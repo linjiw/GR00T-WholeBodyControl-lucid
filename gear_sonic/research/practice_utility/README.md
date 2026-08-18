@@ -36,6 +36,10 @@ scan_pool ──► build_split ──► build_probe_manifest ──► [ paire
 | `latent_gap_probe.py` | LUCID's temporal-VAE gap, as an audited predictor |
 | `utility_label.py` | Paired evaluations → labels; **Gate A** identifiability |
 | `proxy_audit.py` | Proxy scoring; **Gate B** sufficiency decision |
+| `proxy_features.py` | Offline motion-structure descriptors (no fabricated contact) |
+| `quality_telemetry.py` | Live quality collection from the simulator's contact sensor |
+| `callbacks.py` | Trainer/env wiring; sampler snapshot; capsule saving |
+| `run_log.py` | Parse training logs for parity, resume, and throughput checks |
 
 ## Decisions worth knowing
 
@@ -65,12 +69,42 @@ the quantity that drives it makes any improvement partly definitional.
 **Gate B is hard to pass toward more machinery.** Any sufficient simple proxy
 blocks the estimator — and that outcome is a publishable result.
 
+## Verified live
+
+Paired control/intervention branches ran inside real SONIC training. The
+intervention boosted its target bin to sampling probability 0.146 against 0.0068
+for the highest non-kernel context (21×), both radius-1 neighbours boosted, the
+distribution still summing to 1.000000; the control drew 0 episodes on the target
+motion and the intervention drew 5, for a realized extra kernel dose of 1.736.
+
+Four defects surfaced only in live runs, each now covered by a test that pins the
+upstream reality:
+
+1. `_motion_fps` is a per-motion **tensor** upstream, not a scalar — a scalar
+   fake made a fatal error invisible to the whole CPU suite.
+2. SONIC loads resident motions **with replacement**, so one global bin occupies
+   several active positions (18 of 535 observed).
+3. A snapshot at install captures the sampler's **prior** — all failure rates
+   read exactly 1.0, leaving a campaign with no difficulty axis. Hence
+   `snapshot_at_step`, and a hard refusal of degenerate candidate sets.
+4. A capsule storing the **combined** `model.state_dict()` cannot seed a branch,
+   only archive one. Hence the split policy/value layout and
+   `export_sonic_checkpoint`.
+
+## Measured
+
+| | |
+|---|---|
+| throughput | 70.7 s/iteration at `num_envs=256` (87 env-steps/s) |
+| scaling | iteration time nearly flat in `num_envs` — horizon, not env count, drives cost |
+| adaptation transient | reward 0.48 → 17.83, episode length 13 → 223 over 24 iterations |
+| frozen campaign | 24 contexts, all 4 failure quartiles, 10 families, **31.4 GPU-hours** |
+
 ## Not yet built
 
-Trainer/env callbacks that install the adapter into a live SONIC run, the
-branch runner, proxy-feature extraction from rollouts, the utility estimator,
-and the residual allocator. Those need GPU time; everything above is validated
-on CPU first, deliberately.
+Dev-suite `J_eff` evaluation (one pass per branch per horizon), the utility
+estimator, and the residual allocator. The last two are **gated**: Gate B
+authorizes them or nothing does.
 
 ## Running
 
