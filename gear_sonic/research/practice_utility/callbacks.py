@@ -375,11 +375,26 @@ class PracticeCapsuleCallback(TrainerCallback):
         return control
 
     def save(self, horizon_label: str, global_step: int, kwargs: dict[str, Any]) -> str:
-        """Write one capsule. RNG is captured *before* anything else is read."""
+        """Write one capsule. RNG is captured *before* anything else is read.
+
+        The model is stored the way SONIC's own loader expects -- ``policy`` and
+        ``value`` state dicts kept apart -- not as one combined ``state_dict()``.
+        A combined blob cannot be split back reliably, which would make a capsule
+        unusable as a branch origin and confine the whole programme to probing
+        one policy stage.
+        """
         rng_state = RngState.capture(self.pair_id)
         env = kwargs.get("env")
         model = kwargs.get("model")
         optimizer = kwargs.get("optimizer")
+        lr_scheduler = kwargs.get("lr_scheduler")
+
+        model_state = {
+            "combined_state_dict": _state_dict_of(model),
+            "policy_state_dict": _state_dict_of(getattr(model, "policy", None)),
+            "value_state_dict": _state_dict_of(getattr(model, "value_model", None)),
+            "lr_scheduler_state_dict": _state_dict_of(lr_scheduler),
+        }
 
         path = Path(self.capsule_dir) / f"{self.branch_id}_{horizon_label}.capsule.pt"
         save_capsule(
@@ -388,9 +403,13 @@ class PracticeCapsuleCallback(TrainerCallback):
             pair_id=self.pair_id,
             role=self.role,
             global_step=global_step,
-            model_state=_state_dict_of(model),
+            model_state=model_state,
             optimizer_state=_state_dict_of(optimizer),
-            trainer_state={"global_step": global_step, "horizon_label": horizon_label},
+            trainer_state={
+                "global_step": global_step,
+                "horizon_label": horizon_label,
+                "trainer_state_obj": kwargs.get("state"),
+            },
             env_state=env.get_env_state_dict() if hasattr(env, "get_env_state_dict") else {},
             native_sampler_state=_sampler_state_of(env),
             rng_state=rng_state,

@@ -8,6 +8,8 @@ Two guarantees are load-bearing:
   silently accepted.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -253,6 +255,68 @@ class TestForkPair:
         )
         with pytest.raises(B.CapsuleIntegrityError, match="different pairs"):
             B.assert_fork_identical(str(a), str(b))
+
+
+class TestSonicExport:
+    """A capsule must be usable as a branch origin, not just as an archive."""
+
+    def sonic_capsule(self, tmp_path, **overrides):
+        model_state = {
+            "combined_state_dict": {"all": torch.arange(4.0)},
+            "policy_state_dict": {"actor.w": torch.arange(6.0)},
+            "value_state_dict": {"critic.w": torch.ones(3)},
+            "lr_scheduler_state_dict": {"last_epoch": 5},
+        }
+        model_state.update(overrides.pop("model_state", {}))
+        return write(tmp_path, model_state=model_state, **overrides)
+
+    def test_exports_a_loadable_checkpoint(self, tmp_path):
+        path, _ = self.sonic_capsule(tmp_path)
+        out = B.export_sonic_checkpoint(path, tmp_path / "ckpt.pt")
+        checkpoint = torch.load(out, weights_only=False)
+        assert torch.equal(checkpoint["policy_state_dict"]["actor.w"], torch.arange(6.0))
+        assert torch.equal(checkpoint["value_state_dict"]["critic.w"], torch.ones(3))
+
+    def test_carries_optimizer_and_scheduler(self, tmp_path):
+        path, _ = self.sonic_capsule(tmp_path)
+        checkpoint = torch.load(B.export_sonic_checkpoint(path, tmp_path / "c.pt"),
+                                weights_only=False)
+        assert checkpoint["optimizer_state_dict"]["step"] == 1000
+        assert checkpoint["lr_scheduler_state_dict"]["last_epoch"] == 5
+
+    def test_carries_provenance_back_to_the_capsule(self, tmp_path):
+        path, digest = self.sonic_capsule(tmp_path)
+        checkpoint = torch.load(B.export_sonic_checkpoint(path, tmp_path / "c.pt"),
+                                weights_only=False)
+        trace = checkpoint["practice_utility"]
+        assert trace["capsule_sha256"] == digest
+        assert trace["branch_id"] == "pair0_control"
+        assert trace["global_step"] == 1000
+
+    def test_refuses_a_combined_only_capsule(self, tmp_path):
+        """The defect this exporter exists to prevent.
+
+        A combined state_dict cannot be split back into policy and value, so
+        writing a checkpoint from one would load the wrong weights silently.
+        """
+        path, _ = write(tmp_path, model_state={"w": torch.arange(6.0)})
+        with pytest.raises(B.CapsuleIntegrityError, match="combined model state"):
+            B.export_sonic_checkpoint(path, tmp_path / "c.pt")
+
+    def test_refuses_an_empty_policy(self, tmp_path):
+        path, _ = self.sonic_capsule(tmp_path, model_state={"policy_state_dict": {}})
+        with pytest.raises(B.CapsuleIntegrityError, match="empty policy_state_dict"):
+            B.export_sonic_checkpoint(path, tmp_path / "c.pt")
+
+    def test_leaves_no_partial_file(self, tmp_path):
+        path, _ = self.sonic_capsule(tmp_path)
+        B.export_sonic_checkpoint(path, tmp_path / "c.pt")
+        assert not list(tmp_path.glob("*.partial"))
+
+    def test_creates_missing_output_directories(self, tmp_path):
+        path, _ = self.sonic_capsule(tmp_path)
+        out = B.export_sonic_checkpoint(path, tmp_path / "nested" / "deep" / "c.pt")
+        assert Path(out).exists()
 
 
 class TestStateComparison:

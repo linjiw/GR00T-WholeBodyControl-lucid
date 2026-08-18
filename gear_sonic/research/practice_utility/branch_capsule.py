@@ -255,6 +255,60 @@ def assert_fork_identical(control_path: str, intervention_path: str) -> None:
         raise CapsuleIntegrityError("forked capsules differ in provenance")
 
 
+def export_sonic_checkpoint(
+    capsule_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+) -> str:
+    """Write a capsule out as a checkpoint SONIC's own loader accepts.
+
+    This is what makes *stage-conditioned* probing possible: a branch can start
+    from a mid-adaptation checkpoint rather than always from the released model.
+    Without it every branch shares one policy stage, and the programme cannot ask
+    whether practice utility depends on how far training has progressed -- which
+    is one of its three headline questions.
+
+    Raises if the capsule predates the split policy/value layout, rather than
+    silently writing a checkpoint that would load the wrong weights.
+    """
+    payload = torch.load(Path(capsule_path), weights_only=False)
+    model_state = payload.get("model_state", {})
+    if not isinstance(model_state, dict) or "policy_state_dict" not in model_state:
+        raise CapsuleIntegrityError(
+            f"{capsule_path} stores a combined model state and cannot be split into "
+            "policy and value dicts. Re-save with a current PracticeCapsuleCallback."
+        )
+    policy = model_state.get("policy_state_dict") or {}
+    if not policy:
+        raise CapsuleIntegrityError(
+            f"{capsule_path} has an empty policy_state_dict; it cannot seed a branch"
+        )
+
+    checkpoint = {
+        "policy_state_dict": policy,
+        "value_state_dict": model_state.get("value_state_dict") or None,
+        "optimizer_state_dict": payload.get("optimizer_state") or None,
+        "lr_scheduler_state_dict": model_state.get("lr_scheduler_state_dict") or None,
+        "state": payload.get("trainer_state", {}).get("trainer_state_obj"),
+        "env_state_dict": payload.get("env_state") or {},
+        # Provenance travels with the checkpoint so a branch can be traced back
+        # to the capsule and campaign it came from.
+        "practice_utility": {
+            "source_capsule": str(capsule_path),
+            "capsule_sha256": payload.get("capsule_sha256"),
+            "branch_id": payload.get("branch_id"),
+            "pair_id": payload.get("pair_id"),
+            "global_step": payload.get("global_step"),
+            "provenance": payload.get("provenance"),
+        },
+    }
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = output.with_suffix(output.suffix + ".partial")
+    torch.save(checkpoint, staging)
+    staging.replace(output)
+    return str(output)
+
+
 def _capsule_hash(payload: dict[str, Any]) -> str:
     return sha256_of(
         {
