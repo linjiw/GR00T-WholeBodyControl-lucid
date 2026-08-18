@@ -52,11 +52,24 @@ class FakeRobot:
 
 
 class FakeSensor:
-    def __init__(self, foot_force=0.0, torso_force=0.0):
-        forces = torch.zeros(NUM_ENVS, len(BODIES), 3)
-        forces[:, FOOT_IDS, 2] = foot_force
-        forces[:, 1, 2] = torso_force          # torso == an undesired contact
+    """A ContactSensor carries its own body ordering, built from prim paths.
+
+    It need not match the articulation's, which is why the collector resolves
+    force indices from the sensor and velocity indices from the robot.
+    """
+
+    def __init__(self, foot_force=0.0, torso_force=0.0, body_names=None):
+        self.body_names = list(body_names if body_names is not None else BODIES)
+        forces = torch.zeros(NUM_ENVS, len(self.body_names), 3)
+        for i, name in enumerate(self.body_names):
+            if name in QT.FOOT_BODIES:
+                forces[:, i, 2] = foot_force
+            elif name == "torso_link":
+                forces[:, i, 2] = torso_force
         self.data = Data(net_forces_w=forces)
+
+    def find_bodies(self, names):
+        return ([i for i, n in enumerate(self.body_names) if n in set(names)], names)
 
 
 class FakeScene:
@@ -228,6 +241,50 @@ class TestMissingSignalsAreNotZeros:
         collector = QT.QualityTelemetryCollector()
         collector.observe(object())          # nothing resembling an env
         assert "robot" in collector.snapshot()["missing_signals"]
+
+
+class TestSensorOrderingIsNotCrossedWithRobotOrdering:
+    """The bug this guards: force indices came from the robot's body list.
+
+    Live, that read forces off the wrong bodies and reported a 99% undesired-
+    contact rate against SONIC's own reward term implying ~0.006.
+    """
+
+    #: Same bodies, deliberately different order from the articulation's.
+    SHUFFLED = ["right_elbow_link", "left_ankle_roll_link", "torso_link",
+                "right_ankle_roll_link", "pelvis", "left_wrist_yaw_link",
+                "right_wrist_yaw_link", "left_elbow_link"]
+
+    def test_slip_is_correct_under_a_shuffled_sensor_order(self):
+        collector = QT.QualityTelemetryCollector(step_dt=0.02)
+        collector.observe(FakeEnv(FakeRobot(foot_speed=1.0),
+                                  FakeSensor(foot_force=100.0, body_names=self.SHUFFLED)))
+        assert collector.snapshot()["foot_slip_total_m"] == pytest.approx(0.04)
+
+    def test_foot_contact_is_still_not_undesired_when_shuffled(self):
+        collector = QT.QualityTelemetryCollector()
+        collector.observe(FakeEnv(FakeRobot(),
+                                  FakeSensor(foot_force=500.0, body_names=self.SHUFFLED)))
+        assert collector.snapshot()["undesired_contact_rate"] == 0.0
+
+    def test_torso_contact_is_still_undesired_when_shuffled(self):
+        collector = QT.QualityTelemetryCollector()
+        collector.observe(FakeEnv(FakeRobot(),
+                                  FakeSensor(torso_force=500.0, body_names=self.SHUFFLED)))
+        assert collector.snapshot()["undesired_contact_rate"] == pytest.approx(1.0)
+
+    def test_undesired_body_count_is_reported(self):
+        collector = QT.QualityTelemetryCollector()
+        collector.observe(FakeEnv(FakeRobot(), FakeSensor()))
+        # eight bodies minus two feet, two wrists, two elbows
+        assert collector.snapshot()["num_undesired_bodies"] == 2
+
+    def test_sensor_without_body_names_reports_missing(self):
+        sensor = FakeSensor(foot_force=100.0)
+        del sensor.body_names
+        collector = QT.QualityTelemetryCollector()
+        collector.observe(FakeEnv(FakeRobot(foot_speed=1.0), sensor))
+        assert "foot_bodies" in collector.snapshot()["missing_signals"]
 
 
 class TestEnvAccess:

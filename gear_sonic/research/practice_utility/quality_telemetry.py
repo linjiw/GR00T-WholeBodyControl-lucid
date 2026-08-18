@@ -67,6 +67,7 @@ class QualityAccumulator:
     torque_saturation_sum: float = 0.0
     joint_limit_proximity_sum: float = 0.0
     energy_sum: float = 0.0
+    num_undesired_bodies: int = 0
     missing_signals: set[str] = field(default_factory=set)
 
     def as_dict(self) -> dict[str, Any]:
@@ -80,6 +81,7 @@ class QualityAccumulator:
             "contact_impulse_total": self.contact_impulse_total,
             "contact_force_peak": self.contact_force_peak,
             "undesired_contact_rate": self.undesired_contact_steps / n,
+            "num_undesired_bodies": self.num_undesired_bodies,
             "torque_saturation": self.torque_saturation_sum / n,
             "joint_limit_proximity": self.joint_limit_proximity_sum / n,
             "energy_proxy": self.energy_sum / n,
@@ -111,8 +113,7 @@ class QualityTelemetryCollector:
         self.accumulator = QualityAccumulator()
         self._previous_action: torch.Tensor | None = None
         self._previous_delta: torch.Tensor | None = None
-        self._foot_indices: list[int] | None = None
-        self._undesired_indices: list[int] | None = None
+        self._index_cache: dict[str, list[int]] = {}
 
     # ----------------------------------------------------------- collection --
 
@@ -152,19 +153,29 @@ class QualityTelemetryCollector:
         if forces is None or velocity is None:
             self.accumulator.missing_signals.add("foot_slip")
             return
-        indices = self._resolve_feet(robot)
-        if not indices:
+        # Contact forces are indexed by the SENSOR's body ordering, which is
+        # built from prim-path discovery and need not match the articulation's.
+        # Velocities are indexed by the robot's. Resolving each from its own
+        # owner is not pedantry: crossing them reads forces off the wrong bodies
+        # and produces confident, wrong numbers.
+        sensor_indices = self._resolve_feet_in(_scene_entity(env, "contact_forces"), "sensor_feet")
+        robot_indices = self._resolve_feet_in(robot, "robot_feet")
+        if not sensor_indices or not robot_indices:
             self.accumulator.missing_signals.add("foot_bodies")
             return
-        magnitude = forces[:, indices].norm(dim=-1)
+        magnitude = forces[:, sensor_indices].norm(dim=-1)
         in_contact = (magnitude > self.contact_threshold).to(torch.float64)
-        horizontal = velocity[:, indices, :2].to(torch.float64).norm(dim=-1)
+        horizontal = velocity[:, robot_indices, :2].to(torch.float64).norm(dim=-1)
+        if in_contact.shape[-1] != horizontal.shape[-1]:
+            self.accumulator.missing_signals.add("foot_index_mismatch")
+            return
         # Mean over envs so the figure is per-robot, not per-batch.
         self.accumulator.foot_slip_total += float(
             (horizontal * in_contact).sum(dim=-1).mean() * self.step_dt
         )
 
-    def _accumulate_contacts(self, env: Any, robot: Any) -> None:
+    def _accumulate_contacts(self, env: Any, robot: Any) -> None:  # noqa: ARG002
+        sensor = _scene_entity(env, "contact_forces")
         forces = self._contact_forces(env)
         if forces is None:
             self.accumulator.missing_signals.add("contact")
@@ -174,7 +185,8 @@ class QualityTelemetryCollector:
         self.accumulator.contact_force_peak = max(
             self.accumulator.contact_force_peak, float(magnitude.max())
         )
-        undesired = self._resolve_undesired(robot)
+        undesired = self._resolve_undesired(sensor)
+        self.accumulator.num_undesired_bodies = len(undesired)
         if undesired:
             touching = (magnitude[:, undesired] > self.contact_threshold).any(dim=-1)
             self.accumulator.undesired_contact_steps += float(touching.to(torch.float64).mean())
@@ -219,30 +231,35 @@ class QualityTelemetryCollector:
             return None
         return forces
 
-    def _resolve_feet(self, robot: Any) -> list[int]:
-        if self._foot_indices is None:
-            self._foot_indices = _find_bodies(robot, list(self.foot_bodies))
-        return self._foot_indices
+    def _resolve_feet_in(self, entity: Any, cache_key: str) -> list[int]:
+        """Foot indices in ``entity``'s own body ordering."""
+        cached = self._index_cache.get(cache_key)
+        if cached is None:
+            cached = _find_bodies(entity, list(self.foot_bodies)) if entity is not None else []
+            self._index_cache[cache_key] = cached
+        return cached
 
-    def _resolve_undesired(self, robot: Any) -> list[int]:
-        """Every body that is not a foot, wrist, or elbow.
+    def _resolve_undesired(self, sensor: Any) -> list[int]:
+        """Bodies that should not touch the ground, in the SENSOR's ordering.
 
-        Mirrors SONIC's own ``undesired_contacts`` exclusion list, so the metric
-        agrees with the configuration's notion of a legitimate contact.
+        Mirrors SONIC's own ``undesired_contacts`` exclusion list -- feet,
+        wrists, elbows -- so the metric agrees with the configuration's notion of
+        a legitimate contact. Resolved against the sensor because that is what
+        indexes the force tensor.
         """
-        if self._undesired_indices is None:
-            names = getattr(robot, "body_names", None)
+        cached = self._index_cache.get("undesired")
+        if cached is None:
+            names = getattr(sensor, "body_names", None) if sensor is not None else None
             if not names:
-                self._undesired_indices = []
+                cached = []
             else:
                 allowed = set(self.foot_bodies) | {
                     "left_wrist_yaw_link", "right_wrist_yaw_link",
                     "left_elbow_link", "right_elbow_link",
                 }
-                self._undesired_indices = [
-                    i for i, name in enumerate(names) if name not in allowed
-                ]
-        return self._undesired_indices
+                cached = [i for i, name in enumerate(names) if name not in allowed]
+            self._index_cache["undesired"] = cached
+        return cached
 
     def snapshot(self) -> dict[str, Any]:
         return self.accumulator.as_dict()
