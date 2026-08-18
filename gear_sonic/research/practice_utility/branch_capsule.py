@@ -125,10 +125,10 @@ def save_capsule(
         "pair_id": pair_id,
         "role": role,
         "global_step": int(global_step),
-        "model_state": model_state,
-        "optimizer_state": optimizer_state,
-        "trainer_state": trainer_state,
-        "env_state": env_state,
+        "model_state": _to_cpu(model_state),
+        "optimizer_state": _to_cpu(optimizer_state),
+        "trainer_state": _to_cpu(trainer_state),
+        "env_state": _to_cpu(env_state),
         "native_sampler_state": _to_cpu(native_sampler_state),
         "rng": rng_state.to_payload(),
         "provenance": provenance.to_dict(),
@@ -164,7 +164,8 @@ def load_capsule(
         restore_rng: restore the captured random streams immediately. Leave on
             unless the caller intends to restore them itself, in order.
     """
-    payload = torch.load(Path(path), weights_only=False)
+    # map_location keeps an archive readable on a busy or GPU-less machine.
+    payload = torch.load(Path(path), weights_only=False, map_location="cpu")
 
     missing = [k for k in REQUIRED_KEYS if k not in payload]
     if missing:
@@ -236,8 +237,8 @@ def assert_fork_identical(control_path: str, intervention_path: str) -> None:
     Run this before every paired campaign. A silent difference in model or
     sampler state at fork time would masquerade as a treatment effect.
     """
-    control = torch.load(Path(control_path), weights_only=False)
-    treated = torch.load(Path(intervention_path), weights_only=False)
+    control = torch.load(Path(control_path), weights_only=False, map_location="cpu")
+    treated = torch.load(Path(intervention_path), weights_only=False, map_location="cpu")
 
     if control["pair_id"] != treated["pair_id"]:
         raise CapsuleIntegrityError("capsules belong to different pairs")
@@ -270,7 +271,7 @@ def export_sonic_checkpoint(
     Raises if the capsule predates the split policy/value layout, rather than
     silently writing a checkpoint that would load the wrong weights.
     """
-    payload = torch.load(Path(capsule_path), weights_only=False)
+    payload = torch.load(Path(capsule_path), weights_only=False, map_location="cpu")
     model_state = payload.get("model_state", {})
     if not isinstance(model_state, dict) or "policy_state_dict" not in model_state:
         raise CapsuleIntegrityError(
@@ -322,10 +323,23 @@ def _capsule_hash(payload: dict[str, Any]) -> str:
     )
 
 
-def _to_cpu(state: dict[str, Any]) -> dict[str, Any]:
-    return {
-        k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in state.items()
-    }
+def _to_cpu(value: Any) -> Any:
+    """Recursively move every tensor to CPU.
+
+    A capsule holding CUDA tensors can only be opened on a machine with a free
+    GPU -- loading one during a training run fails with an out-of-memory error,
+    which is exactly when a campaign wants to inspect or export it. Capsules are
+    archives and must be readable anywhere.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_to_cpu(v) for v in value)
+    return value
 
 
 def _states_equal(a: Any, b: Any) -> bool:

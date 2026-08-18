@@ -257,6 +257,28 @@ class TestForkPair:
             B.assert_fork_identical(str(a), str(b))
 
 
+class TestDeviceAgnostic:
+    """A capsule is an archive; opening one must not require a free GPU."""
+
+    def test_saved_tensors_are_on_cpu(self, tmp_path):
+        path, _ = write(tmp_path)
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        assert payload["model_state"]["w"].device.type == "cpu"
+        assert payload["native_sampler_state"]["adp_samp_num_episodes"].device.type == "cpu"
+
+    def test_nested_structures_are_moved(self, tmp_path):
+        nested = {"a": {"b": [torch.ones(2), (torch.zeros(3),)]}}
+        path, _ = write(tmp_path, model_state=nested)
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        assert payload["model_state"]["a"]["b"][0].device.type == "cpu"
+        assert payload["model_state"]["a"]["b"][1][0].device.type == "cpu"
+
+    def test_non_tensor_values_survive(self, tmp_path):
+        path, _ = write(tmp_path, model_state={"w": torch.ones(2), "epoch": 7, "tag": "x"})
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        assert payload["model_state"]["epoch"] == 7 and payload["model_state"]["tag"] == "x"
+
+
 class TestSonicExport:
     """A capsule must be usable as a branch origin, not just as an archive."""
 
