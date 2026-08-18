@@ -31,9 +31,51 @@ from gear_sonic.research.practice_utility.rng_capsule import (  # noqa: F401
     derive_seed,
     enable_determinism,
 )
+from gear_sonic.research.practice_utility.motion_pool import (  # noqa: F401
+    MotionRecord,
+    PoolScan,
+    drop_exact_duplicates,
+    motion_family,
+    parse_motion_key,
+    pool_sha256,
+    scan_pool,
+)
+from gear_sonic.research.practice_utility.probe_manifest import (  # noqa: F401
+    ContextCandidate,
+    ManifestError,
+    ProbeManifest,
+    build_probe_manifest,
+    stratified_select,
+    validate_manifest,
+)
+from gear_sonic.research.practice_utility.proxy_audit import (  # noqa: F401
+    GateBReport,
+    ProxyResult,
+    assess_sufficiency,
+    audit_all_proxies,
+    audit_proxy,
+    count_reversals,
+    spearman,
+)
+from gear_sonic.research.practice_utility.quality_metrics import (  # noqa: F401
+    EpisodeQuality,
+    QualityThresholds,
+    apply_gates,
+    evaluate_gates,
+    macro_mean_quality_success,
+    summarize,
+)
 from gear_sonic.research.practice_utility.sampler_adapter import (  # noqa: F401
     InterventionSpec,
     PracticeSamplerAdapter,
+)
+from gear_sonic.research.practice_utility.split import (  # noqa: F401
+    DEFAULT_RATIOS,
+    MotionSplit,
+    SplitError,
+    build_groups,
+    build_split,
+    verify_split,
 )
 from gear_sonic.research.practice_utility.schema import (  # noqa: F401
     SCHEMA_VERSION,
@@ -78,6 +120,42 @@ __all__ = [
     "channel_generator",
     "derive_seed",
     "enable_determinism",
+    # motion pool and splits
+    "MotionRecord",
+    "PoolScan",
+    "scan_pool",
+    "drop_exact_duplicates",
+    "motion_family",
+    "parse_motion_key",
+    "pool_sha256",
+    "MotionSplit",
+    "SplitError",
+    "DEFAULT_RATIOS",
+    "build_groups",
+    "build_split",
+    "verify_split",
+    # campaign design
+    "ContextCandidate",
+    "ProbeManifest",
+    "ManifestError",
+    "build_probe_manifest",
+    "stratified_select",
+    "validate_manifest",
+    # outcomes
+    "EpisodeQuality",
+    "QualityThresholds",
+    "apply_gates",
+    "evaluate_gates",
+    "macro_mean_quality_success",
+    "summarize",
+    # audit
+    "ProxyResult",
+    "GateBReport",
+    "audit_proxy",
+    "audit_all_proxies",
+    "assess_sufficiency",
+    "count_reversals",
+    "spearman",
     # capsules
     "CapsuleIntegrityError",
     "Provenance",

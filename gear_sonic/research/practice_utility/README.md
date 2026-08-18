@@ -1,40 +1,85 @@
-# Practice Utility — T0 infrastructure
+# Practice Utility
 
-Implements the measurement layer for `lucid-design-implementation-plan.md`
-(Part I §4–5, amended by Part II). Everything here is **additive**: with no
-override armed, SONIC behaves exactly as upstream.
+Measures whether extra practice on a training context causally improves later
+deployment, rather than whether that context is currently hard. Implements
+`lucid-design-implementation-plan.md`.
+
+Everything here is **additive**: with no override armed, SONIC's code path is
+unchanged, and `test_sampler_identity` enforces that.
+
+## The chain
+
+```
+scan_pool ──► build_split ──► build_probe_manifest ──► [ paired GPU branches ] ──►
+              (performer /      (stratified, frozen)     control vs intervention
+               content)                                  from one capsule
+                                                                │
+   build_utility_record ◄── quality_metrics + latent_gap_probe ◄─┘
+            │
+            ├──► assess_identifiability   Gate A: is utility measurable at all?
+            └──► assess_sufficiency       Gate B: is an estimator even warranted?
+```
 
 ## Modules
 
-| Module | Purpose | Plan ref |
-|---|---|---|
-| `schema.py` | Data contracts: `ContextKey`, `MotionPoolManifest`, `SamplingSnapshot`, `DoseReport`, `RngReceipt`, `BranchCapsule`, `HarmVector`, `UtilityRecord` | §4.1, §4.3, §4.4 |
-| `intervention.py` | Local kernels, `(1-ε)ρ + εκ` mixing, identity-preserving residual reweighting with KL radius, coverage floors, probability-ratio caps | §4.2, §4.8 |
-| `sampler_adapter.py` | Reads and optionally overrides SONIC's live bin distribution; realized-dose accounting | §5.2, §4.3 |
-| `rng_capsule.py` | Counter-based common random numbers + full RNG capture/restore | §5.4 |
-| `branch_capsule.py` | Save/load/fork paired branches with provenance guards | §5.3 |
+| Module | Purpose |
+|---|---|
+| `schema.py` | Data contracts, keyed on stable motion hashes rather than batch-local ids |
+| `motion_pool.py` | Parse BONES-SEED keys into performer / action / trajectory identities; family taxonomy |
+| `split.py` | Group-disjoint, family-stratified splits over the leakage graph |
+| `probe_manifest.py` | Stratified context selection, frozen before any branch runs |
+| `intervention.py` | Local kernels, `(1-ε)ρ + εκ`, identity-preserving residual reweighting |
+| `sampler_adapter.py` | Read/override SONIC's live bin distribution; realized-dose accounting |
+| `rng_capsule.py` | Counter-based common random numbers; full RNG capture |
+| `branch_capsule.py` | Save/load/fork paired branches with provenance guards |
+| `quality_metrics.py` | Physical-quality outcomes and quality-qualified success |
+| `latent_gap_probe.py` | LUCID's temporal-VAE gap, as an audited predictor |
+| `utility_label.py` | Paired evaluations → labels; **Gate A** identifiability |
+| `proxy_audit.py` | Proxy scoring; **Gate B** sufficiency decision |
 
-## Invariants the tests enforce (203 tests, CPU only)
+## Decisions worth knowing
 
-- **Pass-through identity.** No override armed ⇒ `apply()` returns the *same tensor object*; dtype and device preserved.
-- **ε = 0 identity.** Arms the override path but leaves the distribution unchanged — this is what makes the ε=0 branch a valid noise-floor measurement rather than a different code path.
-- **α = 0 / constant-score identity.** The residual curriculum returns the base distribution exactly.
-- **Kernels never cross a motion boundary.** Neighbouring bins of a different clip are not a neighbourhood.
-- **KL radius, coverage floor, and `max_prob_ratio` bounds actually hold** (asserted on `q/base`, not merely "smaller than uncapped").
-- **Dose is counted in executed steps**, so an episode that terminates after 3 steps does not count as full practice.
-- **Stale kernels are detected** after a motion-library reload rather than silently mis-attributing dose.
-- **Forked capsules are identical** in model, optimizer, sampler, env, RNG, and provenance; only `branch_id`/`role` differ.
-- **Resume against a different motion pool or config is refused.**
-- **Upstream contract test** re-reads `MotionLibBase`'s real source and fails if an attribute the adapter depends on disappears.
+**Two split regimes, never one number.** BONES-SEED cannot support a split
+closing both leakage channels at once — transitive closure puts 91% of the
+4950-clip pool in one component. `performer` (unseen performers) and `content`
+(unseen actions) are built and reported separately; `build_split` refuses a
+degenerate combined split rather than returning one.
 
-## Not yet built (next)
+**Dose is counted in executed steps.** An episode terminating after three steps
+must not score as full practice. `build_utility_record` refuses to emit a label
+when the intervention branch received no more kernel exposure than the control.
 
-Quality-metric evaluator, LUCID latent-gap/VAE probe, branch runner + trainer
-hooks, utility-label builder, proxy audit, estimator, residual allocator.
+**Efficacy cannot outvote a harm gate.** A breached gate makes a context
+`harmful` outright, not a smaller positive.
+
+**`J_eff` is a macro-mean over families.** A method that helps common motions
+and harms rare ones must not read as an improvement.
+
+**Correlations are computed within group, then averaged.** A proxy held constant
+within each policy stage scores pooled Spearman 0.87 purely because both it and
+utility rise with training; grouped it correctly scores 0.0.
+
+**The latent gap is a predictor, not the scheduler.** Scoring a curriculum with
+the quantity that drives it makes any improvement partly definitional.
+
+**Gate B is hard to pass toward more machinery.** Any sufficient simple proxy
+blocks the estimator — and that outcome is a publishable result.
+
+## Not yet built
+
+Trainer/env callbacks that install the adapter into a live SONIC run, the
+branch runner, proxy-feature extraction from rollouts, the utility estimator,
+and the residual allocator. Those need GPU time; everything above is validated
+on CPU first, deliberately.
 
 ## Running
 
 ```bash
 source /data/robotixx/lucid-sonic/lucid_env.sh
-python -m pytest tests/practice_utility/ -q
+python -m pytest tests/practice_utility/ -q          # 530 tests
+
+python scripts/practice_utility/build_motion_pool.py \
+    --pool-dir  /data/robotixx/lucid-sonic/pools/debug512/robot_filtered \
+    --pool-id   debug512 \
+    --output-dir /data/robotixx/lucid-sonic/manifests
 ```
