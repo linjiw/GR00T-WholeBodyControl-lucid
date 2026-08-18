@@ -31,6 +31,14 @@ from gear_sonic.research.practice_utility.rng_capsule import (  # noqa: F401
     derive_seed,
     enable_determinism,
 )
+from gear_sonic.research.practice_utility.observer import (  # noqa: F401
+    CommandExecutionBuffer,
+    PracticeObserverCallback,
+)
+from gear_sonic.research.practice_utility.quality_telemetry import (  # noqa: F401
+    PracticeQualityCallback,
+    QualityTelemetryCollector,
+)
 from gear_sonic.research.practice_utility.motion_pool import (  # noqa: F401
     MotionRecord,
     PoolScan,
@@ -156,6 +164,11 @@ __all__ = [
     "assess_sufficiency",
     "count_reversals",
     "spearman",
+    # live observation
+    "PracticeObserverCallback",
+    "CommandExecutionBuffer",
+    "PracticeQualityCallback",
+    "QualityTelemetryCollector",
     # capsules
     "CapsuleIntegrityError",
     "Provenance",

@@ -1,0 +1,17 @@
+# Per-step rollout observer: LUCID latent gap + physical-quality telemetry.
+# Patches ManagerEnvWrapper.step, because both measurements need every control
+# step and trainer callbacks only fire per PPO iteration. Disabled by default.
+practice_observer:
+  _target_: gear_sonic.research.practice_utility.observer.PracticeObserverCallback
+  enabled: false
+  output_dir: null
+  branch_id: unbound
+  # Frozen LUCID encoder; window geometry is taken from the artifact, not here,
+  # so gaps stay comparable across branches.
+  encoder_path: null
+  window_length: 16
+  window_stride: 1
+  sample_every: 1
+  tracked_env: 0
+  step_dt: 0.02
+  collect_quality: true
