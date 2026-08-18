@@ -167,10 +167,25 @@ def assign_failure_quartiles(candidates: Iterable[ContextCandidate]) -> list[Con
     Quartiles are assigned by rank, not by fixed thresholds, so the strata stay
     populated whatever the shape of the failure distribution -- which changes a
     great deal between an early and a late checkpoint.
+
+    Raises if every candidate shares one failure rate. That is what a snapshot
+    taken before any episode looks like: SONIC seeds ``adp_samp_num_episodes``
+    and ``adp_samp_num_failures`` with the same ``init_num_failures``, so every
+    rate reads exactly 1.0. Ranking ties would manufacture four strata out of
+    noise and the campaign would have no difficulty axis at all, so this fails
+    loudly instead.
     """
     candidates = list(candidates)
     if not candidates:
         return []
+    rates = {round(c.failure_rate, 9) for c in candidates}
+    if len(rates) == 1 and len(candidates) > 1:
+        raise ManifestError(
+            f"all {len(candidates)} candidates share failure rate "
+            f"{next(iter(rates))}; the sampler snapshot carries no statistics. "
+            "Take it after warm-up (PracticeContextCallback.snapshot_at_step > 0), "
+            "not at install."
+        )
     order = sorted(range(len(candidates)), key=lambda i: candidates[i].failure_rate)
     for rank, index in enumerate(order):
         quartile = min(3, (rank * 4) // len(order))

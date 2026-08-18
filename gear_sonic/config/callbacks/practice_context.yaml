@@ -13,3 +13,5 @@ practice_context:
   dose_report_dir: null
   dose_report_frequency: 0
   manifest_path: null
+  snapshot_path: null      # dump the native distribution + resident contexts on install
+  snapshot_at_step: 0      # >0: snapshot after warm-up, when failure stats mean something

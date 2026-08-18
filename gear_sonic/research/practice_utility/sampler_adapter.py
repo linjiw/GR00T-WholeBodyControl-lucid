@@ -371,8 +371,33 @@ class PracticeSamplerAdapter:
     def _motion_hash_for(self, motion_key: str, num_frames: int) -> str:
         if self.manifest is not None and motion_key in self.manifest.motion_hashes:
             return self.manifest.motion_hashes[motion_key]
-        fps = float(getattr(self.motion_lib, "_motion_fps", 50.0))
-        return motion_hash(motion_key, num_frames, fps)
+        return motion_hash(motion_key, num_frames, self._timeline_fps())
+
+    def _timeline_fps(self) -> float:
+        """Rate of the timeline the bins are defined on.
+
+        ``_sim_fps`` (a scalar, ``1 / step_dt``) is the right choice, not
+        ``_motion_fps``: the latter is a per-motion tensor of *source* clip
+        rates indexed by batch-local motion id, whereas bin boundaries and
+        ``adp_samp_num_frames`` live on the resampled simulation timeline and
+        are keyed by dataset-wide motion id. Mixing the two indexing schemes
+        would silently attach the wrong rate to a clip.
+        """
+        for attribute, default in (("_sim_fps", None), ("_motion_fps", None)):
+            value = getattr(self.motion_lib, attribute, default)
+            if value is None:
+                continue
+            if hasattr(value, "numel"):
+                # A per-motion tensor cannot be reduced to one clip's rate here;
+                # only accept it when it is genuinely scalar.
+                if value.numel() != 1:
+                    continue
+                return float(value.reshape(-1)[0])
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 50.0
 
     @staticmethod
     def _gather(source: torch.Tensor, index: torch.Tensor) -> list[float]:

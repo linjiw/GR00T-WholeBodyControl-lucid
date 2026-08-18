@@ -41,7 +41,8 @@ class FakeMotionLib:
         self.uniform_sampling_rate = 0.1
         self.adp_samp_failure_rate_max_over_mean = 200.0
         self._motion_data_keys = self._keys
-        self._motion_fps = 50.0
+        self._motion_fps = torch.full((NUM_MOTIONS,), 30.0)   # per-motion tensor upstream
+        self._sim_fps = 50.0
         self._device = torch.device("cpu")
 
         frames_per_motion = BINS_PER_MOTION * BIN_SIZE

@@ -62,6 +62,8 @@ class PracticeContextCallback(TrainerCallback):
         dose_report_dir: str | None = None,
         dose_report_frequency: int = 0,
         manifest_path: str | None = None,
+        snapshot_path: str | None = None,
+        snapshot_at_step: int = 0,
     ) -> None:
         self.enabled = bool(enabled)
         self.role = role
@@ -73,6 +75,14 @@ class PracticeContextCallback(TrainerCallback):
         self.dose_report_dir = dose_report_dir
         self.dose_report_frequency = int(dose_report_frequency)
         self.manifest_path = manifest_path
+        self.snapshot_path = snapshot_path
+        # Snapshotting at install captures the sampler's *prior*, not its
+        # statistics: adp_samp_num_episodes and num_failures both start at
+        # init_num_failures, so every failure rate reads exactly 1.0 and carries
+        # no information. A campaign stratified on that would have no
+        # difficulty axis at all. Snapshot after warm-up instead.
+        self.snapshot_at_step = int(snapshot_at_step)
+        self._snapshot_written = False
 
         self.adapter: PracticeSamplerAdapter | None = None
         self._motion_lib: Any = None
@@ -101,6 +111,14 @@ class PracticeContextCallback(TrainerCallback):
             self._install(kwargs.get("env"))
         # A motion resample swaps the resident batch out from under the kernel.
         self._rearm_if_stale()
+        step = getattr(state, "global_step", 0) if state is not None else 0
+        if (
+            self.snapshot_path
+            and not self._snapshot_written
+            and step >= self.snapshot_at_step > 0
+        ):
+            self.write_snapshot(step)
+            self._snapshot_written = True
         if (
             self.dose_report_frequency
             and self.dose_report_dir
@@ -157,6 +175,10 @@ class PracticeContextCallback(TrainerCallback):
                 # dropping this batch's dose is safer than attributing it wrongly.
                 pass
             return motion_ids, time_steps
+
+        if self.snapshot_path and self.snapshot_at_step <= 0:
+            self.write_snapshot()
+            self._snapshot_written = True
 
         motion_lib.update_adaptive_sampling_probabilities = update_with_override
         motion_lib.sample_motion_ids_and_time_steps = sample_and_record
@@ -231,6 +253,53 @@ class PracticeContextCallback(TrainerCallback):
         )
 
     # -------------------------------------------------------------- output --
+
+    def write_snapshot(self, global_step: int = 0) -> str | None:
+        """Dump the native distribution and every resident context.
+
+        This is how a campaign discovers which contexts actually exist: bin
+        boundaries are decided by SONIC at load time from each clip's resampled
+        frame count, so they cannot be guessed from the stored motion files.
+        A control run writes this, and the probe manifest is built from it.
+        """
+        if self.adapter is None or not self.snapshot_path:
+            return None
+        snapshot = self.adapter.snapshot_native_distribution(global_step)
+        contexts = []
+        for position, bin_id in enumerate(snapshot.active_bin_ids):
+            context = self.adapter.context_for_bin(bin_id)
+            contexts.append(
+                {
+                    **context.to_dict(),
+                    "context_id": context.context_id,
+                    "global_bin_id": bin_id,
+                    "sampling_probability": snapshot.active_prob[position],
+                    "failure_rate": snapshot.failure_rate_raw[position],
+                    "num_episodes": snapshot.num_episodes[position],
+                    "num_failures": snapshot.num_failures[position],
+                }
+            )
+        path = Path(self.snapshot_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "kind": "practice_utility_sampler_snapshot",
+                    "schema_version": 1,
+                    "global_step": global_step,
+                    "branch_id": self.branch_id,
+                    "num_bins": snapshot.num_bins,
+                    "num_active_bins": len(snapshot.active_bin_ids),
+                    "distribution_sha256": snapshot.distribution_sha256,
+                    "effective_num_bins": snapshot.effective_num_bins,
+                    "uniform_sampling_rate": snapshot.uniform_sampling_rate,
+                    "failure_rate_max_over_mean": snapshot.failure_rate_max_over_mean,
+                    "contexts": contexts,
+                },
+                indent=2,
+            )
+        )
+        return str(path)
 
     def write_dose_report(self, global_step: int) -> str | None:
         """Persist the realized-dose receipt for this branch."""

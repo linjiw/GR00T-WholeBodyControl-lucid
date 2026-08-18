@@ -49,7 +49,10 @@ class FakeMotionLib:
         self.uniform_sampling_rate = 0.1
         self.adp_samp_failure_rate_max_over_mean = 200.0
         self._motion_data_keys = self._keys
-        self._motion_fps = 50.0
+        # Upstream stores a per-motion tensor of SOURCE clip rates here, indexed
+        # by batch-local motion id -- not a scalar. The fake mirrors that.
+        self._motion_fps = torch.full((num_motions,), 30.0)
+        self._sim_fps = 50.0
         self._device = torch.device("cpu")
 
 
@@ -214,6 +217,24 @@ class TestContextKeys:
     def test_derived_hash_used_without_manifest(self, adapter):
         assert adapter.context_for_bin(0).motion_hash == motion_hash("motion_00", 200, 50.0)
 
+    def test_derived_hash_uses_the_sim_timeline_not_source_fps(self, lib):
+        """Bins live on the resampled sim timeline; source clip fps is a
+        per-motion tensor on a different indexing scheme."""
+        adapter = PracticeSamplerAdapter(lib)
+        assert adapter._timeline_fps() == 50.0
+
+    def test_per_motion_fps_tensor_is_not_mistaken_for_a_scalar(self, lib):
+        """The bug the first live run found: float(tensor_of_N) raises."""
+        del lib._sim_fps
+        adapter = PracticeSamplerAdapter(lib)
+        assert adapter._timeline_fps() == 50.0          # falls back, does not raise
+        assert adapter.context_for_bin(0).motion_hash
+
+    def test_scalar_fps_tensor_is_accepted(self, lib):
+        del lib._sim_fps
+        lib._motion_fps = torch.tensor([25.0])
+        assert PracticeSamplerAdapter(lib)._timeline_fps() == 25.0
+
 
 class TestSnapshot:
     def test_captures_a_normalized_distribution(self, adapter):
@@ -309,6 +330,73 @@ class TestDoseAccounting:
             adapter.record_draw(torch.tensor([1]))
 
 
+class TestDuplicateResidentBins:
+    """SONIC loads resident motions with replacement.
+
+    ``update_adaptive_sampling_motion_frames`` appends a motion's bins once per
+    resident copy, so the same global bin id can occupy several positions in
+    ``adp_samp_active_motion_bins``. Observed live: 18 of 535 active entries
+    were duplicates. Both the kernel and the dose accounting must stay correct
+    when that happens.
+    """
+
+    def duplicated_lib(self):
+        # Motion 0's four bins appear twice, as if it were resident twice.
+        lib = FakeMotionLib()
+        lib.adp_samp_active_motion_bins = torch.tensor(
+            [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7]
+        )
+        n = lib.adp_samp_active_motion_bins.numel()
+        lib.adp_sampling_active_prob = torch.full((n,), 1.0 / n, dtype=torch.float64)
+        return lib
+
+    def test_kernel_covers_every_copy_of_the_context(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.2, kernel_radius=0)
+        kernel = adapter._kernel_weights
+        # Positions 1 and 5 are both bin 1; each must carry mass.
+        assert float(kernel[1]) > 0 and float(kernel[5]) > 0
+
+    def test_distribution_stays_normalized_with_duplicates(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.2)
+        out = adapter.apply(lib.adp_sampling_active_prob)
+        assert float(out.sum()) == pytest.approx(1.0)
+        assert bool((out >= 0).all())
+
+    def test_boost_lands_on_the_duplicated_context(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        before = lib.adp_sampling_active_prob.clone()
+        adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.2, kernel_radius=0)
+        after = adapter.apply(before)
+        assert float(after[1]) > float(before[1])
+        assert float(after[5]) > float(before[5])
+
+    def test_dose_is_attributed_once_per_draw_not_per_copy(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.2, kernel_radius=0)
+        adapter.record_draw(torch.tensor([1, 1, 1]))
+        report = adapter.get_exact_dose_report()
+        assert report.drawn_episodes == 3.0
+        assert report.drawn_kernel_mass == pytest.approx(3.0)
+
+    def test_context_identity_is_shared_by_duplicates(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        assert adapter.context_for_bin(1).context_id == adapter.context_for_bin(1).context_id
+
+    def test_completion_dose_handles_duplicates(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.2, kernel_radius=0)
+        adapter.record_completion(torch.tensor([1, 1]), torch.tensor([100.0, 50.0]))
+        assert adapter.get_exact_dose_report().completed_kernel_steps == pytest.approx(150.0)
+
+
 class TestPairedBranchesShareABase:
     """Control and intervention must differ only through the intervention."""
 
@@ -364,9 +452,31 @@ class TestUpstreamContract:
             "uniform_sampling_rate",
             "adp_samp_failure_rate_max_over_mean",
             "_motion_data_keys",
+            "_sim_fps",
         ]
         missing = [name for name in required if name not in source]
         assert not missing, f"adapter depends on attributes absent upstream: {missing}"
+
+    def test_motion_fps_really_is_a_tensor_upstream(self):
+        """Pins the reality that broke the first live run.
+
+        The fake must keep mirroring this: a scalar stand-in made a live-only
+        failure invisible to the whole CPU suite.
+        """
+        import inspect
+
+        from gear_sonic.utils.motion_lib import motion_lib_base
+
+        source = inspect.getsource(motion_lib_base.MotionLibBase)
+        assert "self._motion_fps = torch.tensor(" in source
+
+    def test_sim_fps_really_is_a_scalar_upstream(self):
+        import inspect
+
+        from gear_sonic.utils.motion_lib import motion_lib_base
+
+        source = inspect.getsource(motion_lib_base.MotionLibBase)
+        assert "self._sim_fps = 1 / self.m_cfg.get(" in source
 
     def test_sampling_entry_point_still_exists(self):
         from gear_sonic.utils.motion_lib import motion_lib_base
