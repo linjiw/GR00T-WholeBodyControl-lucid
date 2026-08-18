@@ -41,6 +41,30 @@ except Exception:  # pragma: no cover
         """Stand-in so this module imports without transformers."""
 
 
+#: Active observers, keyed by branch id. The DR curriculum needs the gap the
+#: observer is already collecting, and Hydra instantiates the two callbacks
+#: independently with no reference between them. A tiny registry beats making
+#: the curriculum patch ``step`` a second time and collect the same data twice.
+_ACTIVE_OBSERVERS: dict[str, "PracticeObserverCallback"] = {}
+
+
+def register_observer(observer: "PracticeObserverCallback") -> None:
+    _ACTIVE_OBSERVERS[observer.branch_id] = observer
+
+
+def get_active_observer(branch_id: str | None = None) -> "PracticeObserverCallback | None":
+    """The observer for ``branch_id``, or the only active one if unambiguous."""
+    if branch_id is not None:
+        return _ACTIVE_OBSERVERS.get(branch_id)
+    if len(_ACTIVE_OBSERVERS) == 1:
+        return next(iter(_ACTIVE_OBSERVERS.values()))
+    return None
+
+
+def clear_observers() -> None:
+    _ACTIVE_OBSERVERS.clear()
+
+
 @dataclass
 class CommandExecutionBuffer:
     """Ring buffer of commanded and realized joint positions for one env.
@@ -120,6 +144,7 @@ class PracticeObserverCallback(TrainerCallback):
         if self.enabled:
             self._load_encoder()
             self._install(kwargs.get("env"))
+            register_observer(self)
         return control
 
     def on_step_end(self, args, state, control, **kwargs):  # noqa: ARG002
@@ -224,6 +249,16 @@ class PracticeObserverCallback(TrainerCallback):
             self._latent_gaps.append(float(gap[0]))
 
     # ------------------------------------------------------------- reporting --
+
+    def drain_gaps(self) -> list[float]:
+        """Hand the epoch's latent gaps to a consumer without clearing them.
+
+        The curriculum reads these before ``_flush`` resets them, so callback
+        ordering matters: the curriculum must run before the observer's own
+        ``on_step_end``. Returning a copy keeps the observer's record intact
+        either way.
+        """
+        return list(self._latent_gaps)
 
     def _flush(self, global_step: int) -> dict[str, Any]:
         latent = L.summarize_gap(torch.tensor(self._latent_gaps)) if self._latent_gaps else None

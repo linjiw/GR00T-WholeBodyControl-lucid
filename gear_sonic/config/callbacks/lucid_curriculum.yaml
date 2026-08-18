@@ -1,0 +1,27 @@
+# LUCID domain-randomization curriculum: latent gap -> PI controller -> lambda.
+# Requires practice_observer for the gap. Disabled by default.
+#
+# NOTE ON COVERAGE: only reset- and interval-mode event terms can be rescaled at
+# runtime. friction, base CoM, and joint-default offsets are startup-mode and
+# are therefore NOT scheduled; the callback logs scalable_terms so a run states
+# exactly which channels it moved.
+lucid_curriculum:
+  _target_: gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback
+  enabled: false
+  mode: lucid              # lucid | fixed | off
+  observer_branch_id: null
+  output_dir: null
+  branch_id: unbound
+  initial_lambda: 0.0
+  fixed_lambda: 1.0        # used by mode=fixed
+  # delta_target should be calibrated per encoder via dr_controller.calibrate_target;
+  # latent scales differ between encoders so a constant does not transfer.
+  delta_target: 0.10
+  kp: 1.0
+  ki: 0.1
+  alpha: 0.05
+  integral_max: 5.0
+  quantile: 0.9
+  return_floor: null
+  return_decay: 0.5
+  update_every: 1
