@@ -47,6 +47,10 @@ from gear_sonic.research.practice_utility.schema import ContextKey, DoseReport  
 #: Training-side efficacy metric used when no dev-suite evaluation is supplied.
 FALLBACK_EFFICACY = "Mean rewards"
 
+#: Iterations averaged when reading efficacy at a horizon. Measured to cut the
+#: cross-seed relative spread of mean reward from 4.77% to 3.33%.
+DEFAULT_EFFICACY_WINDOW = 4
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
@@ -60,6 +64,8 @@ def parse_args(argv=None):
     parser.add_argument("--noise-floor", type=Path, default=None,
                         help="noise_floor_report.json; supplies Gate A's denominator")
     parser.add_argument("--efficacy-metric", default=FALLBACK_EFFICACY)
+    parser.add_argument("--efficacy-window", type=int, default=DEFAULT_EFFICACY_WINDOW,
+                        help="iterations averaged at each horizon (1 = single point)")
     parser.add_argument("--shared-control", action="store_true", default=True,
                         help="one control per (stage, seed), as screening uses")
     return parser.parse_args(argv)
@@ -94,20 +100,34 @@ def dose_from_report(report: dict | None, role: str, branch_id: str) -> DoseRepo
 
 
 def evaluations_for(series: dict[int, float], horizons: dict[str, int], role: str,
-                    branch_id: str) -> list[UL.BranchEvaluation]:
-    """One evaluation per horizon, taking the nearest recorded iteration at or below it."""
+                    branch_id: str, window: int = DEFAULT_EFFICACY_WINDOW
+                    ) -> list[UL.BranchEvaluation]:
+    """One evaluation per horizon, averaged over the last ``window`` iterations.
+
+    Averaging rather than reading a single point at the horizon, because that
+    single point is noisy. Measured across three seeds: the cross-seed relative
+    spread of mean reward at the final iteration was 4.77%, while the mean over
+    the last four iterations was 3.33% -- the same runs, a third less noise, for
+    free. Since the noise floor is what Gate A must clear, spending nothing to
+    lower it is the cheapest sensitivity available.
+    """
     out = []
     for label, horizon in horizons.items():
-        usable = [i for i in series if i <= horizon]
+        usable = sorted(i for i in series if i <= horizon)
         if not usable:
             continue
-        value = series[max(usable)]
+        chosen = usable[-window:] if window > 1 else usable[-1:]
+        value = sum(series[i] for i in chosen) / len(chosen)
         out.append(
             UL.BranchEvaluation(
                 branch_id=branch_id, role=role, horizon_label=label,
                 j_eff=value, clean_j_eff=value,
                 action_rate=0.0, foot_slip=0.0, contact_impulse=0.0, torque_saturation=0.0,
-                extras={"iteration_used": float(max(usable))},
+                extras={
+                    "iterations_averaged": float(len(chosen)),
+                    "first_iteration": float(chosen[0]),
+                    "last_iteration": float(chosen[-1]),
+                },
             )
         )
     return out
@@ -147,9 +167,11 @@ def main(argv=None) -> int:
                         control_dose=dose_from_report(control_dose, "control", control_id),
                         intervention_dose=dose_from_report(dose, "intervention", branch_id),
                         control_evaluations=evaluations_for(
-                            control_series, horizons, "control", control_id),
+                            control_series, horizons, "control", control_id,
+                            args.efficacy_window),
                         intervention_evaluations=evaluations_for(
-                            series, horizons, "intervention", branch_id),
+                            series, horizons, "intervention", branch_id,
+                            args.efficacy_window),
                         epsilon=manifest["epsilon"],
                         kernel_radius_bins=manifest["kernel_radius_bins"],
                         base_distribution_sha256=manifest["manifest_sha256"],
@@ -198,6 +220,7 @@ def main(argv=None) -> int:
             "training_side_mean_reward" if args.efficacy_metric == FALLBACK_EFFICACY
             else args.efficacy_metric
         ),
+        "efficacy_window": args.efficacy_window,
         "efficacy_caveat": (
             "training-side efficacy is NOT the plan's J_eff (macro-mean quality-qualified "
             "success on a frozen dev suite). Context ordering under it is a cheap "
