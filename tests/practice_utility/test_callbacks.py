@@ -300,6 +300,93 @@ class TestStaleKernelHandling:
         assert torch.allclose(probs, torch.full((4,), 0.25, dtype=torch.float64))
 
 
+class TestFailSoftArming:
+    """A context absent from the resident batch must not kill the branch.
+
+    SONIC keeps only part of the pool loaded and rotates it -- 195 of 512
+    motions in a measured run -- so a randomly chosen context is often absent at
+    install. Raising there killed a real noise-floor branch and would have killed
+    most of a campaign.
+    """
+
+    def absent_context(self):
+        """A context on motion 2, which the shrunken batch will not contain."""
+        key = "motion_02"
+        return ContextKey(
+            motion_key=key,
+            motion_hash=motion_hash(key, BINS_PER_MOTION * BIN_SIZE, 50.0),
+            bin_index=1, bin_start_frame=BIN_SIZE, bin_end_frame=2 * BIN_SIZE,
+        )
+
+    def callback_with(self, context):
+        return C.PracticeContextCallback(
+            enabled=True, role="intervention", pair_id="p0",
+            context=context.to_dict(), epsilon=0.25,
+        )
+
+    def test_install_survives_an_absent_context(self, env):
+        env._motion_lib.adp_samp_active_motion_bins = torch.arange(4)   # motion 0 only
+        n = 4
+        env._motion_lib.adp_sampling_active_prob = torch.full((n,), 1.0 / n, dtype=torch.float64)
+        callback = self.callback_with(self.absent_context())
+        callback.on_train_begin(None, FakeState(), None, env=env)       # must not raise
+        assert callback._armed is False
+        assert callback.adapter is not None
+
+    def test_absent_context_leaves_the_distribution_native(self, env):
+        env._motion_lib.adp_samp_active_motion_bins = torch.arange(4)
+        env._motion_lib.adp_sampling_active_prob = torch.full((4,), 0.25, dtype=torch.float64)
+        callback = self.callback_with(self.absent_context())
+        callback.on_train_begin(None, FakeState(), None, env=env)
+        env._motion_lib.update_adaptive_sampling_probabilities()
+        assert torch.allclose(
+            env._motion_lib.adp_sampling_active_prob,
+            torch.full((4,), 0.25, dtype=torch.float64),
+        )
+
+    def test_arms_once_the_context_becomes_resident(self, env):
+        env._motion_lib.adp_samp_active_motion_bins = torch.arange(4)
+        env._motion_lib.adp_sampling_active_prob = torch.full((4,), 0.25, dtype=torch.float64)
+        callback = self.callback_with(self.absent_context())
+        callback.on_train_begin(None, FakeState(), None, env=env)
+        assert callback._armed is False
+
+        # A resample brings the whole pool back, including motion 2.
+        env._motion_lib.adp_samp_active_motion_bins = torch.arange(12)
+        env._motion_lib.adp_sampling_active_prob = torch.full((12,), 1 / 12, dtype=torch.float64)
+        callback.on_step_end(None, FakeState(3), None, env=env)
+        assert callback._armed is True
+        assert callback._first_armed_step == 3
+
+    def test_dose_report_records_never_armed(self, env, tmp_path):
+        env._motion_lib.adp_samp_active_motion_bins = torch.arange(4)
+        env._motion_lib.adp_sampling_active_prob = torch.full((4,), 0.25, dtype=torch.float64)
+        callback = C.PracticeContextCallback(
+            enabled=True, role="intervention", pair_id="p0",
+            context=self.absent_context().to_dict(), epsilon=0.25,
+            dose_report_dir=str(tmp_path),
+        )
+        callback.on_train_begin(None, FakeState(), None, env=env)
+        payload = json.loads(open(callback.write_dose_report(5)).read())
+        assert payload["never_armed"] is True
+        assert payload["armed"] is False
+        assert payload["arm_attempts"] >= 1
+
+    def test_dose_report_counts_armed_steps(self, env, tmp_path):
+        callback = C.PracticeContextCallback(
+            enabled=True, role="intervention", pair_id="p0",
+            context=context_for().to_dict(), epsilon=0.1,
+            dose_report_dir=str(tmp_path),
+        )
+        callback.on_train_begin(None, FakeState(), None, env=env)
+        for step in range(1, 4):
+            callback.on_step_end(None, FakeState(step), None, env=env)
+        payload = json.loads(open(callback.write_dose_report(3)).read())
+        assert payload["armed_steps"] == 3
+        assert payload["never_armed"] is False
+        assert payload["first_armed_step"] == 0
+
+
 class TestCapsuleCallback:
     def make(self, tmp_path, **overrides):
         params = dict(

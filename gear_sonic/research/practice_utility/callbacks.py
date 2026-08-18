@@ -83,6 +83,13 @@ class PracticeContextCallback(TrainerCallback):
         # difficulty axis at all. Snapshot after warm-up instead.
         self.snapshot_at_step = int(snapshot_at_step)
         self._snapshot_written = False
+        # A context is only armable while its motion is resident. SONIC keeps a
+        # subset of the pool loaded (195 of 512 motions in a measured run), so a
+        # branch whose context is absent at install must wait for a resample
+        # rather than die -- otherwise most of a campaign never starts.
+        self._arm_attempts = 0
+        self._armed_steps = 0
+        self._first_armed_step: int | None = None
 
         self.adapter: PracticeSamplerAdapter | None = None
         self._motion_lib: Any = None
@@ -109,9 +116,14 @@ class PracticeContextCallback(TrainerCallback):
             return control
         if self.adapter is None:
             self._install(kwargs.get("env"))
-        # A motion resample swaps the resident batch out from under the kernel.
-        self._rearm_if_stale()
         step = getattr(state, "global_step", 0) if state is not None else 0
+        # A motion resample swaps the resident batch out from under the kernel,
+        # and may also bring an absent context into residence.
+        self._rearm_if_stale()
+        if self.context is not None and not self._armed:
+            self._arm(step)
+        if self._armed:
+            self._armed_steps += 1
         if (
             self.snapshot_path
             and not self._snapshot_written
@@ -214,16 +226,35 @@ class PracticeContextCallback(TrainerCallback):
 
     # ------------------------------------------------------------- arming --
 
-    def _arm(self) -> None:
+    def _arm(self, global_step: int = 0) -> bool:
+        """Arm the intervention if the context is resident. Never fatal.
+
+        Returns whether the branch is armed. A context absent from the current
+        motion batch is a normal, transient condition -- SONIC holds only part of
+        the pool in memory and rotates it -- so this records the attempt and
+        returns False instead of raising. A branch that never manages to arm
+        delivers no dose, and ``build_utility_record`` already refuses to emit a
+        label in that case, which is where the failure belongs: loud at label
+        time, quiet at install.
+        """
         if self.adapter is None or self.context is None:
             self._armed = False
-            return
-        # epsilon == 0 is armed deliberately: the noise-floor branch must travel
-        # the same code path as a real intervention.
-        self.adapter.set_intervention(
-            self.context, epsilon=self.epsilon, kernel_radius=self.kernel_radius_bins
-        )
+            return False
+        self._arm_attempts += 1
+        try:
+            # epsilon == 0 is armed deliberately: the noise-floor branch must
+            # travel the same code path as a real intervention.
+            self.adapter.set_intervention(
+                self.context, epsilon=self.epsilon, kernel_radius=self.kernel_radius_bins
+            )
+        except ValueError:
+            self.adapter.clear_override()
+            self._armed = False
+            return False
         self._armed = True
+        if self._first_armed_step is None:
+            self._first_armed_step = global_step
+        return True
 
     def _rearm_if_stale(self) -> None:
         if not self._armed or self.adapter is None or self.context is None:
@@ -232,13 +263,10 @@ class PracticeContextCallback(TrainerCallback):
         kernel = self.adapter._kernel_weights
         if resident is None or kernel is None or kernel.numel() == resident.numel():
             return
-        try:
-            self._arm()
-        except ValueError:
-            # The context is no longer resident after the resample. Fall back to
-            # the native distribution rather than intervening on a stale kernel.
+        if not self._arm():
+            # The context is no longer resident after the resample; fall back to
+            # the native distribution rather than intervene through a stale kernel.
             self.adapter.clear_override()
-            self._armed = False
 
     def _load_manifest(self) -> MotionPoolManifest | None:
         if not self.manifest_path:
@@ -320,6 +348,10 @@ class PracticeContextCallback(TrainerCallback):
                     "epsilon": self.epsilon,
                     "kernel_radius_bins": self.kernel_radius_bins,
                     "armed": self._armed,
+                    "armed_steps": self._armed_steps,
+                    "arm_attempts": self._arm_attempts,
+                    "first_armed_step": self._first_armed_step,
+                    "never_armed": self._first_armed_step is None,
                     "drawn_episodes": report.drawn_episodes,
                     "drawn_kernel_mass": report.drawn_kernel_mass,
                     "completed_env_steps": report.completed_env_steps,
