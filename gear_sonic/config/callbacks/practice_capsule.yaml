@@ -1,0 +1,14 @@
+# Saves branch capsules -- model, optimizer, sampler counters, and the RNG state
+# that ModelSaveCallback omits -- at the nested horizon checkpoints.
+practice_capsule:
+  _target_: gear_sonic.research.practice_utility.callbacks.PracticeCapsuleCallback
+  enabled: false
+  capsule_dir: ${experiment_dir}/capsules
+  horizons:
+    H_s: 8
+    H_m: 32
+    H_l: 128
+  pair_id: unbound
+  role: control
+  branch_id: null
+  provenance: null

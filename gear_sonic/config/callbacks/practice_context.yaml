@@ -1,0 +1,15 @@
+# Practice-utility context callback. Disabled by default: with `enabled: false`
+# nothing is patched, observed, or written, so a research-off run is the native
+# SONIC run.
+practice_context:
+  _target_: gear_sonic.research.practice_utility.callbacks.PracticeContextCallback
+  enabled: false
+  role: control            # control | intervention
+  pair_id: unbound
+  branch_id: null
+  context: null            # ContextKey dict; required when role == intervention
+  epsilon: 0.0             # 0.0 is a real condition: the noise-floor branch
+  kernel_radius_bins: 1
+  dose_report_dir: null
+  dose_report_frequency: 0
+  manifest_path: null
