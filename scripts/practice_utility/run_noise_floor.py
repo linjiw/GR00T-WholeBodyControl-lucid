@@ -128,7 +128,8 @@ def run(command, log_path) -> tuple[int, float]:
 
 
 def summarize(results, iterations) -> dict:
-    """Paired differences per metric, and the resulting floor."""
+    """Paired differences per metric, plus the cross-seed divergence floor."""
+    cross_seed = cross_seed_spread(results)
     floor: dict[str, dict] = {}
     for metric in FLOOR_METRICS:
         deltas, finals = [], []
@@ -160,13 +161,50 @@ def summarize(results, iterations) -> dict:
         "schema_version": 1,
         "iterations_per_branch": iterations,
         "metrics": floor,
+        "cross_seed_control_spread": cross_seed,
         "interpretation": (
-            "sd_delta is the paired branch noise at epsilon = 0, where the true "
-            "effect is zero by construction. Gate A requires between-context "
-            "utility variation to exceed it; any context-level difference smaller "
-            "than this is indistinguishable from branch noise."
+            "Two different floors, and they answer different questions.\n"
+            "epsilon=0 same-seed paired delta (metrics.*.sd_delta) is MACHINERY "
+            "noise: it shows whether arming the intervention path perturbs a run "
+            "that should be unchanged. Near-zero here is the end-to-end "
+            "confirmation of the epsilon=0 identity guarantee.\n"
+            "It does NOT bound the noise a real intervention faces. Once epsilon>0 "
+            "changes which bins are sampled, RNG consumption diverges and "
+            "trajectories separate; an epsilon=0 pair cannot exhibit that by "
+            "construction. cross_seed_control_spread estimates that divergence "
+            "component from control runs at different seeds, and it is the floor "
+            "Gate A should be judged against."
         ),
     }
+
+
+def cross_seed_spread(results) -> dict:
+    """Spread across control runs at different seeds.
+
+    This is the practically relevant floor. An epsilon=0 pair shares its whole
+    random stream, so it cannot show the divergence a real intervention causes
+    the moment it samples a different bin. Different-seed controls do exhibit
+    exactly that divergence while having no treatment effect at all.
+    """
+    spread: dict[str, dict] = {}
+    for metric in FLOOR_METRICS:
+        finals = []
+        for entry in results:
+            series = entry.get("control_series", {}).get(metric, {})
+            if series:
+                finals.append(series[max(series)])
+        if len(finals) < 2:
+            continue
+        mean = statistics.fmean(finals)
+        sd = statistics.stdev(finals)
+        spread[metric] = {
+            "num_seeds": len(finals),
+            "final_values": finals,
+            "mean": mean,
+            "sd": sd,
+            "relative_sd": sd / abs(mean) if mean else None,
+        }
+    return spread
 
 
 def main(argv=None) -> int:
@@ -210,12 +248,17 @@ def main(argv=None) -> int:
     path = args.out_dir / "noise_floor_report.json"
     path.write_text(json.dumps(report, indent=2))
 
-    print("\nnoise floor (epsilon = 0 paired deltas):")
+    print("\nMACHINERY noise (epsilon = 0, same seed -- shared random stream):")
     for metric, stats in report["metrics"].items():
         rel = f"{stats['relative_sd']:.4f}" if stats["relative_sd"] is not None else "n/a"
-        print(f"  {metric:16s} n={stats['num_pairs']} sd={stats['sd_delta']:.5f} "
-              f"max|d|={stats['max_abs_delta']:.5f} level={stats['control_level_mean']:.4f} "
+        print(f"  {metric:16s} n={stats['num_pairs']} sd={stats['sd_delta']:.6f} "
+              f"max|d|={stats['max_abs_delta']:.6f} level={stats['control_level_mean']:.4f} "
               f"rel_sd={rel}")
+    print("\nDIVERGENCE noise (control runs, different seeds -- the floor Gate A faces):")
+    for metric, stats in report["cross_seed_control_spread"].items():
+        rel = f"{stats['relative_sd']:.4f}" if stats["relative_sd"] is not None else "n/a"
+        print(f"  {metric:16s} n={stats['num_seeds']} sd={stats['sd']:.6f} "
+              f"mean={stats['mean']:.4f} rel_sd={rel}")
     print(f"\nwrote {path}")
     return 0
 
