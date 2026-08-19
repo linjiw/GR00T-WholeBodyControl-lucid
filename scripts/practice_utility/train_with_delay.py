@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 """Run SONIC training with delayed actuators enabled.
 
-A thin launcher: it enables the delayed actuators, prints what it swapped, then
-hands off to ``gear_sonic/train_agent_trl.py`` with every argument untouched.
-Keeping the swap here rather than in ``robots/g1.py`` means a baseline arm run
-through the ordinary entrypoint is genuinely unmodified.
+A thin launcher: it arranges for the actuator swap to happen at the one moment
+it can, then hands off to ``gear_sonic/train_agent_trl.py`` with every argument
+untouched. Keeping the swap here rather than in ``robots/g1.py`` means a
+baseline arm run through the ordinary entrypoint is genuinely unmodified.
+
+On the timing, which is fiddly and was wrong once
+-------------------------------------------------
+``robots/g1.py`` cannot be imported until Isaac Sim exists, and Isaac Sim is
+launched by ``AppLauncher`` *inside* ``train_agent_trl.main`` -- not at import
+time, as an earlier version of this script assumed. Patching right after
+importing the module therefore failed with ``No module named 'isaaclab.envs'``.
+
+The swap must land after the app launches but before the environment config
+resolves the robot, and there is exactly one seam that satisfies both:
+``create_manager_env``, which calls ``custom_instantiate(config.manager_env)``
+and is itself called well after the launcher. So that function is wrapped.
+
+``main`` is invoked directly rather than through ``runpy``: running the file
+again would build a fresh module object and quietly discard the patch.
 
     python scripts/practice_utility/train_with_delay.py --max-delay 8 -- \
         +exp=manager/universal_token/all_modes/sonic_release ...
@@ -13,7 +28,6 @@ through the ordinary entrypoint is genuinely unmodified.
 from __future__ import annotations
 
 import argparse
-import runpy
 import sys
 from pathlib import Path
 
@@ -32,28 +46,36 @@ def main(argv=None) -> int:
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
 
-    # Isaac Sim must be launched before isaaclab imports resolve, and
-    # train_agent_trl does that at import time via AppLauncher. The swap has to
-    # land after that import but before the env config is built, so the module
-    # is imported first and patched immediately afterwards.
-    import gear_sonic.train_agent_trl  # noqa: F401  (launches the app)
+    import gear_sonic.train_agent_trl as trainer
 
-    from gear_sonic.research.practice_utility.actuator_patch import (
-        describe_actuators,
-        enable_delayed_actuators,
-    )
+    original_create_env = trainer.create_manager_env
 
-    report = enable_delayed_actuators(max_delay=known.max_delay, min_delay=known.min_delay)
-    print(f"[latency] swapped {report['num_groups']} actuator groups, "
-          f"max_delay={known.max_delay} steps "
-          f"({known.max_delay * 5} ms at 200 Hz)")
-    for group, klass in describe_actuators().items():
-        print(f"[latency]   {group}: {klass}")
-    if report["num_groups"] == 0:
-        print("[latency] WARNING: nothing was swapped; this run has NO latency")
+    def create_manager_env_with_delay(config, device, args_cli):
+        # Isaac Sim is up by now, so robots/g1.py and the delayed actuator are
+        # importable; the env config has not yet resolved the robot.
+        from gear_sonic.research.practice_utility.actuator_patch import (
+            describe_actuators,
+            enable_delayed_actuators,
+        )
+
+        report = enable_delayed_actuators(
+            max_delay=known.max_delay, min_delay=known.min_delay
+        )
+        print(
+            f"[latency] swapped {report['num_groups']} actuator groups, "
+            f"max_delay={known.max_delay} steps ({known.max_delay * 5} ms at 200 Hz)",
+            flush=True,
+        )
+        for group, klass in describe_actuators().items():
+            print(f"[latency]   {group}: {klass}", flush=True)
+        if report["num_groups"] == 0:
+            print("[latency] WARNING: nothing was swapped; this run has NO latency", flush=True)
+        return original_create_env(config, device, args_cli)
+
+    trainer.create_manager_env = create_manager_env_with_delay
 
     sys.argv = [str(REPO / "gear_sonic" / "train_agent_trl.py"), *passthrough]
-    runpy.run_path(str(REPO / "gear_sonic" / "train_agent_trl.py"), run_name="__main__")
+    trainer.main()
     return 0
 
 
