@@ -412,3 +412,40 @@ def sticky(inner: Any, key: str, every: int = 1):
         f"Wrapped to resample only every {every} episode resets (channel {key!r})."
     )
     return wrapper
+
+
+# --------------------------------------------------------------------------
+# Event config carrying the latency channel
+# --------------------------------------------------------------------------
+
+
+def _build_event_cfg():
+    """Subclass SONIC's EventCfg with a latency slot.
+
+    SONIC's ``EventCfg`` declares its terms as fixed class attributes, so a new
+    randomization channel needs a new field. Subclassing here rather than editing
+    the upstream class keeps every unmodified run genuinely unmodified -- and a
+    baseline arm that shares a mutated robot or event config with the treatment
+    arm is not a baseline.
+
+    Built lazily because the parent lives behind an Isaac Sim import.
+    """
+    from isaaclab.utils import configclass
+
+    from gear_sonic.envs.manager_env.mdp.events import EventCfg
+
+    @configclass
+    class LucidEventCfg(EventCfg):
+        """SONIC's events plus a curriculum-scalable actuation-latency term."""
+
+        randomize_action_delay = None
+
+    return LucidEventCfg
+
+
+def __getattr__(name: str):
+    # Module-level lazy attribute so `LucidEventCfg` resolves only once Isaac is
+    # importable, while `_target_` strings referencing it stay valid in configs.
+    if name == "LucidEventCfg":
+        return _build_event_cfg()
+    raise AttributeError(name)

@@ -1,0 +1,18 @@
+# Curriculum-scalable actuation latency, in PHYSICS STEPS (5 ms each at 200 Hz).
+#
+# Requires the delayed actuators to be enabled -- see
+# scripts/practice_utility/train_with_delay.py. Without them this term reports
+# that it touched zero actuators rather than silently applying no latency.
+#
+# delay_range is registered in dr_scaling.RANGE_NOMINALS with nominal 0, so
+# lambda scales it: lambda=0 -> [0, 0] (bit-identical to no latency),
+# lambda=1 -> [0, 8] = 0-40 ms, LUCID's training range.
+randomize_action_delay:
+  _target_: isaaclab.managers.EventTermCfg
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_action_delay
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+    delay_range: [0.0, 8.0]

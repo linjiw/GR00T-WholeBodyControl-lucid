@@ -32,8 +32,11 @@ defaults:
   - terms/base_com@_here_
   - terms/push_robot@_here_
   - terms/randomize_rigid_body_mass@_here_
+  - terms/randomize_action_delay@_here_
 
-_target_: gear_sonic.envs.manager_env.mdp.events.EventCfg
+# Subclasses SONIC's EventCfg with a latency slot, so upstream stays untouched
+# and a baseline arm run through the stock config is genuinely unmodified.
+_target_: gear_sonic.research.practice_utility.events_reset_safe.LucidEventCfg
 
 # Mass: IsaacLab's term is already reset-safe.
 randomize_rigid_body_mass:
