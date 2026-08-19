@@ -388,3 +388,100 @@ class TestDelayIsCurriculumScalable:
         env = env_with_actuators({"legs": FakeDelayedActuator()})
         E.randomize_action_delay(env, None, scale_range([0.0, 8.0], 0.25, 0.0), Cfg())
         assert int(env.asset.actuators["legs"].positions_delay_buffer.time_lags.max()) <= 2
+
+
+class TestStickyResampling:
+    """Holding a draw for K episodes decouples randomization *width* (lambda,
+    slow) from randomization *frequency* (resample_every, fast)."""
+
+    class Scene:
+        num_envs = 12
+
+    class Env:
+        def __init__(self):
+            self.scene = TestStickyResampling.Scene()
+
+    def test_every_one_is_a_pass_through(self):
+        env, ids = self.Env(), torch.arange(12)
+        assert E.due_for_resample(env, ids, 1, "k").tolist() == ids.tolist()
+
+    def test_every_zero_is_a_pass_through(self):
+        env, ids = self.Env(), torch.arange(12)
+        assert E.due_for_resample(env, ids, 0, "k").tolist() == ids.tolist()
+
+    def test_average_redraw_rate_matches_one_over_every(self):
+        torch.manual_seed(0)
+        env, ids = self.Env(), torch.arange(12)
+        total = sum(E.due_for_resample(env, ids, 4, "k").numel() for _ in range(40))
+        assert total / 40 == pytest.approx(3.0, abs=0.35)   # 12 envs / every 4
+
+    def test_phases_are_staggered_not_lockstep(self):
+        """A zero-init counter redraws the whole batch at once -- a synchronised
+        physics shock, the opposite of what sticky DR is for."""
+        torch.manual_seed(0)
+        env, ids = self.Env(), torch.arange(12)
+        sizes = [E.due_for_resample(env, ids, 4, "k").numel() for _ in range(8)]
+        assert max(sizes) < 12
+
+    def test_each_env_redraws_exactly_once_per_period(self):
+        torch.manual_seed(0)
+        env, ids = self.Env(), torch.arange(12)
+        seen = []
+        for _ in range(4):
+            seen.extend(E.due_for_resample(env, ids, 4, "k").tolist())
+        assert sorted(seen) == list(range(12))
+
+    def test_channels_keep_independent_counters(self):
+        torch.manual_seed(0)
+        env, ids = self.Env(), torch.arange(12)
+        for _ in range(3):
+            E.due_for_resample(env, ids, 4, "mass")
+        fresh = E.due_for_resample(env, ids, 1, "push")
+        assert fresh.tolist() == ids.tolist()
+
+    def test_partial_env_ids_only_advance_their_own_counters(self):
+        torch.manual_seed(0)
+        env = self.Env()
+        for _ in range(10):
+            E.due_for_resample(env, torch.tensor([0, 1]), 4, "k")
+        counters = getattr(env, E.RESAMPLE_COUNTER)["k"]
+        assert int(counters[0]) >= 10 and int(counters[5]) < 10
+
+    def test_sticky_wrapper_forwards_only_due_envs(self):
+        torch.manual_seed(0)
+        env = self.Env()
+        calls = []
+
+        def inner(env, env_ids, scale):
+            calls.append((env_ids.tolist(), scale))
+
+        wrapped = E.sticky(inner, "mass", every=4)
+        for _ in range(4):
+            wrapped(env, torch.arange(12), scale=2.0)
+        forwarded = sorted(i for call, _ in calls for i in call)
+        assert forwarded == list(range(12))
+
+    def test_sticky_wrapper_skips_when_nothing_is_due(self):
+        torch.manual_seed(0)
+        env = self.Env()
+        calls = []
+        wrapped = E.sticky(lambda e, ids: calls.append(ids), "k", every=1000)
+        for _ in range(3):
+            wrapped(env, torch.arange(12))
+        assert len(calls) <= 1        # at most the initially-phased envs
+
+    def test_sticky_wrapper_preserves_arguments(self):
+        env = self.Env()
+        seen = {}
+
+        def inner(env, env_ids, a, b=None):
+            seen["a"], seen["b"] = a, b
+
+        E.sticky(inner, "k", every=1)(env, torch.arange(12), 7, b=9)
+        assert seen == {"a": 7, "b": 9}
+
+    def test_sticky_wrapper_handles_none_env_ids(self):
+        env = self.Env()
+        calls = []
+        E.sticky(lambda e, ids: calls.append(ids.numel()), "k", every=1)(env, None)
+        assert calls == [12]

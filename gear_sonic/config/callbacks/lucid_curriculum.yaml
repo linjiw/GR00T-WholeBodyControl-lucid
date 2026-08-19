@@ -25,3 +25,17 @@ lucid_curriculum:
   return_floor: null
   return_decay: 0.5
   update_every: 1
+
+  # Hold lambda for the first N iterations after a (re)start. Gap and return
+  # estimates are dominated by the restart transient -- measured at up to 28%
+  # relative spread in early iterations -- so reacting to them moves difficulty
+  # on noise.
+  warmup_iterations: 4
+  # Path to a curriculum_state_*.json to resume from. WITHOUT THIS a resumed run
+  # silently restarts the curriculum at initial_lambda: the environment jumps
+  # back to easy and the curriculum re-climbs from zero. Nothing errors; the
+  # learning curve just looks worse than it should.
+  resume_state_path: null
+  # Optional cap on how far lambda may jump on resume, for when the restored
+  # intensity does not match the environment about to be trained in.
+  max_lambda_step_on_resume: null

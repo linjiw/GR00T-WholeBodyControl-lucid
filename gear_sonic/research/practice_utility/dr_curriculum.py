@@ -22,6 +22,26 @@ from gear_sonic.research.practice_utility import dr_scaling as DS
 from gear_sonic.research.practice_utility import observer as OBS
 from gear_sonic.research.practice_utility.dr_controller import LucidDRController, PIConfig
 
+#: Active curriculum callbacks, so a checkpoint writer can capture their state
+#: without Hydra having to wire the two callbacks together.
+_ACTIVE_CURRICULA: dict[str, "LucidCurriculumCallback"] = {}
+
+
+def register_curriculum(callback: "LucidCurriculumCallback") -> None:
+    _ACTIVE_CURRICULA[callback.branch_id] = callback
+
+
+def get_active_curriculum(branch_id: str | None = None) -> "LucidCurriculumCallback | None":
+    if branch_id is not None:
+        return _ACTIVE_CURRICULA.get(branch_id)
+    if len(_ACTIVE_CURRICULA) == 1:
+        return next(iter(_ACTIVE_CURRICULA.values()))
+    return None
+
+
+def clear_curricula() -> None:
+    _ACTIVE_CURRICULA.clear()
+
 try:  # pragma: no cover
     from transformers import TrainerCallback
 except Exception:  # pragma: no cover
@@ -50,6 +70,9 @@ class LucidCurriculumCallback(TrainerCallback):
         return_floor: float | None = None,
         return_decay: float = 0.5,
         update_every: int = 1,
+        warmup_iterations: int = 0,
+        resume_state_path: str | None = None,
+        max_lambda_step_on_resume: float | None = None,
     ) -> None:
         if mode not in ("lucid", "fixed", "off"):
             raise ValueError(f"unknown curriculum mode {mode!r}; expected lucid/fixed/off")
@@ -60,6 +83,15 @@ class LucidCurriculumCallback(TrainerCallback):
         self.branch_id = branch_id
         self.fixed_lambda = float(fixed_lambda)
         self.update_every = max(1, int(update_every))
+        # After a (re)start the gap and return estimates are dominated by the
+        # restart transient -- measured at up to 28% relative spread in the first
+        # iterations. Reacting to that moves difficulty on noise, so hold lambda
+        # until the run has settled.
+        self.warmup_iterations = max(0, int(warmup_iterations))
+        self.resume_state_path = resume_state_path
+        self.max_lambda_step_on_resume = max_lambda_step_on_resume
+        self._start_step: int | None = None
+        self._resumed_from: dict[str, Any] | None = None
 
         self.controller = LucidDRController(
             PIConfig(
@@ -79,6 +111,14 @@ class LucidCurriculumCallback(TrainerCallback):
         if not self.enabled:
             return control
         self._bind(kwargs.get("env"))
+        register_curriculum(self)
+        # Restore before the first rollout. Without this a resumed run silently
+        # restarts the curriculum at initial_lambda: the environment jumps back
+        # to easy, the policy is briefly trained on a distribution it has already
+        # outgrown, and the curriculum re-climbs from zero. Nothing errors, and
+        # the learning curve simply looks worse than it should.
+        if self.resume_state_path:
+            self.load_state_file(self.resume_state_path)
         # Apply the starting intensity before the first rollout, so iteration 1
         # already trains under the curriculum rather than under whatever the
         # config happened to declare.
@@ -91,6 +131,16 @@ class LucidCurriculumCallback(TrainerCallback):
         if self._event_manager is None:
             self._bind(kwargs.get("env"))
         step = getattr(state, "global_step", 0) if state is not None else 0
+        if self._start_step is None:
+            self._start_step = step
+        if step - self._start_step < self.warmup_iterations:
+            # Hold, but keep applying, so the restored intensity is in force.
+            self._apply(self.controller.lambda_value)
+            self.history.append({
+                "global_step": step, "mode": self.mode, "lambda": self.controller.lambda_value,
+                "gap_quantile": None, "warmup_hold": True,
+            })
+            return control
         if step % self.update_every:
             return control
 
@@ -110,8 +160,13 @@ class LucidCurriculumCallback(TrainerCallback):
                       **outcome.to_dict()}
 
         record["scalable_terms"] = self.scalable
+        if self._resumed_from is not None:
+            record["resumed_from"] = self._resumed_from
         self.history.append(record)
         self._write(record)
+        # Persist every update, so a run killed between checkpoints still
+        # resumes with the curriculum it had rather than with lambda = 0.
+        self.save_state_file()
         return control
 
     # ------------------------------------------------------------- internals --
@@ -145,6 +200,60 @@ class LucidCurriculumCallback(TrainerCallback):
                     except (TypeError, ValueError):
                         continue
         return None
+
+    # ------------------------------------------------------------ persistence --
+
+    def state_dict(self) -> dict[str, Any]:
+        """Curriculum state that must ride along with a checkpoint."""
+        return {
+            "schema_version": 1,
+            "mode": self.mode,
+            "branch_id": self.branch_id,
+            "controller": self.controller.state_dict(),
+            "scalable_terms": self.scalable,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore lambda and the integral, optionally rate-limiting the jump.
+
+        ``max_lambda_step_on_resume`` exists for the case where the restored
+        intensity does not match the environment the run is about to train in --
+        a changed config, a different pool, a hand-edited lambda. Jumping
+        straight there reintroduces exactly the shock the curriculum is meant to
+        avoid, so the move can be capped and closed over subsequent epochs.
+        """
+        controller_state = state.get("controller")
+        if not controller_state:
+            return
+        target = float(controller_state.get("lambda_value", self.controller.lambda_value))
+        self.controller.load_state_dict(controller_state)
+        if self.max_lambda_step_on_resume is not None:
+            current = float(self.controller.config.lambda_min)
+            capped = min(target, current + abs(self.max_lambda_step_on_resume))
+            self.controller.lambda_value = capped
+        self._resumed_from = {
+            "lambda": target,
+            "applied_lambda": self.controller.lambda_value,
+            "epoch": self.controller.epoch,
+        }
+
+    def save_state_file(self, path: str | None = None) -> str | None:
+        target = Path(path) if path else (
+            Path(self.output_dir) / f"curriculum_state_{self.branch_id}.json"
+            if self.output_dir else None
+        )
+        if target is None:
+            return None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(self.state_dict(), indent=2, default=str))
+        return str(target)
+
+    def load_state_file(self, path: str) -> bool:
+        source = Path(path)
+        if not source.exists():
+            return False
+        self.load_state_dict(json.loads(source.read_text()))
+        return True
 
     def _write(self, record: dict[str, Any]) -> None:
         if not self.output_dir:

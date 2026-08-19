@@ -569,3 +569,116 @@ class TestObserverRegistry:
 
     def test_unknown_name_returns_none(self):
         assert OBS.get_active_observer("nope") is None
+
+
+class TestCurriculumSurvivesResume:
+    """A resumed run must not silently restart the curriculum at lambda = 0."""
+
+    def trained(self, tmp_path, steps=6):
+        env = FakeEnvWithEvents()
+        OBS.register_observer(StubObserver([0.01] * 20))
+        callback = curriculum(alpha=0.2, output_dir=str(tmp_path))
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        for step in range(1, steps + 1):
+            callback.on_step_end(None, FakeStateWithHistory(step, mean_reward=10.0), None, env=env)
+        return callback, env
+
+    def test_lambda_is_restored(self, tmp_path):
+        first, _ = self.trained(tmp_path)
+        assert first.controller.lambda_value > 0.1
+
+        resumed = curriculum(resume_state_path=str(
+            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
+        assert resumed.controller.lambda_value == pytest.approx(first.controller.lambda_value)
+
+    def test_integral_is_restored(self, tmp_path):
+        first, _ = self.trained(tmp_path)
+        resumed = curriculum(resume_state_path=str(
+            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
+        assert resumed.controller.integral == pytest.approx(first.controller.integral)
+
+    def test_without_resume_the_curriculum_restarts_at_zero(self, tmp_path):
+        """The defect this guards: nothing errors, the curve just looks worse."""
+        first, _ = self.trained(tmp_path)
+        naive = curriculum()
+        naive.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
+        assert naive.controller.lambda_value == 0.0
+        assert first.controller.lambda_value > naive.controller.lambda_value
+
+    def test_restored_intensity_is_applied_before_the_first_rollout(self, tmp_path):
+        first, _ = self.trained(tmp_path)
+        env = FakeEnvWithEvents()
+        resumed = curriculum(resume_state_path=str(
+            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        low, high = env.event_manager._terms[
+            "randomize_rigid_body_mass"].params["mass_distribution_params"]
+        assert low < 1.0 < high        # DR already widened, not reset to nominal
+
+    def test_resume_records_where_it_came_from(self, tmp_path):
+        first, _ = self.trained(tmp_path)
+        env = FakeEnvWithEvents()
+        OBS.register_observer(StubObserver([0.01] * 20))
+        resumed = curriculum(resume_state_path=str(
+            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        resumed.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
+        assert "resumed_from" in resumed.history[-1]
+
+    def test_a_missing_state_file_is_survivable(self, tmp_path):
+        callback = curriculum(resume_state_path=str(tmp_path / "absent.json"))
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
+        assert callback.controller.lambda_value == 0.0
+
+    def test_resume_jump_can_be_rate_limited(self, tmp_path):
+        first, _ = self.trained(tmp_path, steps=10)
+        resumed = curriculum(
+            resume_state_path=str(tmp_path / f"curriculum_state_{first.branch_id}.json"),
+            max_lambda_step_on_resume=0.02)
+        resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
+        assert resumed.controller.lambda_value <= 0.02 + 1e-9
+        assert resumed.controller.lambda_value < first.controller.lambda_value
+
+    def test_state_file_is_written_every_update(self, tmp_path):
+        self.trained(tmp_path, steps=3)
+        assert (tmp_path / "curriculum_state_b0.json").exists()
+
+
+class TestWarmupHold:
+    def test_lambda_is_held_during_warmup(self):
+        env = FakeEnvWithEvents()
+        OBS.register_observer(StubObserver([0.001] * 20))
+        callback = curriculum(alpha=0.5, warmup_iterations=3)
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        for step in (1, 2, 3):
+            callback.on_step_end(None, FakeStateWithHistory(step, mean_reward=10.0), None, env=env)
+        assert all(r.get("warmup_hold") for r in callback.history)
+        assert callback.controller.lambda_value == 0.0
+
+    def test_updates_resume_after_warmup(self):
+        env = FakeEnvWithEvents()
+        OBS.register_observer(StubObserver([0.001] * 20))
+        callback = curriculum(alpha=0.5, warmup_iterations=2)
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        for step in range(1, 6):
+            callback.on_step_end(None, FakeStateWithHistory(step, mean_reward=10.0), None, env=env)
+        assert callback.controller.lambda_value > 0.0
+
+    def test_warmup_still_applies_the_restored_intensity(self):
+        env = FakeEnvWithEvents()
+        callback = curriculum(warmup_iterations=5, initial_lambda=0.6)
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        callback.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
+        low, high = env.event_manager._terms[
+            "randomize_rigid_body_mass"].params["mass_distribution_params"]
+        assert low == pytest.approx(1.0 - 0.6 * 0.2)
+
+    def test_zero_warmup_updates_immediately(self):
+        env = FakeEnvWithEvents()
+        OBS.register_observer(StubObserver([0.001] * 20))
+        callback = curriculum(alpha=0.5, warmup_iterations=0)
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        callback.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
+        assert callback.controller.lambda_value > 0.0

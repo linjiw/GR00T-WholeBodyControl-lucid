@@ -332,3 +332,83 @@ def _buffer_capacity(buffer: Any) -> int | None:
         if isinstance(value, int) and value >= 0:
             return value
     return None
+
+
+# --------------------------------------------------------------------------
+# Piecewise-stationary randomization ("sticky" DR)
+# --------------------------------------------------------------------------
+#
+# Reset-mode terms redraw every episode, so each env's dynamics change
+# constantly. That is textbook domain randomization, but it maximises gradient
+# variance: every episode is a different MDP, and the policy never gets a
+# stationary stretch to actually fit.
+#
+# Holding a draw for K consecutive episodes decouples two timescales that are
+# otherwise fused:
+#   * how *wide* the randomization is        -> lambda, the curriculum (slow)
+#   * how *often* an env sees a new draw     -> resample_every (fast, but tunable)
+#
+# With K > 1 each environment trains on one fixed set of physics for K episodes,
+# so within a block the problem is stationary; across the population the policy
+# still sees the full distribution, because different envs are on different
+# phases of their counters.
+
+#: Where the per-env resample counter is cached on the environment.
+RESAMPLE_COUNTER = "_practice_resample_counter"
+
+
+def due_for_resample(env: Any, env_ids: torch.Tensor, every: int, key: str) -> torch.Tensor:
+    """Subset of ``env_ids`` whose turn it is to draw new randomization.
+
+    Counters live per (channel) key, so channels can stick for different numbers
+    of episodes -- mass might hold for ten while pushes redraw every episode.
+
+    ``every <= 1`` returns ``env_ids`` unchanged, which is the ordinary
+    per-episode behaviour and costs nothing.
+    """
+    if every <= 1:
+        return env_ids
+    counters = getattr(env, RESAMPLE_COUNTER, None)
+    if counters is None:
+        counters = {}
+        setattr(env, RESAMPLE_COUNTER, counters)
+    num_envs = getattr(getattr(env, "scene", None), "num_envs", None) or int(env_ids.max()) + 1
+    counter = counters.get(key)
+    if counter is None or counter.numel() < num_envs:
+        # Seed each env at a random phase. A zero-initialised counter makes the
+        # whole population redraw on the same reset, so the entire batch changes
+        # physics at once -- a synchronised shock, and the opposite of what
+        # holding a draw is meant to buy. Staggered phases mean roughly 1/every
+        # of the envs redraw at any reset, so the population distribution stays
+        # smooth while each env still gets its stationary block.
+        counter = torch.randint(0, max(every, 1), (num_envs,), dtype=torch.long)
+        counters[key] = counter
+
+    ids = env_ids.detach().cpu().long()
+    due = (counter[ids] % every) == 0
+    counter[ids] += 1
+    return env_ids[due.to(env_ids.device)]
+
+
+def sticky(inner: Any, key: str, every: int = 1):
+    """Wrap a reset-mode event function so it only fires every ``every`` resets.
+
+    The wrapped function keeps its original signature, so this is a drop-in for
+    any ``mode: "reset"`` term.
+    """
+
+    def wrapper(env: Any, env_ids: torch.Tensor | None, *args: Any, **kwargs: Any):
+        if env_ids is None:
+            num_envs = env.scene.num_envs
+            env_ids = torch.arange(num_envs)
+        selected = due_for_resample(env, env_ids, every, key)
+        if selected.numel() == 0:
+            return None
+        return inner(env, selected, *args, **kwargs)
+
+    wrapper.__name__ = f"sticky_{getattr(inner, '__name__', key)}"
+    wrapper.__doc__ = (
+        f"{getattr(inner, '__doc__', '') or ''}\n\n"
+        f"Wrapped to resample only every {every} episode resets (channel {key!r})."
+    )
+    return wrapper
