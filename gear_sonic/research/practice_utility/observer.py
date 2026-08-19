@@ -133,6 +133,7 @@ class PracticeObserverCallback(TrainerCallback):
         self.history: list[dict[str, Any]] = []
         self._latent_gaps: list[float] = []
         self._raw_gaps: list[float] = []
+        self._last_flushed_gaps: list[float] = []
         self._sample_counter = 0
 
         self._env: Any = None
@@ -251,14 +252,23 @@ class PracticeObserverCallback(TrainerCallback):
     # ------------------------------------------------------------- reporting --
 
     def drain_gaps(self) -> list[float]:
-        """Hand the epoch's latent gaps to a consumer without clearing them.
+        """Hand the epoch's latent gaps to a consumer.
 
-        The curriculum reads these before ``_flush`` resets them, so callback
-        ordering matters: the curriculum must run before the observer's own
-        ``on_step_end``. Returning a copy keeps the observer's record intact
-        either way.
+        Returns the current epoch's gaps, or the previous epoch's if this one has
+        already been flushed. Callback order is decided by dict order in the
+        Hydra config, and a consumer that happens to run *after* the observer's
+        ``on_step_end`` would otherwise read an empty list and silently believe
+        the epoch produced no evidence -- which is exactly what happened on the
+        first live curriculum run: sixteen iterations of ``num_gap_samples = 0``
+        and a controller that correctly, uselessly, held lambda at zero.
+
+        Keeping the last flushed epoch makes the consumer order-independent at
+        the cost of at most one epoch of staleness, which a curriculum updating
+        once per iteration can absorb.
         """
-        return list(self._latent_gaps)
+        if self._latent_gaps:
+            return list(self._latent_gaps)
+        return list(self._last_flushed_gaps)
 
     def _flush(self, global_step: int) -> dict[str, Any]:
         latent = L.summarize_gap(torch.tensor(self._latent_gaps)) if self._latent_gaps else None
@@ -276,6 +286,7 @@ class PracticeObserverCallback(TrainerCallback):
             **({f"raw_{k.replace('gap_', '')}": v for k, v in raw.to_dict().items()} if raw else {}),
             **self.quality.snapshot(),
         }
+        self._last_flushed_gaps = list(self._latent_gaps)
         self._latent_gaps.clear()
         self._raw_gaps.clear()
         self.quality.reset()

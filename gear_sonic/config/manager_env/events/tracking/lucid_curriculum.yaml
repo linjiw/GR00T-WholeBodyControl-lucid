@@ -1,0 +1,69 @@
+# Domain-randomization events made schedulable by the LUCID curriculum.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# level0_4.yaml declares mass, friction, base CoM, and joint-default offsets as
+# mode: "startup". A startup term is applied once when the scene is built, so a
+# runtime curriculum cannot move it -- with the stock config a LUCID run
+# schedules exactly ONE channel (push_robot), which a live three-arm comparison
+# confirmed: scalable_terms = ['push_robot'].
+#
+# Flipping the mode is not sufficient. Three of the four terms accumulate across
+# resets because they randomize from the CURRENT value rather than a stored
+# nominal, so on every episode reset the perturbation stacks on the last one:
+#   - randomize_rigid_body_com     coms += rand   (and mis-broadcasts partial env_ids)
+#   - randomize_joint_default_pos  adds to the already-randomized default
+#   - randomize_rigid_body_material buckets are fixed at __init__, so rescaling
+#                                   its ranges has no effect at all
+# gear_sonic.research.practice_utility.events_reset_safe provides replacements
+# that cache the nominal on first call and re-derive from it thereafter;
+# dr_scaling resamples the material buckets when lambda changes.
+#
+# randomize_rigid_body_mass keeps IsaacLab's implementation: it already restores
+# default_mass before randomizing, which is the pattern the others were missing.
+#
+# COST: reset-mode CoM and material randomization use CPU tensors and a physics
+# view write per reset. Measure throughput against level0_4 before adopting this
+# for a long run.
+
+defaults:
+  - terms/physics_material@_here_
+  - terms/add_joint_default_pos@_here_
+  - terms/base_com@_here_
+  - terms/push_robot@_here_
+  - terms/randomize_rigid_body_mass@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.events.EventCfg
+
+# Mass: IsaacLab's term is already reset-safe.
+randomize_rigid_body_mass:
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      body_names: ".*wrist_yaw.*|torso_link"
+    mass_distribution_params: [0.8, 1.5]
+    operation: "scale"
+
+# CoM: reset-safe replacement; the stock one accumulates and mis-broadcasts.
+base_com:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_rigid_body_com
+  mode: "reset"
+
+# Joint defaults: reset-safe replacement; keeps the action offset in step.
+add_joint_default_pos:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_joint_default_pos
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    pos_distribution_params: [-0.01, 0.01]
+    operation: "add"
+
+# Friction/restitution: reset mode so the term runs again after startup, which
+# is what lets resampled buckets reach the simulation.
+physics_material:
+  mode: "reset"

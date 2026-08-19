@@ -273,6 +273,46 @@ class TestQualityIntegration:
         assert record["branch_id"] == "b0" and record["global_step"] == 1
 
 
+class TestDrainIsOrderIndependent:
+    """Callback order is dict order in the Hydra config, so a consumer must not
+    depend on running before the observer's own on_step_end."""
+
+    def collect(self, callback, env, steps=40):
+        callback.on_train_begin(None, State(0), None, env=env)
+        for _ in range(steps):
+            env.step(torch.zeros(NUM_ENVS, NUM_JOINTS))
+        return callback
+
+    def test_drain_before_flush_returns_the_current_epoch(self, encoder_artifact):
+        callback = self.collect(
+            OB.PracticeObserverCallback(enabled=True, encoder_path=encoder_artifact),
+            FakeEnv(lag=0.2))
+        assert len(callback.drain_gaps()) > 0
+
+    def test_drain_after_flush_still_returns_that_epoch(self, encoder_artifact):
+        """The bug: sixteen live iterations reported num_gap_samples = 0."""
+        env = FakeEnv(lag=0.2)
+        callback = self.collect(
+            OB.PracticeObserverCallback(enabled=True, encoder_path=encoder_artifact), env)
+        before = len(callback.drain_gaps())
+        callback.on_step_end(None, State(1), None, env=env)      # observer flushes first
+        assert len(callback.drain_gaps()) == before
+
+    def test_a_fresh_epoch_supersedes_the_stale_one(self, encoder_artifact):
+        env = FakeEnv(lag=0.2)
+        callback = self.collect(
+            OB.PracticeObserverCallback(enabled=True, encoder_path=encoder_artifact), env)
+        callback.on_step_end(None, State(1), None, env=env)
+        stale = callback.drain_gaps()
+        for _ in range(40):
+            env.step(torch.zeros(NUM_ENVS, NUM_JOINTS))
+        assert callback.drain_gaps() != stale
+
+    def test_drain_never_returns_none(self, encoder_artifact):
+        callback = OB.PracticeObserverCallback(enabled=True, encoder_path=encoder_artifact)
+        assert callback.drain_gaps() == []
+
+
 class TestBuffer:
     def test_respects_capacity(self):
         buffer = OB.CommandExecutionBuffer(capacity=4)
