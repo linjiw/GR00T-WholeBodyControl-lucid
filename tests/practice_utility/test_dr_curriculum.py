@@ -240,6 +240,81 @@ def manager():
     })
 
 
+class MaterialTerm:
+    """Mimics IsaacLab's class-based material term: buckets fixed at __init__.
+
+    IsaacLab stores the constructed instance back on ``cfg.func``
+    (manager_base.py:418), which is where the live buckets live.
+    """
+
+    def __init__(self, n=32):
+        import torch
+        self.material_buckets = torch.stack([
+            torch.empty(n).uniform_(0.3, 1.6),
+            torch.empty(n).uniform_(0.3, 1.2),
+            torch.empty(n).uniform_(0.0, 0.5),
+        ], dim=1)
+
+
+class MaterialCfg(Term):
+    def __init__(self, mode="reset"):
+        super().__init__(mode, {
+            "static_friction_range": [0.3, 1.6],
+            "dynamic_friction_range": [0.3, 1.2],
+            "restitution_range": [0.0, 0.5],
+            "num_buckets": 32,
+        })
+        self.func = MaterialTerm()
+
+
+class TestMaterialBucketsFollowLambda:
+    """Scaling the range parameters alone changes nothing -- buckets must move."""
+
+    def manager_with_material(self):
+        return Manager({"physics_material": MaterialCfg(mode="reset")})
+
+    def test_buckets_are_resampled_when_scaled(self):
+        m = self.manager_with_material()
+        term = m._terms["physics_material"].func
+        before = term.material_buckets.clone()
+        report = DS.apply_lambda(m, DS.capture_baseline(m), 0.2)
+        assert "physics_material" in report.material_terms_resampled
+        import torch
+        assert not torch.allclose(before, term.material_buckets)
+
+    def test_resampled_buckets_respect_the_scaled_range(self):
+        m = self.manager_with_material()
+        DS.apply_lambda(m, DS.capture_baseline(m), 0.0)
+        term = m._terms["physics_material"].func
+        static = term.material_buckets[:, 0]
+        # lambda = 0 collapses friction to its nominal (the midpoint, 0.95)
+        assert float(static.min()) == pytest.approx(0.95, abs=1e-5)
+        assert float(static.max()) == pytest.approx(0.95, abs=1e-5)
+
+    def test_full_lambda_restores_the_configured_span(self):
+        m = self.manager_with_material()
+        baseline = DS.capture_baseline(m)
+        DS.apply_lambda(m, baseline, 0.0)
+        DS.apply_lambda(m, baseline, 1.0)
+        static = m._terms["physics_material"].func.material_buckets[:, 0]
+        assert float(static.min()) >= 0.3 - 1e-6
+        assert float(static.max()) <= 1.6 + 1e-6
+        assert float(static.max()) - float(static.min()) > 0.5
+
+    def test_bucket_count_never_grows(self):
+        """PhysX caps unique materials in the scene at 64000."""
+        m = self.manager_with_material()
+        baseline = DS.capture_baseline(m)
+        for lam in (0.1, 0.5, 0.9):
+            DS.apply_lambda(m, baseline, lam)
+        assert m._terms["physics_material"].func.material_buckets.shape == (32, 3)
+
+    def test_startup_material_is_not_resampled(self):
+        m = Manager({"physics_material": MaterialCfg(mode="startup")})
+        report = DS.apply_lambda(m, DS.capture_baseline(m), 0.5)
+        assert report.material_terms_resampled == []
+
+
 class TestApplyLambda:
     def test_reports_only_runtime_scalable_terms(self):
         assert DS.scalable_terms(manager()) == ["push_robot", "randomize_rigid_body_mass"]

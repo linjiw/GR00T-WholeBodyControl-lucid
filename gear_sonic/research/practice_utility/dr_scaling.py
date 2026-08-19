@@ -29,11 +29,19 @@ credit for randomization it never moved.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 #: Event modes whose ranges take effect again after startup.
 RUNTIME_MODES = ("reset", "interval")
+
+#: Range parameters belonging to the material term, whose buckets are sampled
+#: once at construction and must be resampled for a range change to have effect.
+MATERIAL_RANGE_KEYS = (
+    "static_friction_range",
+    "dynamic_friction_range",
+    "restitution_range",
+)
 
 #: Parameter names understood as randomization ranges, with their nominal value.
 #: The nominal is the value at which the channel contributes no randomization.
@@ -56,6 +64,7 @@ class ScalingReport:
     scaled_terms: list[str]
     skipped_startup_terms: list[str]
     skipped_unknown_params: list[str]
+    material_terms_resampled: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +72,7 @@ class ScalingReport:
             "scaled_terms": self.scaled_terms,
             "skipped_startup_terms": self.skipped_startup_terms,
             "skipped_unknown_params": self.skipped_unknown_params,
+            "material_terms_resampled": self.material_terms_resampled,
             "num_scaled": len(self.scaled_terms),
         }
 
@@ -126,7 +136,7 @@ def apply_lambda(
             baseline, never from the current values -- compounding
             ``lambda`` epoch after epoch would drive every range to zero.
     """
-    scaled, skipped_startup, skipped_unknown = [], [], []
+    scaled, skipped_startup, skipped_unknown, material_resampled = [], [], [], []
     for name, cfg in _iter_terms(event_manager):
         if name not in baseline:
             continue
@@ -148,11 +158,19 @@ def apply_lambda(
             touched = True
         if touched:
             scaled.append(name)
+            # A material term only ever chooses among buckets sampled in its
+            # __init__, so rewriting its range parameters changes nothing until
+            # the buckets themselves are resampled.
+            if any(key in params for key in MATERIAL_RANGE_KEYS):
+                resampled = _resample_material(cfg, params)
+                if resampled:
+                    material_resampled.append(name)
     return ScalingReport(
         lambda_value=lambda_value,
         scaled_terms=sorted(scaled),
         skipped_startup_terms=sorted(skipped_startup),
         skipped_unknown_params=sorted(set(skipped_unknown)),
+        material_terms_resampled=sorted(material_resampled),
     )
 
 
@@ -171,6 +189,33 @@ def capture_baseline(event_manager: Any) -> dict[str, dict[str, Any]]:
         if captured:
             baseline[name] = captured
     return baseline
+
+
+def _resample_material(cfg: Any, params: dict[str, Any]) -> bool:
+    """Rebuild a material term's buckets from its freshly scaled ranges.
+
+    IsaacLab instantiates class-based event terms and stores the instance back
+    on ``cfg.func``, so that is where the live buckets live.
+    """
+    from gear_sonic.research.practice_utility.events_reset_safe import (
+        resample_material_buckets,
+    )
+
+    term = getattr(cfg, "func", None)
+    if term is None:
+        return False
+    return resample_material_buckets(
+        term,
+        static_friction_range=_as_pair(params.get("static_friction_range")),
+        dynamic_friction_range=_as_pair(params.get("dynamic_friction_range")),
+        restitution_range=_as_pair(params.get("restitution_range")),
+    )
+
+
+def _as_pair(value: Any) -> tuple[float, float] | None:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return (float(value[0]), float(value[1]))
+    return None
 
 
 def _iter_terms(event_manager: Any):
