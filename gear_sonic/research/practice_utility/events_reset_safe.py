@@ -239,3 +239,96 @@ def _sync_action_offset(env: Any, asset: Articulation, env_ids: torch.Tensor) ->
     rows = env_ids.to(asset.device)[:, None]
     values = asset.data.default_joint_pos[rows, asset_idx]
     offset[env_ids.to(offset.device)[:, None], action_idx] = values.to(offset.device)
+
+
+# --------------------------------------------------------------------------
+# Actuation latency
+# --------------------------------------------------------------------------
+#
+# SONIC already ships a complete, correct DelayedImplicitActuator
+# (gear_sonic/envs/manager_env/mdp/actuators.py) that wraps each actuator's
+# command in an IsaacLab DelayBuffer and resamples a per-environment lag on
+# every reset. A repo-wide search finds no reference to it anywhere: it is dead
+# code, and G1 uses plain ImplicitActuatorCfg for all five joint groups.
+#
+# That makes it the right place to inject latency, for three reasons:
+#   * resolution is one physics step (5 ms at the configured 200 Hz), not one
+#     control step (20 ms), so 0/5/.../40 ms are all expressible;
+#   * per-env lag and per-reset resampling already exist and are exercised by
+#     IsaacLab's own DelayedPDActuator;
+#   * it sits *downstream* of everything the learner sees. action_manager.action,
+#     the `actions` observation history, PPO's stored actions and
+#     extras["env_actions"] all keep meaning "commanded", exactly as on hardware.
+#     Delaying further upstream would feed the policy its own executed action and
+#     quietly break the train/deploy correspondence.
+#
+# The event term below is what makes latency *curriculum-scalable*: the actuator
+# resamples from its own cfg during scene reset, and reset-mode event terms run
+# afterwards, so this overwrites that draw with a lambda-scaled one.
+
+#: Attribute names of the delay buffers on a delayed actuator.
+DELAY_BUFFERS = ("positions_delay_buffer", "velocities_delay_buffer", "efforts_delay_buffer")
+
+
+def randomize_action_delay(
+    env: Any,
+    env_ids: torch.Tensor | None,
+    delay_range: tuple[float, float] = (0.0, 0.0),
+    asset_cfg: "SceneEntityCfg | None" = None,
+) -> int:
+    """Sample a per-environment actuation delay, in physics steps.
+
+    ``delay_range`` is expressed in physics steps and is scaled by the LUCID
+    curriculum like any other range: at λ=0 it collapses to ``[0, 0]``, which
+    makes the delay buffer return its newest sample and the run bit-identical to
+    no delay at all. That exact identity is what gives the curriculum a clean A/B
+    baseline.
+
+    Returns the number of actuators whose lag was set, so a config that forgot to
+    use ``DelayedImplicitActuatorCfg`` reports zero instead of silently training
+    without latency.
+    """
+    asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
+    actuators = getattr(asset, "actuators", None)
+    if not actuators:
+        return 0
+
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+    if env_ids.numel() == 0:
+        return 0
+
+    low = max(0, int(round(float(delay_range[0]))))
+    high = max(low, int(round(float(delay_range[1]))))
+
+    touched = 0
+    for actuator in actuators.values():
+        buffers = [getattr(actuator, name, None) for name in DELAY_BUFFERS]
+        buffers = [b for b in buffers if b is not None]
+        if not buffers:
+            continue
+        capacity = _buffer_capacity(buffers[0])
+        if capacity is not None:
+            # max_delay sizes the buffer at construction and set_time_lag raises
+            # above it, so clamp rather than let a curriculum crash the run.
+            high = min(high, capacity)
+            low = min(low, high)
+        lags = torch.randint(
+            low, high + 1, (env_ids.numel(),), dtype=torch.int, device=asset.device
+        )
+        for buffer in buffers:
+            buffer.set_time_lag(lags, env_ids)
+            # Resetting matters: without it the buffer still holds targets built
+            # from the previous episode's joint-default offset, which
+            # randomize_joint_default_pos has just changed.
+            buffer.reset(env_ids)
+        touched += 1
+    return touched
+
+
+def _buffer_capacity(buffer: Any) -> int | None:
+    for attribute in ("history_length", "max_length", "_max_len"):
+        value = getattr(buffer, attribute, None)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None

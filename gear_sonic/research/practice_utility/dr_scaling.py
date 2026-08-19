@@ -53,6 +53,9 @@ RANGE_NOMINALS: dict[str, float] = {
     "static_friction_range": None,         # nominal taken from the midpoint
     "dynamic_friction_range": None,
     "restitution_range": 0.0,
+    # Actuation latency, in physics steps. Nominal 0 means lambda=0 collapses to
+    # [0, 0] -- zero delay, bit-identical to a run with no latency channel.
+    "delay_range": 0.0,
 }
 
 

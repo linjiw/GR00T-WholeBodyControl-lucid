@@ -258,3 +258,133 @@ class TestHelpers:
         high = torch.tensor([1.0, 11.0])
         s = E.sample_uniform(low, high, (1000, 2))
         assert float(s[:, 0].max()) <= 1.0 and float(s[:, 1].min()) >= 10.0
+
+
+class FakeDelayBuffer:
+    def __init__(self, history_length=8, num_envs=NUM_ENVS):
+        self.history_length = history_length
+        self.time_lags = torch.zeros(num_envs, dtype=torch.int)
+        self.resets = []
+
+    def set_time_lag(self, lags, env_ids):
+        lags = torch.as_tensor(lags)
+        if int(lags.max()) > self.history_length:
+            raise ValueError("time lag exceeds buffer history length")
+        self.time_lags[torch.as_tensor(env_ids).long()] = lags.to(torch.int)
+
+    def reset(self, env_ids):
+        self.resets.append(torch.as_tensor(env_ids).clone())
+
+
+class FakeDelayedActuator:
+    def __init__(self, history_length=8):
+        self.positions_delay_buffer = FakeDelayBuffer(history_length)
+        self.velocities_delay_buffer = FakeDelayBuffer(history_length)
+        self.efforts_delay_buffer = FakeDelayBuffer(history_length)
+
+
+class FakePlainActuator:
+    """A stock ImplicitActuator: no delay buffers at all."""
+
+
+def env_with_actuators(actuators):
+    env = FakeEnv()
+    env.asset.actuators = actuators
+    return env
+
+
+class TestActionDelay:
+    def test_sets_a_per_env_lag(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        touched = E.randomize_action_delay(env, None, (0.0, 8.0), Cfg())
+        assert touched == 1
+        lags = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        assert int(lags.max()) <= 8 and int(lags.min()) >= 0
+
+    def test_lambda_zero_range_means_no_delay(self):
+        """The clean A/B baseline: zero delay must be exactly zero."""
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (0.0, 0.0), Cfg())
+        assert int(env.asset.actuators["legs"].positions_delay_buffer.time_lags.max()) == 0
+
+    def test_lags_vary_across_environments(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (0.0, 8.0), Cfg())
+        lags = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        assert len(set(lags.tolist())) > 1
+
+    def test_all_three_buffers_are_set(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (2.0, 2.0), Cfg())
+        actuator = env.asset.actuators["legs"]
+        for name in E.DELAY_BUFFERS:
+            assert int(getattr(actuator, name).time_lags.max()) == 2
+
+    def test_buffers_are_reset(self):
+        """Otherwise stale targets built with the previous joint-default offset
+        keep being applied after a reset."""
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, torch.tensor([1, 2]), (1.0, 3.0), Cfg())
+        assert env.asset.actuators["legs"].positions_delay_buffer.resets[-1].tolist() == [1, 2]
+
+    def test_only_selected_envs_change(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, torch.tensor([0, 1]), (4.0, 4.0), Cfg())
+        lags = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        assert int(lags[0]) == 4 and int(lags[5]) == 0
+
+    def test_clamps_to_the_buffer_capacity(self):
+        """max_delay sizes the buffer at construction; set_time_lag raises above
+        it, so a curriculum must not be able to crash the run."""
+        env = env_with_actuators({"legs": FakeDelayedActuator(history_length=4)})
+        E.randomize_action_delay(env, None, (0.0, 100.0), Cfg())
+        assert int(env.asset.actuators["legs"].positions_delay_buffer.time_lags.max()) <= 4
+
+    def test_plain_actuators_report_zero_rather_than_failing_silently(self):
+        """A config that forgot DelayedImplicitActuatorCfg must be detectable."""
+        env = env_with_actuators({"legs": FakePlainActuator()})
+        assert E.randomize_action_delay(env, None, (0.0, 8.0), Cfg()) == 0
+
+    def test_counts_every_delayed_actuator_group(self):
+        env = env_with_actuators({
+            "legs": FakeDelayedActuator(), "arms": FakeDelayedActuator(),
+            "hands": FakePlainActuator(),
+        })
+        assert E.randomize_action_delay(env, None, (0.0, 4.0), Cfg()) == 2
+
+    def test_no_actuators_is_survivable(self):
+        env = env_with_actuators({})
+        assert E.randomize_action_delay(env, None, (0.0, 8.0), Cfg()) == 0
+
+    def test_empty_env_ids_is_a_no_op(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        assert E.randomize_action_delay(
+            env, torch.tensor([], dtype=torch.long), (0.0, 8.0), Cfg()) == 0
+
+    def test_inverted_range_is_tolerated(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (5.0, 2.0), Cfg())
+        assert int(env.asset.actuators["legs"].positions_delay_buffer.time_lags.max()) == 5
+
+    def test_fractional_range_is_rounded_to_physics_steps(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (1.4, 1.4), Cfg())
+        assert int(env.asset.actuators["legs"].positions_delay_buffer.time_lags.max()) == 1
+
+
+class TestDelayIsCurriculumScalable:
+    def test_lambda_maps_to_the_papers_training_range(self):
+        """LUCID v1 trains over 0-40 ms; at 200 Hz that is 0-8 physics steps."""
+        from gear_sonic.research.practice_utility.dr_scaling import RANGE_NOMINALS, scale_range
+
+        assert RANGE_NOMINALS["delay_range"] == 0.0
+        assert scale_range([0.0, 8.0], 0.0, 0.0) == [0.0, 0.0]
+        assert scale_range([0.0, 8.0], 0.5, 0.0) == pytest.approx([0.0, 4.0])
+        assert scale_range([0.0, 8.0], 1.0, 0.0) == pytest.approx([0.0, 8.0])
+
+    def test_scaled_range_drives_the_sampled_lag(self):
+        from gear_sonic.research.practice_utility.dr_scaling import scale_range
+
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, scale_range([0.0, 8.0], 0.25, 0.0), Cfg())
+        assert int(env.asset.actuators["legs"].positions_delay_buffer.time_lags.max()) <= 2
