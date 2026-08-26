@@ -21,6 +21,9 @@ This module is deliberately free of torch/Isaac imports so contracts can be
 validated on CPU, in isolation from the simulator.
 """
 
+# Ruff's force-sort setting conflicts with the repository's isort profile.
+# ruff: noqa: I001
+
 from __future__ import annotations
 
 import dataclasses
@@ -170,9 +173,7 @@ class SamplingSnapshot:
     def __post_init__(self) -> None:
         n = len(self.active_bin_ids)
         if len(self.active_prob) != n:
-            raise ValueError(
-                f"active_prob has {len(self.active_prob)} entries for {n} active bins"
-            )
+            raise ValueError(f"active_prob has {len(self.active_prob)} entries for {n} active bins")
         if n and abs(sum(self.active_prob) - 1.0) > 1e-6:
             raise ValueError(f"active_prob sums to {sum(self.active_prob)!r}, expected 1.0")
         if any(p < 0.0 for p in self.active_prob):
@@ -196,7 +197,14 @@ class DoseReport:
     ``drawn_*`` counts sampling decisions; ``completed_*`` counts environment
     steps actually executed inside the kernel. They differ whenever episodes
     terminate early -- which is exactly when a difficult context is being
-    probed, so the distinction is not academic.
+    probed, so the distinction is not academic. ``total_episodes`` uses the
+    observable sampler-draw count after instrumentation starts; it excludes
+    episodes already resident when the callback is installed.
+
+    ``termination_observations`` is coverage: the number of per-environment
+    termination flags observed by the live hook. ``early_terminations`` is the
+    count of flags that were actually true. The former must match completion
+    observations; it is not an episode or termination count.
     """
 
     branch_id: str
@@ -209,8 +217,17 @@ class DoseReport:
     total_env_steps: float = 0.0
     total_episodes: float = 0.0
     per_bin_drawn: dict[int, float] = field(default_factory=dict)
+    # Executed reference-timeline steps, keyed by SONIC's dataset-global bin
+    # id.  Unlike ``per_bin_drawn`` this is sufficient to reconstruct the
+    # realized dose of *any* frozen context kernel after a branch has run.
+    per_bin_completed: dict[int, float] = field(default_factory=dict)
     per_motion_drawn: dict[str, float] = field(default_factory=dict)
     early_terminations: int = 0
+    completion_hook_calls: int = 0
+    completion_observations: int = 0
+    termination_observations: int = 0
+    dropped_completion_batches: int = 0
+    dose_registry_sha256: str | None = None
     distribution_kl: float | None = None
     sampling_entropy: float | None = None
 
@@ -230,12 +247,74 @@ class DoseReport:
                 "completed_kernel_steps exceeds completed_env_steps "
                 f"({self.completed_kernel_steps} > {self.completed_env_steps})"
             )
+        for name in (
+            "early_terminations",
+            "completion_hook_calls",
+            "completion_observations",
+            "termination_observations",
+            "dropped_completion_batches",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative, got {getattr(self, name)}")
+        if self.termination_observations != self.completion_observations:
+            raise ValueError(
+                "termination-flag coverage must match completion observations "
+                f"({self.termination_observations} != {self.completion_observations})"
+            )
+        if any(value < 0 for value in self.per_bin_completed.values()):
+            raise ValueError("per_bin_completed contains a negative exposure")
+        if self.per_bin_completed:
+            reconstructed = sum(self.per_bin_completed.values())
+            if abs(reconstructed - self.completed_env_steps) > 1e-6:
+                raise ValueError(
+                    "per_bin_completed does not sum to completed_env_steps "
+                    f"({reconstructed} != {self.completed_env_steps})"
+                )
 
     @property
     def kernel_step_fraction(self) -> float:
         if self.completed_env_steps <= 0:
             return 0.0
         return self.completed_kernel_steps / self.completed_env_steps
+
+
+@dataclass(frozen=True)
+class DoseProjection:
+    """One context kernel projected onto a passive completed-step histogram.
+
+    ``membership_by_global_bin`` is peak-normalized: one executed step in the
+    target bin contributes one dose unit.  Its hash makes the denominator
+    independently reproducible from the receipt's completed-bin histogram.
+    """
+
+    context_id: str
+    kernel_radius_bins: int
+    sigma_frames: float
+    completed_kernel_steps: float
+    membership_by_global_bin: dict[int, float]
+    kernel_membership_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.kernel_radius_bins < 0:
+            raise ValueError("kernel_radius_bins must be non-negative")
+        if self.sigma_frames <= 0:
+            raise ValueError("sigma_frames must be positive")
+        if self.completed_kernel_steps < 0:
+            raise ValueError("completed_kernel_steps must be non-negative")
+        if any(not 0.0 <= value <= 1.0 + 1e-12 for value in self.membership_by_global_bin.values()):
+            raise ValueError("kernel membership must lie in [0, 1]")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "context_id": self.context_id,
+            "kernel_radius_bins": self.kernel_radius_bins,
+            "sigma_frames": self.sigma_frames,
+            "completed_kernel_steps": self.completed_kernel_steps,
+            "membership_by_global_bin": {
+                str(key): value for key, value in sorted(self.membership_by_global_bin.items())
+            },
+            "kernel_membership_sha256": self.kernel_membership_sha256,
+        }
 
 
 @dataclass
@@ -384,8 +463,7 @@ class UtilityRecord:
     def realized_extra_dose(self) -> float:
         """Extra kernel exposure the intervention branch actually received."""
         return (
-            self.intervention_dose.completed_kernel_steps
-            - self.control_dose.completed_kernel_steps
+            self.intervention_dose.completed_kernel_steps - self.control_dose.completed_kernel_steps
         )
 
     def utility_at(self, horizon_label: str) -> float:

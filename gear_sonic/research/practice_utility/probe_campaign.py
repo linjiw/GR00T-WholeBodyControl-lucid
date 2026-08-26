@@ -43,13 +43,12 @@ explicit:
     blocked until an immutable algorithm implementation and its tests exist.
 
 The screen manifest intentionally retains one shared control per
-``(stage, seed)``.  :func:`audit_probe_campaign` preserves that frozen branch
-count and emits deterministic screening branch specifications. The current
-callback cannot attribute that shared control's realized completed steps to
-each target kernel, so the audit remains blocked until passive per-context
-dose instrumentation exists or a newly preregistered manifest uses independent
-epsilon-zero controls. It also warns that confirmation evidence requires
-independent paired controls.
+``(stage, seed)``. :func:`audit_probe_campaign` preserves that frozen branch
+count and emits deterministic screening branch specifications. Passive
+per-global-bin instrumentation and a frozen projection plan now have a CPU
+contract, but the audit remains blocked until a hash-bound live-GPU smoke
+receipt verifies the production hook end to end. It also warns that
+confirmation evidence requires independent paired controls.
 """
 
 # Ruff's force-sort-within-sections setting conflicts with the repository's
@@ -70,6 +69,8 @@ from typing import Any, Mapping, Sequence
 import torch
 
 from gear_sonic.research.practice_utility import branch_capsule as BC
+from gear_sonic.research.practice_utility import directional_calibration as DC
+from gear_sonic.research.practice_utility import dose_plan as DP
 from gear_sonic.research.practice_utility.schema import ContextKey, sha256_of
 
 PREFLIGHT_SCHEMA_VERSION = 1
@@ -93,9 +94,35 @@ REQUIRED_LATENT_FEATURES = ("latent_gap_p90", "latent_gap_median")
 PROXY_FEATURE_KIND = "practice_utility_proxy_features"
 NOISE_FLOOR_KIND = "practice_utility_same_estimand_noise_floor"
 GATE_PREREGISTRATION_KIND = "practice_utility_gate_preregistration"
+DIRECTIONAL_PREREGISTRATION_KIND = "practice_utility_latent_directional_calibration_preregistration"
+LIVE_PASSIVE_DOSE_SMOKE_KIND = "practice_utility_live_passive_dose_smoke"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
+_FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_PASSIVE_DOSE_PLAN_LAUNCHER = (
+    _REPO_ROOT / "scripts/practice_utility/create_passive_dose_plan.py"
+).resolve()
+_DIRECTIONAL_CALIBRATION_LAUNCHER = (
+    _REPO_ROOT / "scripts/practice_utility/freeze_directional_calibration.py"
+).resolve()
+_PASSIVE_DOSE_SMOKE_LAUNCHER = (
+    _REPO_ROOT / "scripts/practice_utility/run_passive_dose_smoke.py"
+).resolve()
+_PASSIVE_DOSE_CALLBACK = (
+    _REPO_ROOT / "gear_sonic/research/practice_utility/callbacks.py"
+).resolve()
+_PASSIVE_DOSE_SOURCE_PATHS = {
+    "sampler_adapter": _REPO_ROOT / "gear_sonic/research/practice_utility/sampler_adapter.py",
+    "dose_plan": _REPO_ROOT / "gear_sonic/research/practice_utility/dose_plan.py",
+    "schema": _REPO_ROOT / "gear_sonic/research/practice_utility/schema.py",
+    "intervention": _REPO_ROOT / "gear_sonic/research/practice_utility/intervention.py",
+    "branch_capsule": _REPO_ROOT / "gear_sonic/research/practice_utility/branch_capsule.py",
+    "train_agent": _REPO_ROOT / "gear_sonic/train_agent_trl.py",
+    "ppo_trainer": _REPO_ROOT / "gear_sonic/trl/trainer/ppo_trainer.py",
+    "manager_env_wrapper": _REPO_ROOT / "gear_sonic/envs/wrapper/manager_env_wrapper.py",
+}
 
 
 @dataclass(frozen=True)
@@ -338,22 +365,6 @@ def audit_probe_campaign(
     if manifest is not None:
         report.manifest_sha256 = manifest.manifest_sha256
         _shared_control_notice(manifest, audit)
-        audit.blocker(
-            "shared_control_realized_dose_unimplemented",
-            "the live shared control has no target kernels, so it records zero "
-            "completed_kernel_steps and cannot support the preregistered realized-extra-dose "
-            "denominator; implement passive per-context control dose or freeze a new "
-            "independent-control campaign",
-            "dose",
-        )
-        audit.blocker(
-            "latent_directional_calibration_unimplemented",
-            "Gate B preregisters nested-CV univariate calibration, but no leakage-free "
-            "calibration implementation or immutable algorithm artifact exists; the label "
-            "builder therefore emits rank-only diagnostics and keeps latent predictiveness "
-            "and inverse estimator authorization incomplete",
-            "latent_direction",
-        )
 
     if not bundle_path.is_file():
         audit.blocker(
@@ -371,6 +382,25 @@ def audit_probe_campaign(
 
     _validate_bundle_header(bundle, manifest, report, audit)
     base_dir = bundle_path.parent
+
+    passive_plan = _validate_passive_dose_plan(
+        bundle.get("passive_dose_plan"), manifest, report, base_dir, audit
+    )
+    live_passive_smoke = _validate_live_passive_dose_smoke(
+        bundle.get("live_passive_dose_smoke"), manifest, report, passive_plan, base_dir, audit
+    )
+    if not live_passive_smoke:
+        _block_live_passive_dose(audit)
+
+    directional_asset, directional_preregistration = (
+        _validate_directional_calibration_preregistration(
+            bundle.get("directional_calibration_preregistration"),
+            manifest,
+            report,
+            base_dir,
+            audit,
+        )
+    )
 
     efficacy_plan, efficacy_asset, estimand_sha256, dev_suite_sha256 = _validate_efficacy_plan(
         bundle.get("efficacy_plan"), manifest, base_dir, audit
@@ -397,6 +427,8 @@ def audit_probe_campaign(
         proxy_asset,
         noise_asset,
         estimand_sha256,
+        directional_asset,
+        directional_preregistration,
         base_dir,
         audit,
     )
@@ -682,6 +714,797 @@ def _validate_bundle_header(
             "preflight binds both logical and file hashes of the frozen manifest",
             "preflight",
         )
+
+
+def _validate_passive_dose_plan(
+    reference: Any,
+    manifest: _ManifestView,
+    report: PreflightReport,
+    base_dir: Path,
+    audit: _Audit,
+) -> DP.PassiveDosePlan | None:
+    """Validate the frozen, outcome-blind projection plan for shared controls."""
+
+    scope = "dose_plan"
+    asset = _verify_asset(reference, base_dir, audit, "passive_dose_plan", scope)
+    if asset is None:
+        return None
+    try:
+        plan = DP.load_passive_dose_plan(
+            asset.path,
+            expected_file_sha256=asset.sha256,
+            expected_campaign_id=manifest.campaign_id,
+            expected_manifest_sha256=manifest.manifest_sha256,
+            expected_manifest_file_sha256=report.manifest_file_sha256,
+        )
+    except ValueError as error:
+        audit.blocker("passive_dose_plan_invalid", str(error), scope)
+        return None
+
+    expected = {
+        stage: {context_id: context for _, context_id, context in manifest.contexts[stage]}
+        for stage in manifest.stages
+    }
+    actual = {
+        stage: {context.context_id: context.to_dict() for context in plan.contexts_for(stage)}
+        for stage in sorted(plan.contexts_per_stage)
+    }
+    if actual != expected:
+        audit.blocker(
+            "passive_dose_plan_contexts_mismatch",
+            "passive dose plan must contain each manifest context exactly once by stage",
+            scope,
+        )
+    if plan.kernel_radius_bins != manifest.payload.get("kernel_radius_bins"):
+        audit.blocker(
+            "passive_dose_plan_kernel_mismatch",
+            "passive dose projection radius differs from the frozen intervention kernel",
+            scope,
+        )
+    manifest_contexts = [
+        ContextKey.from_dict(context)
+        for stage in manifest.stages
+        for _, _, context in manifest.contexts[stage]
+    ]
+    try:
+        reference_bin_size = DP.derive_reference_bin_size_frames(manifest_contexts)
+    except ValueError as error:
+        audit.blocker("passive_dose_plan_reference_bin_invalid", str(error), scope)
+    else:
+        if plan.reference_bin_size_frames != reference_bin_size or plan.sigma_frames != float(
+            reference_bin_size
+        ):
+            audit.blocker(
+                "passive_dose_plan_reference_bin_invalid",
+                "passive dose plan sigma/reference size differs from the manifest bins",
+                scope,
+            )
+    expected_launcher_sha256 = (
+        sha256_file(_PASSIVE_DOSE_PLAN_LAUNCHER) if _PASSIVE_DOSE_PLAN_LAUNCHER.is_file() else None
+    )
+    provenance_valid = (
+        Path(plan.source_manifest_path).resolve() == Path(report.manifest_path).resolve()
+        and _FULL_COMMIT.fullmatch(plan.source_commit) is not None
+        and Path(plan.launcher_path).resolve() == _PASSIVE_DOSE_PLAN_LAUNCHER
+        and plan.launcher_sha256 == expected_launcher_sha256
+    )
+    if not provenance_valid:
+        audit.blocker(
+            "passive_dose_plan_provenance_invalid",
+            "passive dose plan must bind the exact manifest, a clean full Git commit, "
+            "and the current plan-freezing launcher bytes",
+            scope,
+        )
+    if not any(item.scope == scope for item in audit.report.blockers):
+        audit.verified(
+            "passive_dose_plan_verified",
+            f"v2 plan {plan.logical_sha256} covers every frozen context",
+            scope,
+        )
+        return plan
+    return None
+
+
+def _validate_live_passive_dose_smoke(
+    reference: Any,
+    manifest: _ManifestView,
+    report: PreflightReport,
+    plan: DP.PassiveDosePlan | None,
+    base_dir: Path,
+    audit: _Audit,
+) -> bool:
+    """Require immutable, recomputable live CUDA evidence for the step hook."""
+
+    scope = "live_passive_dose_smoke"
+    asset = _verify_asset(reference, base_dir, audit, "live_passive_dose_smoke", scope)
+    if asset is None or plan is None:
+        return False
+    smoke = _read_json(asset.path, audit, "live_passive_dose_smoke", scope)
+    if smoke is None:
+        return False
+    initial_blockers = len(audit.report.blockers)
+    if smoke.get("kind") != LIVE_PASSIVE_DOSE_SMOKE_KIND or smoke.get("schema_version") != 1:
+        audit.blocker(
+            "live_passive_dose_smoke_schema_invalid",
+            "live passive-dose smoke has the wrong kind or schema",
+            scope,
+        )
+    recorded_smoke_hash = smoke.get("smoke_sha256")
+    smoke_body = dict(smoke)
+    smoke_body.pop("smoke_sha256", None)
+    if not _is_sha(recorded_smoke_hash) or recorded_smoke_hash != sha256_of(smoke_body):
+        audit.blocker(
+            "live_passive_dose_smoke_logical_hash_invalid",
+            "live passive-dose smoke logical hash is invalid",
+            scope,
+        )
+    expected_links = {
+        "campaign_id": manifest.campaign_id,
+        "manifest_sha256": manifest.manifest_sha256,
+        "manifest_file_sha256": report.manifest_file_sha256,
+        "measurement_hook": DP.PASSIVE_DOSE_HOOK,
+        "execution_mode": "live_gpu_simulator",
+        "device_type": "cuda",
+        "status": "complete",
+    }
+    mismatched = [key for key, value in expected_links.items() if smoke.get(key) != value]
+    if mismatched:
+        audit.blocker(
+            "live_passive_dose_smoke_lineage_invalid",
+            f"live passive-dose smoke differs on {mismatched}",
+            scope,
+        )
+    if (
+        not _FULL_COMMIT.fullmatch(str(smoke.get("source_commit", "")))
+        or smoke.get("source_tree_status") != []
+    ):
+        audit.blocker(
+            "live_passive_dose_smoke_commit_invalid",
+            "live smoke requires a full 40-character commit and clean source tree",
+            scope,
+        )
+    plan_link = smoke.get("passive_dose_plan")
+    if not isinstance(plan_link, dict) or plan_link != {
+        "file_sha256": plan.file_sha256,
+        "logical_sha256": plan.logical_sha256,
+    }:
+        audit.blocker(
+            "live_passive_dose_smoke_plan_mismatch",
+            "live passive-dose smoke does not bind the verified v2 dose plan",
+            scope,
+        )
+    stage = smoke.get("stage")
+    if not isinstance(stage, str) or stage not in manifest.stages:
+        audit.blocker(
+            "live_passive_dose_smoke_stage_invalid",
+            "live passive-dose smoke must name a manifest stage",
+            scope,
+        )
+
+    implementation = smoke.get("implementation")
+    implementation_valid = isinstance(implementation, dict)
+    if implementation_valid:
+        implementation_valid = _binding_matches_current(
+            implementation.get("launcher"), _PASSIVE_DOSE_SMOKE_LAUNCHER
+        ) and _binding_matches_current(implementation.get("callback"), _PASSIVE_DOSE_CALLBACK)
+        implementation_valid = implementation_valid and _binding_is_hash_valid(
+            implementation.get("source_config")
+        )
+        sources = implementation.get("sources")
+        implementation_valid = implementation_valid and isinstance(sources, dict)
+        if isinstance(sources, dict):
+            implementation_valid = (
+                implementation_valid
+                and set(sources) == set(_PASSIVE_DOSE_SOURCE_PATHS)
+                and all(
+                    _binding_matches_current(sources.get(name), path)
+                    for name, path in _PASSIVE_DOSE_SOURCE_PATHS.items()
+                )
+            )
+    if not implementation_valid:
+        audit.blocker(
+            "live_passive_dose_smoke_implementation_invalid",
+            "live smoke must bind the current launcher, callback, and complete source set",
+            scope,
+        )
+
+    prereg_asset = _verify_asset(
+        smoke.get("preregistration"),
+        asset.path.parent,
+        audit,
+        "live_passive_dose_preregistration",
+        scope,
+        record_success=False,
+    )
+    prereg = (
+        _read_json(prereg_asset.path, audit, "live_passive_dose_preregistration", scope)
+        if prereg_asset is not None
+        else None
+    )
+    prereg_valid = prereg is not None and _validate_passive_smoke_preregistration(
+        prereg,
+        manifest=manifest,
+        report=report,
+        plan=plan,
+        smoke=smoke,
+        implementation=implementation if isinstance(implementation, dict) else {},
+    )
+    if not prereg_valid:
+        audit.blocker(
+            "live_passive_dose_preregistration_invalid",
+            "live smoke preregistration is not immutable or does not bind its exact inputs/code",
+            scope,
+        )
+
+    dose_asset = _verify_asset(
+        smoke.get("dose_receipt"),
+        asset.path.parent,
+        audit,
+        "live_passive_dose_receipt",
+        scope,
+        record_success=False,
+    )
+    dose = (
+        _read_json(dose_asset.path, audit, "live_passive_dose_receipt", scope)
+        if dose_asset is not None
+        else None
+    )
+    if (
+        dose is None
+        or prereg is None
+        or not _validate_live_dose_invariants(
+            dose,
+            dose_asset=dose_asset,
+            prereg=prereg,
+            manifest=manifest,
+            report=report,
+            plan=plan,
+            stage=stage,
+            smoke=smoke,
+        )
+    ):
+        audit.blocker(
+            "live_passive_dose_receipt_invalid",
+            "live dose receipt fails recomputed horizon, accounting, lineage, or projection checks",
+            scope,
+        )
+
+    runtime = smoke.get("runtime")
+    log_asset = None
+    if isinstance(runtime, dict):
+        log_asset = _verify_asset(
+            runtime.get("log"),
+            asset.path.parent,
+            audit,
+            "live_passive_dose_log",
+            scope,
+            record_success=False,
+        )
+    runtime_valid = (
+        isinstance(runtime, dict)
+        and runtime.get("exit_code") == 0
+        and _is_positive_number(runtime.get("wall_seconds"))
+        and isinstance(runtime.get("cuda_memory_growth_mib"), (int, float))
+        and not isinstance(runtime.get("cuda_memory_growth_mib"), bool)
+        and float(runtime["cuda_memory_growth_mib"]) >= 512.0
+        and isinstance(runtime.get("gpu"), Mapping)
+        and bool(runtime["gpu"])
+        and log_asset is not None
+        and log_asset.path.stat().st_size > 0
+    )
+    if not runtime_valid:
+        audit.blocker(
+            "live_passive_dose_runtime_invalid",
+            "live smoke must bind a successful CUDA runtime and non-empty hashed log",
+            scope,
+        )
+
+    checks = smoke.get("checks")
+    required_checks = (
+        "passive_completion_exact",
+        "epsilon_zero_control",
+        "dose_registry_stable",
+        "exact_context_projection",
+        "cuda_execution_verified",
+        "atomic_receipt_no_partial",
+        "immutable_preregistration_bound",
+        "successful_runtime_and_log",
+    )
+    if not isinstance(checks, dict) or any(checks.get(key) is not True for key in required_checks):
+        audit.blocker(
+            "live_passive_dose_smoke_checks_incomplete",
+            f"live smoke must pass {list(required_checks)}",
+            scope,
+        )
+    not_yet_verified = smoke.get("not_yet_verified")
+    required_not_yet = {
+        "native step return preservation in the live process",
+        "native distribution bitwise identity against a paired no-callback reference",
+        "callback wrapper removal observed after on_train_end",
+    }
+    if not isinstance(not_yet_verified, list) or not required_not_yet <= set(
+        str(item) for item in not_yet_verified
+    ):
+        audit.blocker(
+            "live_passive_dose_smoke_scope_invalid",
+            "live smoke must leave native identity and wrapper-removal claims explicitly "
+            "not-yet-verified",
+            scope,
+        )
+    if len(audit.report.blockers) == initial_blockers:
+        audit.verified(
+            "live_passive_dose_smoke_verified",
+            "live CUDA smoke verifies exact pre-transition dose and shared-context projection",
+            scope,
+        )
+        return True
+    return False
+
+
+def _binding_matches_current(binding: Any, expected_path: Path) -> bool:
+    """Verify a path/hash binding against the current claim implementation bytes."""
+
+    if not isinstance(binding, dict) or not expected_path.is_file():
+        return False
+    raw_path = binding.get("path")
+    return (
+        isinstance(raw_path, str)
+        and Path(raw_path).resolve() == expected_path.resolve()
+        and binding.get("sha256") == sha256_file(expected_path)
+    )
+
+
+def _binding_is_hash_valid(binding: Any) -> bool:
+    """Rehash a non-code artifact whose exact path is frozen by preregistration."""
+
+    if not isinstance(binding, Mapping):
+        return False
+    raw_path = binding.get("path")
+    if not isinstance(raw_path, str) or not _is_sha(binding.get("sha256")):
+        return False
+    path = Path(raw_path).resolve()
+    return path.is_file() and sha256_file(path) == binding.get("sha256")
+
+
+def _validate_passive_smoke_preregistration(
+    prereg: Mapping[str, Any],
+    *,
+    manifest: _ManifestView,
+    report: PreflightReport,
+    plan: DP.PassiveDosePlan,
+    smoke: Mapping[str, Any],
+    implementation: Mapping[str, Any],
+) -> bool:
+    recorded_hash = prereg.get("preregistration_sha256")
+    body = dict(prereg)
+    body.pop("preregistration_sha256", None)
+    inputs = prereg.get("inputs")
+    design = prereg.get("design")
+    launcher = prereg.get("launcher")
+    command = prereg.get("command")
+    raw_outputs = prereg.get("outputs")
+    raw_runtime = smoke.get("runtime")
+    outputs = raw_outputs if isinstance(raw_outputs, Mapping) else {}
+    runtime = raw_runtime if isinstance(raw_runtime, Mapping) else {}
+    if not isinstance(inputs, Mapping) or not isinstance(design, Mapping):
+        return False
+    manifest_ref = inputs.get("manifest")
+    plan_ref = inputs.get("passive_dose_plan")
+    source_config = design.get("num_steps_source_config")
+    origin_map_ref = inputs.get("origin_map")
+    capsule_ref = inputs.get("capsule")
+    checkpoint_ref = inputs.get("checkpoint")
+    snapshot_ref = inputs.get("snapshot")
+    localized_ref = inputs.get("localized_checkpoint")
+    smoke_origin = smoke.get("origin")
+    selected_origin: Mapping[str, Any] = {}
+    if _binding_is_hash_valid(origin_map_ref):
+        try:
+            origin_map_payload = json.loads(Path(origin_map_ref["path"]).read_text())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            origin_map_payload = None
+        origins = (
+            origin_map_payload.get("origins") if isinstance(origin_map_payload, Mapping) else {}
+        )
+        candidate = origins.get(str(smoke.get("seed"))) if isinstance(origins, Mapping) else None
+        if isinstance(candidate, Mapping):
+            selected_origin = candidate
+    origin_bindings_valid = all(
+        _binding_is_hash_valid(item)
+        for item in (origin_map_ref, capsule_ref, checkpoint_ref, snapshot_ref, localized_ref)
+    )
+    if isinstance(localized_ref, Mapping) and isinstance(checkpoint_ref, Mapping):
+        origin_bindings_valid = origin_bindings_valid and all(
+            (
+                localized_ref.get("publication") == "exclusive_byte_copy",
+                localized_ref.get("sha256") == checkpoint_ref.get("sha256"),
+                Path(str(localized_ref.get("path", ""))).resolve()
+                != Path(str(checkpoint_ref.get("path", ""))).resolve(),
+                Path(str(localized_ref.get("source_path", ""))).resolve()
+                == Path(str(checkpoint_ref.get("path", ""))).resolve(),
+            )
+        )
+    else:
+        origin_bindings_valid = False
+    origin_record_valid = isinstance(smoke_origin, Mapping) and all(
+        (
+            smoke_origin.get("origin_map_file_sha256")
+            == (origin_map_ref.get("sha256") if isinstance(origin_map_ref, Mapping) else None),
+            smoke_origin.get("capsule_file_sha256")
+            == (capsule_ref.get("sha256") if isinstance(capsule_ref, Mapping) else None),
+            smoke_origin.get("checkpoint_file_sha256")
+            == (checkpoint_ref.get("sha256") if isinstance(checkpoint_ref, Mapping) else None),
+            smoke_origin.get("snapshot_file_sha256")
+            == (snapshot_ref.get("sha256") if isinstance(snapshot_ref, Mapping) else None),
+            smoke_origin.get("global_step") == design.get("origin_global_step"),
+            selected_origin.get("origin_step") == design.get("origin_global_step"),
+            selected_origin.get("seed") == smoke.get("seed"),
+            selected_origin.get("capsule_sha256")
+            == (capsule_ref.get("sha256") if isinstance(capsule_ref, Mapping) else None),
+            selected_origin.get("checkpoint_sha256")
+            == (checkpoint_ref.get("sha256") if isinstance(checkpoint_ref, Mapping) else None),
+            selected_origin.get("snapshot_sha256")
+            == (snapshot_ref.get("sha256") if isinstance(snapshot_ref, Mapping) else None),
+        )
+    )
+    return all(
+        (
+            prereg.get("kind") == "practice_utility_passive_dose_smoke_preregistration",
+            prereg.get("schema_version") == 1,
+            prereg.get("immutable") is True,
+            prereg.get("outcome_blind") is True,
+            _is_sha(recorded_hash) and recorded_hash == sha256_of(body),
+            prereg.get("source_commit") == smoke.get("source_commit"),
+            prereg.get("source_tree_clean") is True,
+            prereg.get("source_tree_status") == [],
+            smoke.get("blockers") == [],
+            prereg.get("implementation") == implementation,
+            launcher == implementation.get("launcher"),
+            inputs.get("callback") == implementation.get("callback"),
+            source_config == implementation.get("source_config"),
+            isinstance(manifest_ref, Mapping)
+            and Path(str(manifest_ref.get("path", ""))).resolve()
+            == Path(report.manifest_path).resolve()
+            and manifest_ref.get("sha256") == report.manifest_file_sha256,
+            isinstance(plan_ref, Mapping)
+            and Path(str(plan_ref.get("path", ""))).resolve() == plan.path
+            and plan_ref.get("sha256") == plan.file_sha256
+            and plan_ref.get("logical_sha256") == plan.logical_sha256,
+            design.get("campaign_id") == manifest.campaign_id,
+            design.get("manifest_sha256") == manifest.manifest_sha256,
+            design.get("stage") == smoke.get("stage"),
+            design.get("seed") == smoke.get("seed"),
+            smoke.get("seed") in manifest.seeds,
+            design.get("role") == "control",
+            design.get("epsilon") == 0.0,
+            origin_bindings_valid,
+            origin_record_valid,
+            isinstance(command, list),
+            prereg.get("command_sha256") == sha256_of({"argv": command}),
+            smoke.get("command_sha256") == prereg.get("command_sha256"),
+            isinstance(raw_outputs, Mapping),
+            isinstance(raw_runtime, Mapping),
+            isinstance(runtime.get("log"), Mapping)
+            and outputs.get("log") == runtime["log"].get("path"),
+            isinstance(smoke.get("dose_receipt"), Mapping)
+            and outputs.get("dose_receipt") == smoke["dose_receipt"].get("path"),
+        )
+    )
+
+
+def _validate_live_dose_invariants(
+    dose: Mapping[str, Any],
+    *,
+    dose_asset: _Asset | None,
+    prereg: Mapping[str, Any],
+    manifest: _ManifestView,
+    report: PreflightReport,
+    plan: DP.PassiveDosePlan,
+    stage: Any,
+    smoke: Mapping[str, Any],
+) -> bool:
+    """Recompute the smoke's numerical claims instead of trusting check booleans."""
+
+    if dose_asset is None or not isinstance(stage, str) or stage not in manifest.stages:
+        return False
+    design = prereg.get("design")
+    if not isinstance(design, Mapping):
+        return False
+    relative = design.get("relative_horizon")
+    absolute = design.get("absolute_horizon")
+    short = relative.get("H_s") if isinstance(relative, Mapping) else None
+    target = absolute.get("H_s") if isinstance(absolute, Mapping) else None
+    num_envs = design.get("num_envs")
+    num_steps = design.get("num_steps_per_env")
+    origin = design.get("origin_global_step")
+    integer_values = (short, target, num_envs, num_steps, origin)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_values):
+        return False
+    assert all(isinstance(value, int) for value in integer_values)
+    if short <= 0 or num_envs <= 0 or num_steps <= 0 or target != origin + short:
+        return False
+    if manifest.horizons.get("H_s") != short:
+        return False
+    expected_total = short * num_steps * num_envs
+    expected_hooks = short * num_steps
+    expected_observations = expected_hooks * num_envs
+    if design.get("expected_completed_env_steps") != expected_total:
+        return False
+
+    receipt_hash = dose.get("receipt_payload_sha256")
+    receipt_body = dict(dose)
+    receipt_body.pop("receipt_payload_sha256", None)
+    receipt_plan = dose.get("passive_dose_plan")
+    registry = dose.get("dose_registry_sha256_at_install")
+    callback = dose.get("implementation")
+    base_checks = (
+        dose.get("kind") == DP.PASSIVE_DOSE_RECEIPT_KIND,
+        dose.get("schema_version") == DP.PASSIVE_DOSE_RECEIPT_SCHEMA_VERSION,
+        dose.get("status") == "complete",
+        dose.get("valid_for_claim") is True,
+        dose.get("blockers") == [],
+        dose.get("role") == "control",
+        dose.get("epsilon") == 0.0,
+        dose.get("context_id") == "native",
+        dose.get("armed") is False,
+        dose.get("never_armed") is True,
+        dose.get("measurement_hook") == DP.PASSIVE_DOSE_HOOK,
+        dose.get("global_step") == target,
+        dose.get("horizon_label") == "H_s",
+        dose.get("completed_env_steps") == expected_total,
+        dose.get("expected_env_steps") == expected_total,
+        dose.get("completion_hook_calls") == expected_hooks,
+        dose.get("expected_completion_hook_calls") == expected_hooks,
+        dose.get("completion_observations") == expected_observations,
+        dose.get("expected_completion_observations") == expected_observations,
+        dose.get("termination_observations") == expected_observations,
+        dose.get("dropped_completion_batches") == 0,
+        _is_sha(registry),
+        dose.get("dose_registry_sha256_at_report") == registry,
+        dose.get("registry_stable") is True,
+        _is_sha(receipt_hash) and receipt_hash == sha256_of(receipt_body),
+        isinstance(receipt_plan, Mapping)
+        and Path(str(receipt_plan.get("path", ""))).resolve() == plan.path
+        and receipt_plan.get("file_sha256") == plan.file_sha256
+        and receipt_plan.get("logical_sha256") == plan.logical_sha256
+        and receipt_plan.get("stage") == stage,
+        dose.get("lineage")
+        == {
+            "campaign_id": manifest.campaign_id,
+            "manifest_sha256": manifest.manifest_sha256,
+            "manifest_file_sha256": report.manifest_file_sha256,
+        },
+        isinstance(callback, Mapping)
+        and _binding_matches_current(
+            {
+                "path": callback.get("callback_path"),
+                "sha256": callback.get("callback_sha256"),
+            },
+            _PASSIVE_DOSE_CALLBACK,
+        ),
+        not dose_asset.path.with_suffix(dose_asset.path.suffix + ".partial").exists(),
+    )
+    if not all(base_checks):
+        return False
+
+    per_bin = dose.get("per_bin_completed")
+    if not isinstance(per_bin, Mapping):
+        return False
+    try:
+        completed_by_bin = {int(key): float(value) for key, value in per_bin.items()}
+    except (TypeError, ValueError):
+        return False
+    if len(completed_by_bin) != len(per_bin) or any(str(int(key)) != str(key) for key in per_bin):
+        return False
+    if any(not math.isfinite(value) or value < 0 for value in completed_by_bin.values()):
+        return False
+    if not math.isclose(
+        math.fsum(completed_by_bin.values()), expected_total, rel_tol=0.0, abs_tol=1e-6
+    ):
+        return False
+
+    expected_contexts = {context_id: context for _, context_id, context in manifest.contexts[stage]}
+    rows = dose.get("context_doses")
+    if not isinstance(rows, list) or len(rows) != len(expected_contexts):
+        return False
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return False
+        context_id = row.get("context_id")
+        if (
+            not isinstance(context_id, str)
+            or context_id in seen
+            or row.get("context") != expected_contexts.get(context_id)
+        ):
+            return False
+        seen.add(context_id)
+        membership = row.get("membership_by_global_bin")
+        if not isinstance(membership, Mapping):
+            return False
+        try:
+            weights = {int(key): float(value) for key, value in membership.items()}
+        except (TypeError, ValueError):
+            return False
+        if (
+            not weights
+            or len(weights) != len(membership)
+            or any(str(int(key)) != str(key) for key in membership)
+            or any(
+                not math.isfinite(value) or not 0.0 < value <= 1.0 + 1e-12
+                for value in weights.values()
+            )
+            or not math.isclose(max(weights.values()), 1.0, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            return False
+        projected = math.fsum(
+            completed_by_bin.get(bin_id, 0.0) * weight for bin_id, weight in weights.items()
+        )
+        try:
+            recorded_projected = float(row.get("completed_kernel_steps"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not math.isfinite(recorded_projected)
+            or recorded_projected < 0
+            or not math.isclose(projected, recorded_projected, rel_tol=0.0, abs_tol=1e-6)
+        ):
+            return False
+        kernel_payload = {
+            "context_id": context_id,
+            "kernel_radius_bins": row.get("kernel_radius_bins"),
+            "sigma_frames": row.get("sigma_frames"),
+            "membership_by_global_bin": {str(key): value for key, value in sorted(weights.items())},
+            "dose_registry_sha256": registry,
+        }
+        if (
+            row.get("kernel_radius_bins") != plan.kernel_radius_bins
+            or row.get("sigma_frames") != plan.sigma_frames
+            or row.get("kernel_membership_sha256") != sha256_of(kernel_payload)
+        ):
+            return False
+    coverage_hash = sha256_of({"stage": stage, "context_ids": sorted(seen)})
+    return seen == set(expected_contexts) and coverage_hash == smoke.get("context_coverage_sha256")
+
+
+def _block_live_passive_dose(audit: _Audit) -> None:
+    """Keep the historical blocker until one valid live receipt transitions it."""
+
+    audit.blocker(
+        "live_passive_dose_smoke_missing",
+        "no valid hash-bound live-GPU smoke proves the passive completion hook and exact "
+        "shared-control projections end to end",
+        "dose",
+    )
+    audit.blocker(
+        "shared_control_realized_dose_unimplemented",
+        "CPU contracts exist, but shared-control realized dose remains claim-blocked until "
+        "live_passive_dose_smoke_verified is present",
+        "dose",
+    )
+
+
+def _validate_directional_calibration_preregistration(
+    reference: Any,
+    manifest: _ManifestView,
+    report: PreflightReport,
+    base_dir: Path,
+    audit: _Audit,
+) -> tuple[_Asset | None, dict[str, Any] | None]:
+    """Validate the external, outcome-free directional design artifact."""
+
+    scope = "latent_direction"
+    asset = _verify_asset(
+        reference, base_dir, audit, "directional_calibration_preregistration", scope
+    )
+    if asset is None:
+        return None, None
+    payload = _read_json(asset.path, audit, "directional_calibration_preregistration", scope)
+    if payload is None:
+        return asset, None
+    initial_blockers = len(audit.report.blockers)
+    if (
+        payload.get("kind") != DIRECTIONAL_PREREGISTRATION_KIND
+        or payload.get("schema_version") != 1
+    ):
+        audit.blocker(
+            "directional_calibration_preregistration_schema_invalid",
+            "directional calibration preregistration has the wrong kind or schema",
+            scope,
+        )
+    expected = {
+        "frozen_before_outcomes": True,
+        "contains_outcomes": False,
+        "campaign_id": manifest.campaign_id,
+        "manifest_sha256": manifest.manifest_sha256,
+        "manifest_file_sha256": report.manifest_file_sha256,
+    }
+    bad = [key for key, value in expected.items() if payload.get(key) != value]
+    if bad:
+        audit.blocker(
+            "directional_calibration_preregistration_binding_invalid",
+            f"directional preregistration differs on {bad}",
+            scope,
+        )
+    source_manifest = payload.get("source_manifest")
+    git_identity = payload.get("git")
+    launcher = payload.get("launcher")
+    current_launcher_sha256 = (
+        sha256_file(_DIRECTIONAL_CALIBRATION_LAUNCHER)
+        if _DIRECTIONAL_CALIBRATION_LAUNCHER.is_file()
+        else None
+    )
+    provenance_valid = (
+        isinstance(source_manifest, dict)
+        and Path(str(source_manifest.get("path", ""))).resolve()
+        == Path(report.manifest_path).resolve()
+        and source_manifest.get("logical_sha256") == manifest.manifest_sha256
+        and source_manifest.get("file_sha256") == report.manifest_file_sha256
+        and isinstance(git_identity, dict)
+        and _FULL_COMMIT.fullmatch(str(git_identity.get("sha", ""))) is not None
+        and git_identity.get("status_short") == []
+        and isinstance(launcher, dict)
+        and Path(str(launcher.get("path", ""))).resolve() == _DIRECTIONAL_CALIBRATION_LAUNCHER
+        and launcher.get("sha256") == current_launcher_sha256
+    )
+    if not provenance_valid:
+        audit.blocker(
+            "directional_calibration_preregistration_provenance_invalid",
+            "directional preregistration must bind the exact manifest, a clean full Git "
+            "identity, and the current directional-freezing launcher bytes",
+            scope,
+        )
+    body = dict(payload)
+    recorded = body.pop("artifact_sha256", None)
+    if not _is_sha(recorded) or recorded != sha256_of(body):
+        audit.blocker(
+            "directional_calibration_preregistration_hash_invalid",
+            "directional preregistration logical hash is invalid",
+            scope,
+        )
+    try:
+        algorithm = DC.validate_algorithm_artifact(payload.get("algorithm"))
+    except ValueError as error:
+        audit.blocker("directional_calibration_algorithm_invalid", str(error), scope)
+        algorithm = None
+    if algorithm is not None:
+        rows = []
+        raw_contexts = manifest.payload.get("contexts_per_stage") or {}
+        for stage in manifest.stages:
+            for seed in manifest.seeds:
+                for entry in raw_contexts.get(stage, []):
+                    rows.append(
+                        DC.CalibrationDesignRow(
+                            sample_id=f"{stage}|{seed}|{entry.get('context_id')}",
+                            context_id=str(entry.get("context_id")),
+                            motion_family=str(entry.get("family", "")),
+                        )
+                    )
+        try:
+            expected_support = DC.validate_design_support(rows, algorithm)
+        except ValueError as error:
+            audit.blocker("directional_calibration_design_invalid", str(error), scope)
+        else:
+            if payload.get("design_support") != expected_support:
+                audit.blocker(
+                    "directional_calibration_design_mismatch",
+                    "recorded directional design support/folds do not match the manifest",
+                    scope,
+                )
+            if expected_support.get("status") != "ready":
+                audit.blocker(
+                    "directional_calibration_design_not_ready",
+                    "frozen manifest cannot support the preregistered nested grouped folds",
+                    scope,
+                )
+    if len(audit.report.blockers) == initial_blockers:
+        audit.verified(
+            "directional_calibration_preregistration_verified",
+            f"outcome-free directional design is READY [{recorded}]",
+            scope,
+        )
+        return asset, payload
+    return asset, None
 
 
 def _validate_efficacy_plan(
@@ -1800,6 +2623,8 @@ def _validate_gates(
     proxy_asset: _Asset | None,
     noise_asset: _Asset | None,
     estimand_sha256: str | None,
+    directional_asset: _Asset | None,
+    directional_preregistration: dict[str, Any] | None,
     base_dir: Path,
     audit: _Audit,
 ) -> None:
@@ -1837,6 +2662,43 @@ def _validate_gates(
             "Gate preregistration does not bind the deployment utility estimand hash",
             "gates",
         )
+    latent = gates.get("latent_proxy_audit")
+    external_algorithm = (
+        directional_preregistration.get("algorithm")
+        if isinstance(directional_preregistration, dict)
+        else None
+    )
+    external_logical_hash = (
+        directional_preregistration.get("artifact_sha256")
+        if isinstance(directional_preregistration, dict)
+        else None
+    )
+    if not isinstance(latent, dict) or external_algorithm is None or directional_asset is None:
+        audit.blocker(
+            "gate_directional_preregistration_missing",
+            "Gate B requires the verified external directional-calibration preregistration",
+            "gates",
+        )
+    else:
+        binding = {
+            "embedded_algorithm": latent.get("directional_calibration") == external_algorithm,
+            "logical_hash": latent.get("directional_calibration_preregistration_sha256")
+            == external_logical_hash,
+            "file_hash": latent.get("directional_calibration_preregistration_file_sha256")
+            == directional_asset.sha256,
+        }
+        if not all(binding.values()):
+            audit.blocker(
+                "gate_directional_preregistration_mismatch",
+                "Gate B does not bind the exact external directional algorithm/design artifact",
+                "gates",
+            )
+        else:
+            audit.verified(
+                "gate_directional_preregistration_verified",
+                "Gate B binds the external READY design and exact implemented algorithm",
+                "gates",
+            )
     if not any(item.scope == "gates" for item in audit.report.blockers):
         audit.verified(
             "gate_vocabulary_verified",
@@ -1962,6 +2824,26 @@ def _missing_bundle_contract(audit: _Audit, *, include_bundle: bool) -> None:
     if include_bundle:
         audit.blocker("preflight_bundle_missing", "preflight bundle is required", "preflight")
     required = (
+        (
+            "passive_dose_plan_missing",
+            "hash-bound v2 passive-dose plan with exact manifest context coverage",
+            "dose_plan",
+        ),
+        (
+            "live_passive_dose_smoke_missing",
+            "hash-bound live-GPU passive-dose smoke receipt",
+            "dose",
+        ),
+        (
+            "shared_control_realized_dose_unimplemented",
+            "shared controls remain claim-blocked until the live passive-dose smoke passes",
+            "dose",
+        ),
+        (
+            "directional_calibration_preregistration_missing",
+            "external outcome-free directional-calibration algorithm/design artifact",
+            "latent_direction",
+        ),
         (
             "origin_map_missing",
             "per-(stage, seed) origin map with full capsule/checkpoint pairs",

@@ -5,13 +5,19 @@ means untouched**. A disabled callback must not patch, wrap, or observe
 anything, so that a "research code off" baseline really is the native run.
 """
 
+# Ruff's force-sort setting conflicts with the repository's isort profile.
+# ruff: noqa: I001
+
 import json
+from pathlib import Path
 
 import pytest
 import torch
 
 from gear_sonic.research.practice_utility import callbacks as C
+from gear_sonic.research.practice_utility import dose_plan as DP
 from gear_sonic.research.practice_utility.schema import ContextKey, motion_hash
+from scripts.practice_utility import create_passive_dose_plan as DOSE_CLI
 
 BIN_SIZE = 50
 BINS_PER_MOTION = 4
@@ -51,12 +57,22 @@ class FakeMotionLib:
         self.adp_samp_length_starts = torch.arange(NUM_MOTIONS) * frames_per_motion
         self.adp_samp_frame_to_bin = torch.arange(NUM_MOTIONS * frames_per_motion) // BIN_SIZE
         self.update_calls = 0
+        self.adaptive_update_calls = 0
         self.sample_calls = 0
 
     def update_adaptive_sampling_probabilities(self):
         self.update_calls += 1
         n = self.adp_samp_active_motion_bins.numel()
         self.adp_sampling_active_prob = torch.full((n,), 1.0 / n, dtype=torch.float64)
+
+    def update_adaptive_sampling(self, failure, motion_ids, motion_time_steps):
+        self.adaptive_update_calls += 1
+        self.last_adaptive_update = (
+            failure.clone(),
+            motion_ids.clone(),
+            motion_time_steps.clone(),
+        )
+        return "native-update-result"
 
     def sample_motion_ids_and_time_steps(self, n):
         self.sample_calls += 1
@@ -74,6 +90,34 @@ class FakeMotionLib:
 class FakeEnv:
     def __init__(self):
         self._motion_lib = FakeMotionLib()
+        self.num_envs = 2
+        self.motion_command = type("FakeMotionCommand", (), {})()
+        self.motion_command.motion_ids = torch.tensor([0, 0])
+        self.motion_command.motion_start_time_steps = torch.tensor([0, 0])
+        self.motion_command.time_steps = torch.tensor([10, 60])
+        self.return_dones = torch.tensor([False, True])
+        self.return_time_outs = torch.tensor([False, False])
+        self.next_motion_ids = None
+        self.next_motion_start_time_steps = None
+        self.next_time_steps = None
+        self.step_calls = 0
+        self.last_step_result = None
+
+    def step(self, actions=None):
+        self.step_calls += 1
+        if self.next_motion_ids is not None:
+            self.motion_command.motion_ids = self.next_motion_ids.clone()
+        if self.next_motion_start_time_steps is not None:
+            self.motion_command.motion_start_time_steps = self.next_motion_start_time_steps.clone()
+        if self.next_time_steps is not None:
+            self.motion_command.time_steps = self.next_time_steps.clone()
+        self.last_step_result = (
+            {"actions": actions},
+            torch.zeros(self.num_envs),
+            self.return_dones.clone(),
+            {"time_outs": self.return_time_outs.clone()},
+        )
+        return self.last_step_result
 
     def get_env_state_dict(self):
         return {"motion_lib": {"stub": True}}
@@ -93,6 +137,72 @@ def context_for(bin_index=1):
         bin_start_frame=bin_index * BIN_SIZE,
         bin_end_frame=(bin_index + 1) * BIN_SIZE,
     )
+
+
+def write_dose_plan(tmp_path, *contexts):
+    launcher = Path(DOSE_CLI.__file__).resolve()
+    rows = [
+        {"context_id": context.context_id, "context": context.to_dict()} for context in contexts
+    ]
+    payload = {
+        "kind": DP.PASSIVE_DOSE_PLAN_KIND,
+        "schema_version": DP.PASSIVE_DOSE_PLAN_SCHEMA_VERSION,
+        "campaign_id": "screen_test",
+        "manifest_sha256": "a" * 64,
+        "manifest_file_sha256": "b" * 64,
+        "provenance": {
+            "source_manifest": {
+                "path": str(tmp_path / "manifest.json"),
+                "logical_sha256": "a" * 64,
+                "file_sha256": "b" * 64,
+            },
+            "git": {"sha": "c" * 40, "status_short": []},
+            "launcher": {
+                "path": str(launcher),
+                "sha256": DP.file_sha256(launcher),
+            },
+        },
+        "control_strategy": "shared_per_stage_seed",
+        "measurement_hook": DP.PASSIVE_DOSE_HOOK,
+        "kernel": {
+            "radius_bins": 0,
+            "reference_bin_size_frames": 50,
+            "sigma_frames": 50.0,
+            "membership_normalization": "peak_equals_one",
+        },
+        "contexts_per_stage": {"late": rows},
+    }
+    payload["dose_plan_sha256"] = DP.logical_sha256(payload)
+    path = tmp_path / "dose_plan.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return path
+
+
+def claim_callback(tmp_path, plan_path, **overrides):
+    params = dict(
+        enabled=True,
+        role="control",
+        pair_id="screen_test_late_s11",
+        branch_id="screen_test_late_s11_control",
+        kernel_radius_bins=0,
+        dose_report_dir=str(tmp_path / "dose"),
+        claim_mode=True,
+        dose_plan_path=str(plan_path),
+        dose_plan_sha256=DP.file_sha256(plan_path),
+        dose_plan_stage="late",
+        dose_report_horizons={"H_s": 1},
+        dose_origin_global_step=0,
+        dose_num_steps_per_iteration=1,
+        dose_num_envs=2,
+        dose_lineage={
+            "campaign_id": "screen_test",
+            "manifest_sha256": "a" * 64,
+            "manifest_file_sha256": "b" * 64,
+            "source_commit": "c" * 40,
+        },
+    )
+    params.update(overrides)
+    return C.PracticeContextCallback(**params)
 
 
 @pytest.fixture
@@ -253,6 +363,39 @@ class TestDoseRecording:
         assert motion_ids.shape == (4,) and int(time_steps[0]) == 60
         assert env._motion_lib.sample_calls == 1
 
+    def test_completed_step_wrapper_preserves_native_call_and_return(self, env):
+        callback = self.install(env)
+        result = env.step({"actions": "unchanged"})
+        report = callback.adapter.get_exact_dose_report()
+        assert result is env.last_step_result
+        assert env.step_calls == 1
+        assert report.per_bin_completed == {0: 1.0, 1: 1.0}
+        assert report.completed_env_steps == 2.0
+        assert report.completion_hook_calls == 1
+        assert report.termination_observations == 2
+        assert report.early_terminations == 1
+
+    def test_completed_step_observation_does_not_change_distribution(self, env):
+        callback = self.install(env, epsilon=0.0)
+        before = env._motion_lib.adp_sampling_active_prob.clone()
+        env.return_dones = torch.tensor([False, False])
+        env.step(None)
+        assert torch.equal(env._motion_lib.adp_sampling_active_prob, before)
+        assert callback.adapter.get_exact_dose_report().completed_env_steps == 2.0
+
+    def test_reset_to_different_bin_credits_the_pre_transition_context(self, env):
+        callback = self.install(env)
+        env.next_time_steps = torch.tensor([110, 160])
+        env.return_dones = torch.tensor([True, True])
+        env.return_time_outs = torch.tensor([False, True])
+
+        env.step(None)
+
+        report = callback.adapter.get_exact_dose_report()
+        assert report.per_bin_completed == {0: 1.0, 1: 1.0}
+        assert report.early_terminations == 1
+        assert torch.equal(env.motion_command.time_steps, torch.tensor([110, 160]))
+
     def test_writes_a_dose_report(self, env, tmp_path):
         callback = self.install(env, dose_report_dir=str(tmp_path))
         env._motion_lib.sample_motion_ids_and_time_steps(8)
@@ -291,6 +434,153 @@ class TestDoseRecording:
                 snapshot_path=str(tmp_path / "snapshot.json"),
                 snapshot_timeline_fps=50.0,
             )
+
+
+class TestPassiveClaimReceipts:
+    def test_shared_control_emits_every_planned_context_at_exact_horizon(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(0), context_for(1))
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        env.step(None)
+        callback.on_step_end(None, FakeState(1), None, env=env)
+
+        reports = list((tmp_path / "dose").glob("dose_*_H_s_step000001.json"))
+        assert len(reports) == 1
+        payload = json.loads(reports[0].read_text())
+        assert payload["schema_version"] == 2
+        assert payload["status"] == "complete"
+        assert payload["valid_for_claim"] is True
+        assert payload["completed_env_steps"] == payload["expected_env_steps"] == 2.0
+        assert payload["completion_hook_calls"] == payload["expected_completion_hook_calls"] == 1
+        assert payload["termination_observations"] == 2
+        assert len(payload["context_doses"]) == 2
+        assert {row["context_id"] for row in payload["context_doses"]} == {
+            context_for(0).context_id,
+            context_for(1).context_id,
+        }
+        assert payload["passive_dose_plan"]["file_sha256"] == DP.file_sha256(plan)
+        assert not list((tmp_path / "dose").glob("*.partial"))
+
+    def test_claim_mode_fails_at_receipt_on_stale_global_registry(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        env._motion_lib.adp_samp_bins[0, 1] += 1
+        env.return_dones = torch.tensor([False, False])
+        env.step(None)
+        with pytest.raises(RuntimeError, match="registry changed"):
+            callback.on_step_end(None, FakeState(1), None, env=env)
+        assert env.step_calls == 1
+        assert callback.adapter.get_exact_dose_report().dropped_completion_batches == 0
+        blocked = next((tmp_path / "dose").glob("dose_*_H_s_step000001.json"))
+        assert json.loads(blocked.read_text())["status"] == "blocked"
+        callback.uninstall()
+
+    def test_one_registry_hash_serves_24_receipt_projections(self, env, tmp_path, monkeypatch):
+        base = context_for(1).to_dict()
+        contexts = [
+            ContextKey.from_dict({**base, "encoder_mode": f"g1_projection_{index:02d}"})
+            for index in range(24)
+        ]
+        plan = write_dose_plan(tmp_path, *contexts)
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        assert callback.adapter is not None
+        calls = 0
+        original = callback.adapter.dose_registry_sha256
+
+        def counted():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(callback.adapter, "dose_registry_sha256", counted)
+        env.return_dones = torch.tensor([False, False])
+        env.step(None)
+        callback.on_step_end(None, FakeState(1), None, env=env)
+        report = next((tmp_path / "dose").glob("dose_*_H_s_step000001.json"))
+        assert len(json.loads(report.read_text())["context_doses"]) == 24
+        assert calls == 1
+
+    def test_claim_mode_fails_after_native_step_on_dropped_batch(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        env.return_dones = torch.tensor([False])
+        env.return_time_outs = torch.tensor([False])
+        with pytest.raises(RuntimeError, match="captured transition contexts"):
+            env.step(None)
+        assert env.step_calls == 1
+        assert callback.adapter.get_exact_dose_report().dropped_completion_batches == 1
+        callback.uninstall()
+
+    def test_claim_receipt_is_exclusive_and_preserves_first_evidence(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        env.step(None)
+        path = Path(callback.write_dose_report(1, horizon_label="H_s"))
+        original = path.read_bytes()
+
+        with pytest.raises(FileExistsError):
+            callback.write_dose_report(1, horizon_label="H_s")
+
+        assert path.read_bytes() == original
+        assert not list(path.parent.glob(".*.partial"))
+
+    def test_claim_install_rejects_live_bin_size_different_from_plan(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        env._motion_lib.adp_samp_bin_size = 25
+        callback = claim_callback(tmp_path, plan)
+        with pytest.raises(ValueError, match="live adp_samp_bin_size"):
+            callback.on_train_begin(None, FakeState(0), None, env=env)
+
+    def test_nonclaim_plan_receipt_is_never_marked_valid_for_claim(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        callback = C.PracticeContextCallback(
+            enabled=True,
+            role="control",
+            pair_id="p0",
+            dose_report_dir=str(tmp_path / "dose"),
+            dose_plan_path=str(plan),
+            dose_plan_sha256=DP.file_sha256(plan),
+            dose_plan_stage="late",
+            kernel_radius_bins=0,
+        )
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        env.step(None)
+        payload = json.loads(Path(callback.write_dose_report(1)).read_text())
+        assert payload["valid_for_claim"] is False
+
+    def test_claim_receipt_without_exact_horizon_is_blocked_not_valid(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        env.step(None)
+        with pytest.raises(RuntimeError, match="not tied to an exact horizon"):
+            callback.write_dose_report(1)
+        path = next((tmp_path / "dose").glob("dose_*_step000001.json"))
+        payload = json.loads(path.read_text())
+        assert payload["status"] == "blocked"
+        assert payload["valid_for_claim"] is False
+
+    def test_train_end_fails_if_exact_horizon_was_not_seen_and_restores_hooks(self, env, tmp_path):
+        plan = write_dose_plan(tmp_path, context_for(1))
+        callback = claim_callback(tmp_path, plan)
+        callback.on_train_begin(None, FakeState(0), None, env=env)
+        with pytest.raises(RuntimeError, match="without exact horizon receipts"):
+            callback.on_train_end(None, FakeState(0), None, env=env)
+        assert "step" not in vars(env)
+
+    def test_uninstall_restores_a_preexisting_instance_hook_exactly(self, env):
+        def instance_hook(actions):
+            return actions
+
+        env.step = instance_hook
+        callback = C.PracticeContextCallback(enabled=True, role="control", pair_id="p0")
+        callback.on_train_begin(None, FakeState(), None, env=env)
+        callback.uninstall()
+        assert env.step is instance_hook
 
 
 class TestStaleKernelHandling:

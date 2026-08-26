@@ -21,12 +21,13 @@ Where this binds, in ``gear_sonic/utils/motion_lib/motion_lib_base.py``:
     ``adp_samp_bins[bin] = (orig_motion_id, bin_start, bin_end)``. Dose is
     counted here, at draw time.
 
-Counting dose at draw time matters. ``update_adaptive_sampling_stats()`` runs at
-episode *end* and is the wrong place to measure exposure, because an episode
-that terminates immediately still counts as one episode there while delivering
-almost no practice. The realized-dose denominator in
-:meth:`UtilityRecord.utility_at` needs steps actually executed inside the
-kernel, so the adapter tracks draws and completions separately.
+Counting dose at draw time matters for episode counts, but completed exposure
+is captured separately around ``ManagerEnvWrapper.step``. The callback freezes
+the current reference context before IsaacLab can reset and resample a failed
+environment, then records the successful transition after the native step
+returns. The realized-dose denominator in :meth:`UtilityRecord.utility_at`
+therefore reflects steps actually executed inside the kernel rather than the
+next episode's newly sampled motion.
 
 The adapter is duck-typed over the motion library so its guarantees can be
 tested on CPU against a fake that mirrors the real attribute contract.
@@ -43,10 +44,12 @@ import torch
 from gear_sonic.research.practice_utility import intervention as I
 from gear_sonic.research.practice_utility.schema import (
     ContextKey,
+    DoseProjection,
     DoseReport,
     MotionPoolManifest,
     SamplingSnapshot,
     motion_hash,
+    sha256_of,
 )
 
 
@@ -80,6 +83,10 @@ class InterventionSpec:
             raise ValueError(f"epsilon must be in [0, 1], got {self.epsilon}")
 
 
+class StaleDoseRegistryError(RuntimeError):
+    """Raised when passive dose can no longer be projected on its frozen bins."""
+
+
 class PracticeSamplerAdapter:
     """Reads, and optionally overrides, SONIC's bin sampling distribution."""
 
@@ -100,13 +107,18 @@ class PracticeSamplerAdapter:
         self._residual_id: str | None = None
 
         self._drawn_per_bin: dict[int, float] = defaultdict(float)
+        self._completed_per_bin: dict[int, float] = defaultdict(float)
         self._kernel_weights: torch.Tensor | None = None
         self._drawn_episodes = 0.0
         self._drawn_kernel_mass = 0.0
         self._completed_env_steps = 0.0
         self._completed_kernel_steps = 0.0
-        self._total_episodes = 0.0
         self._early_terminations = 0
+        self._completion_hook_calls = 0
+        self._completion_observations = 0
+        self._termination_observations = 0
+        self._dropped_completion_batches = 0
+        self._dose_registry_sha256 = self.dose_registry_sha256()
 
     # ---------------------------------------------------------------- state --
 
@@ -125,12 +137,16 @@ class PracticeSamplerAdapter:
     def reset_dose(self) -> None:
         """Zero the dose counters, e.g. at the start of a continuation."""
         self._drawn_per_bin = defaultdict(float)
+        self._completed_per_bin = defaultdict(float)
         self._drawn_episodes = 0.0
         self._drawn_kernel_mass = 0.0
         self._completed_env_steps = 0.0
         self._completed_kernel_steps = 0.0
-        self._total_episodes = 0.0
         self._early_terminations = 0
+        self._completion_hook_calls = 0
+        self._completion_observations = 0
+        self._termination_observations = 0
+        self._dropped_completion_batches = 0
 
     # ------------------------------------------------------------ snapshots --
 
@@ -256,14 +272,35 @@ class PracticeSamplerAdapter:
         steps_completed: torch.Tensor,
         early_terminated: torch.Tensor | None = None,
     ) -> None:
-        """Record how many steps each finished episode actually executed."""
+        """Record one batch of executed reference-timeline steps.
+
+        The callback wraps ``ManagerEnvWrapper.step`` and passes the contexts
+        frozen immediately before each successful native step with unit
+        ``steps_completed``. The more general weighted form remains useful for
+        CPU contract tests and offline aggregation.
+        """
         ids = global_bin_ids.detach().cpu().reshape(-1)
         steps = steps_completed.detach().cpu().reshape(-1).to(torch.float64)
         if ids.numel() != steps.numel():
             raise ValueError("global_bin_ids and steps_completed must align")
+        if early_terminated is not None and early_terminated.numel() != ids.numel():
+            raise ValueError("early_terminated must align with global_bin_ids")
+        if not bool(torch.isfinite(steps).all()) or bool((steps < 0).any()):
+            raise ValueError("steps_completed must be finite and non-negative")
+        num_bins = int(self.motion_lib.adp_samp_num_bins)
+        if bool(((ids < 0) | (ids >= num_bins)).any()):
+            raise ValueError("global_bin_ids contains an unmappable bin")
 
-        self._total_episodes += float(ids.numel())
+        self._completion_hook_calls += 1
+        self._completion_observations += int(ids.numel())
+        self._termination_observations += int(ids.numel())
         self._completed_env_steps += float(steps.sum())
+        if ids.numel():
+            unique_ids, inverse = torch.unique(ids.to(torch.long), return_inverse=True)
+            totals = torch.zeros(unique_ids.numel(), dtype=torch.float64)
+            totals.scatter_add_(0, inverse, steps)
+            for bin_id, value in zip(unique_ids.tolist(), totals.tolist()):
+                self._completed_per_bin[int(bin_id)] += float(value)
         if early_terminated is not None:
             self._early_terminations += int(early_terminated.detach().cpu().sum())
 
@@ -277,12 +314,132 @@ class PracticeSamplerAdapter:
                     (membership[position[valid]] * steps[valid]).sum()
                 )
 
+    def record_dropped_completion_batch(self) -> None:
+        """Record a batch that could not be attributed exactly.
+
+        Claim-mode callbacks raise immediately after incrementing this counter;
+        exploratory callers may continue, but the resulting receipt is marked
+        unusable.
+        """
+
+        self._dropped_completion_batches += 1
+
+    def dose_registry_sha256(self) -> str:
+        """Hash the immutable dataset-global mapping used for passive dose.
+
+        ``adp_samp_active_motion_bins`` is intentionally absent. SONIC may
+        rotate the resident batch during a continuation, but
+        ``adp_samp_frame_to_bin`` and ``adp_samp_bins`` retain the same
+        dataset-global identities. A change to that global mapping is stale;
+        an ordinary resident-batch rotation is not.
+        """
+
+        lib = self.motion_lib
+        rows = lib.adp_samp_bins.detach().cpu().to(torch.long)
+        frame_to_bin = lib.adp_samp_frame_to_bin.detach().cpu().to(torch.long)
+        keys = lib._motion_data_keys
+        listed = keys.tolist() if hasattr(keys, "tolist") else list(keys)
+        return sha256_of(
+            {
+                "global_bin_rows": [[int(value) for value in row] for row in rows.tolist()],
+                "frame_to_bin": [int(value) for value in frame_to_bin.tolist()],
+                "motion_keys": [str(value) for value in listed],
+                "bin_size": int(lib.adp_samp_bin_size),
+            }
+        )
+
+    def verify_dose_registry(self) -> str:
+        """Hash the global registry once and verify it against installation.
+
+        This belongs at receipt time, not in the per-simulation-step completion
+        hook. The returned hash is then an explicit verification token for all
+        context projections emitted by that receipt.
+        """
+
+        current = self.dose_registry_sha256()
+        if current != self._dose_registry_sha256:
+            raise StaleDoseRegistryError(
+                "passive dose registry changed during the continuation: "
+                f"{self._dose_registry_sha256} -> {current}"
+            )
+        return current
+
+    def project_completed_kernel_steps(
+        self,
+        context: ContextKey,
+        *,
+        verified_registry_sha256: str,
+        kernel_radius: int = 1,
+        sigma_frames: float | None = None,
+    ) -> DoseProjection:
+        """Purely project the histogram using one receipt-time registry check."""
+
+        if verified_registry_sha256 != self._dose_registry_sha256:
+            raise StaleDoseRegistryError(
+                "projection did not receive the verified installation registry hash"
+            )
+        spec = I.KernelSpec(
+            radius_bins=kernel_radius,
+            sigma_frames=float(
+                sigma_frames if sigma_frames is not None else self.motion_lib.adp_samp_bin_size
+            ),
+        )
+        # Build over the immutable global registry, not the rotating resident
+        # list. This keeps projection pure and lets a shared control cover all
+        # planned contexts even when a context is not resident at report time.
+        # Duplicate active ids therefore cannot double count dose.
+        lib = self.motion_lib
+        rows = lib.adp_samp_bins.detach().cpu().to(torch.long)
+        motion_ids, starts, ends = rows[:, 0], rows[:, 1], rows[:, 2]
+        target_motion_id = self._motion_id_for_key(context.motion_key)
+        self._validate_context_bin_identity(context)
+        matches = torch.nonzero(
+            (motion_ids == target_motion_id)
+            & (starts == context.bin_start_frame)
+            & (ends == context.bin_end_frame),
+            as_tuple=False,
+        ).flatten()
+        if matches.numel() != 1:
+            raise ValueError(f"context {context.context_id} maps to {matches.numel()} global bins")
+        weights = I.build_local_kernel(
+            target_position=int(matches[0]),
+            bin_positions=starts // int(lib.adp_samp_bin_size),
+            bin_motion_ids=motion_ids,
+            target_motion_id=target_motion_id,
+            bin_centre_frames=(starts + ends) // 2,
+            spec=spec,
+        )
+        peak = float(weights.max())
+        membership = weights / peak if peak > 0 else weights
+        by_bin = {index: float(value) for index, value in enumerate(membership.tolist())}
+        by_bin = {key: value for key, value in by_bin.items() if value > 0.0}
+        completed = sum(
+            self._completed_per_bin.get(key, 0.0) * value for key, value in by_bin.items()
+        )
+        kernel_hash = sha256_of(
+            {
+                "context_id": context.context_id,
+                "kernel_radius_bins": spec.radius_bins,
+                "sigma_frames": spec.sigma_frames,
+                "membership_by_global_bin": {
+                    str(key): value for key, value in sorted(by_bin.items())
+                },
+                "dose_registry_sha256": self._dose_registry_sha256,
+            }
+        )
+        return DoseProjection(
+            context_id=context.context_id,
+            kernel_radius_bins=spec.radius_bins,
+            sigma_frames=spec.sigma_frames,
+            completed_kernel_steps=float(completed),
+            membership_by_global_bin=by_bin,
+            kernel_membership_sha256=kernel_hash,
+        )
+
     def get_exact_dose_report(self, context_id: str | None = None) -> DoseReport:
         """Emit the realized-dose receipt for this branch."""
         if context_id is None:
-            context_id = (
-                self._intervention.context.context_id if self._intervention else "native"
-            )
+            context_id = self._intervention.context.context_id if self._intervention else "native"
         per_motion: dict[str, float] = defaultdict(float)
         for bin_id, count in self._drawn_per_bin.items():
             per_motion[self.context_for_bin(bin_id).motion_key] += count
@@ -295,10 +452,19 @@ class PracticeSamplerAdapter:
             completed_env_steps=self._completed_env_steps,
             completed_kernel_steps=self._completed_kernel_steps,
             total_env_steps=self._completed_env_steps,
-            total_episodes=self._total_episodes,
+            # This is the observable episode-start count: sampler draws after
+            # instrumentation began. It intentionally excludes episodes that
+            # were already resident at callback installation.
+            total_episodes=self._drawn_episodes,
             per_bin_drawn=dict(self._drawn_per_bin),
+            per_bin_completed=dict(self._completed_per_bin),
             per_motion_drawn=dict(per_motion),
             early_terminations=self._early_terminations,
+            completion_hook_calls=self._completion_hook_calls,
+            completion_observations=self._completion_observations,
+            termination_observations=self._termination_observations,
+            dropped_completion_batches=self._dropped_completion_batches,
+            dose_registry_sha256=self._dose_registry_sha256,
         )
 
     # --------------------------------------------------------------- helpers --
@@ -311,7 +477,12 @@ class PracticeSamplerAdapter:
         motion_ids, starts, ends = rows[:, 0], rows[:, 1], rows[:, 2]
 
         target_motion_id = self._motion_id_for_key(context.motion_key)
-        match = (motion_ids == target_motion_id) & (starts == context.bin_start_frame)
+        self._validate_context_bin_identity(context)
+        match = (
+            (motion_ids == target_motion_id)
+            & (starts == context.bin_start_frame)
+            & (ends == context.bin_end_frame)
+        )
         positions = torch.nonzero(match, as_tuple=False).flatten()
         if positions.numel() == 0:
             raise ValueError(
@@ -363,6 +534,16 @@ class PracticeSamplerAdapter:
             if str(key) == motion_key:
                 return index
         raise ValueError(f"motion key {motion_key!r} not present in the motion library")
+
+    def _validate_context_bin_identity(self, context: ContextKey) -> None:
+        bin_size = int(self.motion_lib.adp_samp_bin_size)
+        if (
+            context.bin_start_frame % bin_size != 0
+            or context.bin_index != context.bin_start_frame // bin_size
+        ):
+            raise ValueError(
+                f"context {context.context_id} bin_index does not match its reference-bin start"
+            )
 
     def _motion_frame_count(self, orig_motion_id: int) -> int:
         frames = getattr(self.motion_lib, "adp_samp_num_frames", None)

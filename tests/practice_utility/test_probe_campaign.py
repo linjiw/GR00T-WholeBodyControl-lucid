@@ -12,6 +12,8 @@ from pathlib import Path
 import torch
 
 from gear_sonic.research.practice_utility import branch_capsule as BC
+from gear_sonic.research.practice_utility import directional_calibration as DC
+from gear_sonic.research.practice_utility import dose_plan as DP
 from gear_sonic.research.practice_utility import probe_campaign as PC
 from gear_sonic.research.practice_utility import proxy_audit as PA
 from gear_sonic.research.practice_utility.rng_capsule import RngState
@@ -20,6 +22,8 @@ from gear_sonic.research.practice_utility.schema import (
     motion_hash,
     sha256_of,
 )
+from scripts.practice_utility import create_passive_dose_plan as DOSE_CLI
+from scripts.practice_utility import freeze_directional_calibration as DIRECTIONAL_CLI
 
 
 def write_json(path: Path, payload: dict) -> Path:
@@ -34,22 +38,23 @@ def reference(path: Path, **extras) -> dict:
 
 def manifest_payload() -> dict:
     contexts = []
-    for index, family in enumerate(("walk", "jump")):
+    families = ("f0", "f0", "f1", "f1", "f2", "f2", "f3", "f3", "f4", "f5", "f6", "f7")
+    for index, family in enumerate(families):
         key = f"motion_{index}__A{index:03d}"
         context = ContextKey(
             key,
             motion_hash(key, 100, 30.0),
-            index,
-            50 * index,
-            50 * (index + 1),
+            0,
+            0,
+            50,
         )
         contexts.append(
             {
                 "context": context.to_dict(),
                 "context_id": context.context_id,
-                "failure_rate": 0.2 + 0.5 * index,
+                "failure_rate": 0.05 + 0.05 * index,
                 "sampling_probability": 0.1,
-                "failure_quartile": 2 * index,
+                "failure_quartile": index % 4,
                 "family": family,
                 "contact_regime": "steady",
                 "partition": "adaptation",
@@ -67,7 +72,7 @@ def manifest_payload() -> dict:
         "horizons": {"H_s": 2, "H_l": 4},
         "pool_sha256": "b" * 64,
         "split_sha256": "c" * 64,
-        "num_intervention_branches": 4,
+        "num_intervention_branches": 24,
         "num_control_branches": 2,
         "contexts_per_stage": {"late": contexts},
     }
@@ -103,8 +108,8 @@ def full_origin(
         trainer_state={"global_step": step, "trainer_state_obj": {"global_step": step}},
         env_state={"episode_count": 8},
         native_sampler_state={
-            "adp_samp_num_episodes": torch.ones(2),
-            "adp_samp_num_failures": torch.ones(2),
+            "adp_samp_num_episodes": torch.ones(len(manifest["contexts_per_stage"]["late"])),
+            "adp_samp_num_failures": torch.ones(len(manifest["contexts_per_stage"]["late"])),
         },
         rng_state=RngState.capture(f"origin_s{seed}"),
         provenance=provenance,
@@ -131,8 +136,8 @@ def full_origin(
             "kind": "practice_utility_sampler_snapshot",
             "schema_version": 1,
             "global_step": step,
-            "num_bins": 2,
-            "num_active_bins": 2,
+            "num_bins": len(rows),
+            "num_active_bins": len(rows),
             "distribution_sha256": "3" * 64,
             "contexts": rows,
         },
@@ -319,6 +324,53 @@ def valid_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "utility_deltas": [-0.01, 0.0, 0.01],
         },
     )
+    passive_payload = DP.build_passive_dose_plan_payload(
+        manifest,
+        manifest_file_sha256=PC.sha256_file(manifest_path),
+        sigma_frames=50.0,
+        created_at="2026-08-26T00:00:00+00:00",
+        source_manifest_path=str(manifest_path),
+        source_commit="a" * 40,
+        git_status_short=[],
+        launcher_path=str(Path(DOSE_CLI.__file__).resolve()),
+        launcher_sha256=PC.sha256_file(Path(DOSE_CLI.__file__).resolve()),
+    )
+    passive_plan = write_json(tmp_path / "passive_dose_plan_v2.json", passive_payload)
+
+    directional_algorithm = DC.default_algorithm_artifact()
+    directional_rows = [
+        DC.CalibrationDesignRow(
+            sample_id=f"late|{seed}|{entry['context_id']}",
+            context_id=entry["context_id"],
+            motion_family=entry["family"],
+        )
+        for seed in manifest["seeds"]
+        for entry in manifest["contexts_per_stage"]["late"]
+    ]
+    directional_payload = {
+        "kind": PC.DIRECTIONAL_PREREGISTRATION_KIND,
+        "schema_version": 1,
+        "frozen_before_outcomes": True,
+        "campaign_id": manifest["campaign_id"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest_file_sha256": PC.sha256_file(manifest_path),
+        "source_manifest": {
+            "path": str(manifest_path.resolve()),
+            "logical_sha256": manifest["manifest_sha256"],
+            "file_sha256": PC.sha256_file(manifest_path),
+        },
+        "git": {"sha": "a" * 40, "status_short": []},
+        "launcher": {
+            "path": str(Path(DIRECTIONAL_CLI.__file__).resolve()),
+            "sha256": PC.sha256_file(Path(DIRECTIONAL_CLI.__file__).resolve()),
+        },
+        "algorithm": directional_algorithm,
+        "design_support": DC.validate_design_support(directional_rows, directional_algorithm),
+        "contains_outcomes": False,
+    }
+    directional_payload["artifact_sha256"] = sha256_of(directional_payload)
+    directional = write_json(tmp_path / "directional_preregistration.json", directional_payload)
+
     gates = write_json(
         tmp_path / "gates.json",
         {
@@ -347,6 +399,11 @@ def valid_fixture(tmp_path: Path) -> tuple[Path, Path]:
                     "min_pairwise_accuracy": PA.SUFFICIENCY["min_pairwise_accuracy"],
                 },
                 "directional_test": "nested_cv_univariate_calibration",
+                "directional_calibration": directional_algorithm,
+                "directional_calibration_preregistration_sha256": directional_payload[
+                    "artifact_sha256"
+                ],
+                "directional_calibration_preregistration_file_sha256": PC.sha256_file(directional),
                 "raw_sign_accuracy_allowed": False,
             },
             "estimator_authorization": {
@@ -366,6 +423,8 @@ def valid_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "manifest_file_sha256": PC.sha256_file(manifest_path),
             "screening_control_strategy": PC.SHARED_CONTROL_STRATEGY,
             "randomness_contract": PC.STOCHASTIC_RANDOMNESS_CONTRACT,
+            "passive_dose_plan": reference(passive_plan),
+            "directional_calibration_preregistration": reference(directional),
             "origin_maps": {"late": reference(origin_map)},
             "encoder": reference(
                 encoder,
@@ -400,21 +459,303 @@ def test_missing_sidecar_fails_closed_with_actionable_blockers(tmp_path):
     } <= finding_codes(report.blockers)
 
 
-def test_complete_bundle_preserves_both_unimplemented_claim_blockers(tmp_path):
+def test_complete_bundle_keeps_live_passive_dose_blocker(tmp_path):
     manifest, preflight = valid_fixture(tmp_path)
     report = PC.audit_probe_campaign(manifest, preflight)
     assert not report.ready
     assert finding_codes(report.blockers) == {
+        "live_passive_dose_smoke_reference_missing",
+        "live_passive_dose_smoke_missing",
         "shared_control_realized_dose_unimplemented",
-        "latent_directional_calibration_unimplemented",
     }
-    assert len(report.branch_specs) == 6
+    assert len(report.branch_specs) == 26
     assert sum(spec.role == "control" for spec in report.branch_specs) == 2
-    assert sum(spec.role == "intervention" for spec in report.branch_specs) == 4
+    assert sum(spec.role == "intervention" for spec in report.branch_specs) == 24
     assert all(spec.absolute_horizons == {"H_s": 26, "H_l": 28} for spec in report.branch_specs)
     assert all(spec.target_global_step == 28 for spec in report.branch_specs)
     assert "shared_controls_screening_only" in finding_codes(report.warnings)
     assert "gate_vocabulary_verified" in finding_codes(report.verified)
+    assert "passive_dose_plan_verified" in finding_codes(report.verified)
+    assert "directional_calibration_preregistration_verified" in finding_codes(report.verified)
+
+
+def attach_valid_live_passive_smoke(tmp_path):
+    manifest_path, preflight = valid_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    bundle = json.loads(preflight.read_text())
+    plan_path = Path(bundle["passive_dose_plan"]["path"])
+    plan = DP.load_passive_dose_plan(plan_path)
+    stage = "late"
+    context_ids = sorted(row["context_id"] for row in manifest["contexts_per_stage"][stage])
+    contexts = {row["context_id"]: row["context"] for row in manifest["contexts_per_stage"][stage]}
+    registry_sha256 = "9" * 64
+    completed = 2 * 1 * 256
+    projections = []
+    for context_id in context_ids:
+        membership = {"0": 1.0}
+        kernel_payload = {
+            "context_id": context_id,
+            "kernel_radius_bins": plan.kernel_radius_bins,
+            "sigma_frames": plan.sigma_frames,
+            "membership_by_global_bin": membership,
+            "dose_registry_sha256": registry_sha256,
+        }
+        projections.append(
+            {
+                "context": contexts[context_id],
+                "context_id": context_id,
+                "kernel_radius_bins": plan.kernel_radius_bins,
+                "sigma_frames": plan.sigma_frames,
+                "completed_kernel_steps": float(completed),
+                "membership_by_global_bin": membership,
+                "kernel_membership_sha256": sha256_of(kernel_payload),
+            }
+        )
+    dose = {
+        "kind": DP.PASSIVE_DOSE_RECEIPT_KIND,
+        "schema_version": DP.PASSIVE_DOSE_RECEIPT_SCHEMA_VERSION,
+        "status": "complete",
+        "valid_for_claim": True,
+        "role": "control",
+        "epsilon": 0.0,
+        "context_id": "native",
+        "armed": False,
+        "never_armed": True,
+        "global_step": 26,
+        "horizon_label": "H_s",
+        "measurement_hook": DP.PASSIVE_DOSE_HOOK,
+        "completed_env_steps": float(completed),
+        "expected_env_steps": completed,
+        "completion_hook_calls": 2,
+        "expected_completion_hook_calls": 2,
+        "completion_observations": completed,
+        "expected_completion_observations": completed,
+        "termination_observations": completed,
+        "dropped_completion_batches": 0,
+        "dose_registry_sha256_at_install": registry_sha256,
+        "dose_registry_sha256_at_report": registry_sha256,
+        "registry_stable": True,
+        "per_bin_completed": {"0": float(completed)},
+        "passive_dose_plan": {
+            "path": str(plan.path),
+            "file_sha256": plan.file_sha256,
+            "logical_sha256": plan.logical_sha256,
+            "stage": stage,
+        },
+        "lineage": {
+            "campaign_id": manifest["campaign_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_file_sha256": PC.sha256_file(manifest_path),
+        },
+        "implementation": {
+            "callback_path": str(PC._PASSIVE_DOSE_CALLBACK),
+            "callback_sha256": PC.sha256_file(PC._PASSIVE_DOSE_CALLBACK),
+        },
+        "context_doses": projections,
+        "blockers": [],
+    }
+    dose["receipt_payload_sha256"] = sha256_of(dose)
+    dose_path = write_json(tmp_path / "live_dose.json", dose)
+    log_path = tmp_path / "live.log"
+    log_path.write_text("successful live simulator smoke\n")
+    source_config = write_json(tmp_path / "source_config.json", {"num_steps_per_env": 1})
+    launcher_binding = reference(PC._PASSIVE_DOSE_SMOKE_LAUNCHER)
+    callback_binding = reference(PC._PASSIVE_DOSE_CALLBACK)
+    source_config_binding = reference(source_config)
+    implementation = {
+        "launcher": launcher_binding,
+        "callback": callback_binding,
+        "source_config": source_config_binding,
+        "sources": {name: reference(path) for name, path in PC._PASSIVE_DOSE_SOURCE_PATHS.items()},
+    }
+    origin_map_path = Path(bundle["origin_maps"][stage]["path"])
+    origin_map = json.loads(origin_map_path.read_text())
+    origin = origin_map["origins"]["11"]
+    capsule_path = Path(origin["capsule"])
+    checkpoint_path = Path(origin["checkpoint"])
+    snapshot_path = Path(origin["snapshot"])
+    localized_checkpoint = tmp_path / "localized_origin_checkpoint.pt"
+    localized_checkpoint.write_bytes(checkpoint_path.read_bytes())
+    command = ["python", "train_agent_trl.py", "+claim_smoke=true"]
+    command_sha256 = sha256_of({"argv": command})
+    prereg = {
+        "kind": "practice_utility_passive_dose_smoke_preregistration",
+        "schema_version": 1,
+        "immutable": True,
+        "outcome_blind": True,
+        "source_commit": "a" * 40,
+        "source_tree_clean": True,
+        "source_tree_status": [],
+        "implementation": implementation,
+        "launcher": launcher_binding,
+        "inputs": {
+            "manifest": reference(manifest_path),
+            "passive_dose_plan": {
+                **reference(plan_path),
+                "logical_sha256": plan.logical_sha256,
+            },
+            "callback": callback_binding,
+            "origin_map": reference(origin_map_path),
+            "capsule": reference(capsule_path),
+            "checkpoint": reference(checkpoint_path),
+            "snapshot": reference(snapshot_path),
+            "localized_checkpoint": {
+                **reference(localized_checkpoint),
+                "source_path": str(checkpoint_path),
+                "publication": "exclusive_byte_copy",
+            },
+        },
+        "design": {
+            "campaign_id": manifest["campaign_id"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "stage": stage,
+            "seed": 11,
+            "role": "control",
+            "epsilon": 0.0,
+            "origin_global_step": 24,
+            "relative_horizon": {"H_s": 2},
+            "absolute_horizon": {"H_s": 26},
+            "num_envs": 256,
+            "num_steps_per_env": 1,
+            "num_steps_source_config": source_config_binding,
+            "expected_completed_env_steps": completed,
+        },
+        "command": command,
+        "command_sha256": command_sha256,
+        "outputs": {
+            "log": str(log_path),
+            "dose_receipt": str(dose_path),
+        },
+    }
+    prereg["preregistration_sha256"] = sha256_of(prereg)
+    prereg_path = write_json(tmp_path / "live.preregistration.json", prereg)
+    smoke = {
+        "kind": PC.LIVE_PASSIVE_DOSE_SMOKE_KIND,
+        "schema_version": 1,
+        "status": "complete",
+        "campaign_id": manifest["campaign_id"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest_file_sha256": PC.sha256_file(manifest_path),
+        "measurement_hook": DP.PASSIVE_DOSE_HOOK,
+        "execution_mode": "live_gpu_simulator",
+        "device_type": "cuda",
+        "stage": stage,
+        "seed": 11,
+        "source_commit": "a" * 40,
+        "source_tree_status": [],
+        "implementation": implementation,
+        "preregistration": reference(prereg_path),
+        "command_sha256": command_sha256,
+        "runtime": {
+            "exit_code": 0,
+            "wall_seconds": 1.0,
+            "cuda_memory_growth_mib": 1024.0,
+            "gpu": {"peak_used_mib": 2048.0},
+            "log": reference(log_path),
+        },
+        "passive_dose_plan": {
+            "file_sha256": plan.file_sha256,
+            "logical_sha256": plan.logical_sha256,
+        },
+        "origin": {
+            "origin_map_file_sha256": PC.sha256_file(origin_map_path),
+            "global_step": 24,
+            "capsule_file_sha256": PC.sha256_file(capsule_path),
+            "checkpoint_file_sha256": PC.sha256_file(checkpoint_path),
+            "snapshot_file_sha256": PC.sha256_file(snapshot_path),
+        },
+        "dose_receipt": reference(dose_path),
+        "context_coverage_sha256": sha256_of({"stage": stage, "context_ids": context_ids}),
+        "checks": {
+            "passive_completion_exact": True,
+            "epsilon_zero_control": True,
+            "dose_registry_stable": True,
+            "exact_context_projection": True,
+            "cuda_execution_verified": True,
+            "atomic_receipt_no_partial": True,
+            "immutable_preregistration_bound": True,
+            "successful_runtime_and_log": True,
+        },
+        "not_yet_verified": [
+            "native step return preservation in the live process",
+            "native distribution bitwise identity against a paired no-callback reference",
+            "callback wrapper removal observed after on_train_end",
+        ],
+        "blockers": [],
+    }
+    smoke["smoke_sha256"] = sha256_of(smoke)
+    smoke_path = write_json(tmp_path / "live_smoke.json", smoke)
+    bundle["live_passive_dose_smoke"] = reference(smoke_path)
+    write_json(preflight, bundle)
+
+    return manifest_path, preflight, smoke_path, dose_path, prereg_path
+
+
+def test_directly_observed_live_passive_smoke_unblocks_dose_hook(tmp_path):
+    manifest_path, preflight, _, _, _ = attach_valid_live_passive_smoke(tmp_path)
+    report = PC.audit_probe_campaign(manifest_path, preflight)
+
+    assert report.ready
+    assert "live_passive_dose_smoke_verified" in finding_codes(report.verified)
+    assert "shared_control_realized_dose_unimplemented" not in finding_codes(report.blockers)
+
+
+def test_live_smoke_recomputes_dose_totals_instead_of_trusting_checks(tmp_path):
+    manifest, preflight, smoke_path, dose_path, _ = attach_valid_live_passive_smoke(tmp_path)
+    dose = json.loads(dose_path.read_text())
+    dose["per_bin_completed"]["0"] -= 1.0
+    dose.pop("receipt_payload_sha256")
+    dose["receipt_payload_sha256"] = sha256_of(dose)
+    write_json(dose_path, dose)
+    smoke = json.loads(smoke_path.read_text())
+    smoke["dose_receipt"] = reference(dose_path)
+    smoke.pop("smoke_sha256")
+    smoke["smoke_sha256"] = sha256_of(smoke)
+    write_json(smoke_path, smoke)
+    bundle = json.loads(preflight.read_text())
+    bundle["live_passive_dose_smoke"] = reference(smoke_path)
+    write_json(preflight, bundle)
+
+    report = PC.audit_probe_campaign(manifest, preflight)
+
+    assert "live_passive_dose_receipt_invalid" in finding_codes(report.blockers)
+
+
+def test_live_smoke_must_bind_current_callback_and_source_set(tmp_path):
+    manifest, preflight, smoke_path, _, _ = attach_valid_live_passive_smoke(tmp_path)
+    smoke = json.loads(smoke_path.read_text())
+    smoke["implementation"]["callback"]["sha256"] = "0" * 64
+    smoke.pop("smoke_sha256")
+    smoke["smoke_sha256"] = sha256_of(smoke)
+    write_json(smoke_path, smoke)
+    bundle = json.loads(preflight.read_text())
+    bundle["live_passive_dose_smoke"] = reference(smoke_path)
+    write_json(preflight, bundle)
+
+    report = PC.audit_probe_campaign(manifest, preflight)
+
+    assert "live_passive_dose_smoke_implementation_invalid" in finding_codes(report.blockers)
+
+
+def test_live_smoke_must_bind_immutable_clean_preregistration(tmp_path):
+    manifest, preflight, smoke_path, _, prereg_path = attach_valid_live_passive_smoke(tmp_path)
+    prereg = json.loads(prereg_path.read_text())
+    prereg["source_tree_clean"] = False
+    prereg.pop("preregistration_sha256")
+    prereg["preregistration_sha256"] = sha256_of(prereg)
+    write_json(prereg_path, prereg)
+    smoke = json.loads(smoke_path.read_text())
+    smoke["preregistration"] = reference(prereg_path)
+    smoke.pop("smoke_sha256")
+    smoke["smoke_sha256"] = sha256_of(smoke)
+    write_json(smoke_path, smoke)
+    bundle = json.loads(preflight.read_text())
+    bundle["live_passive_dose_smoke"] = reference(smoke_path)
+    write_json(preflight, bundle)
+
+    report = PC.audit_probe_campaign(manifest, preflight)
+
+    assert "live_passive_dose_preregistration_invalid" in finding_codes(report.blockers)
 
 
 def test_manifest_tampering_is_detected_before_launch(tmp_path):
@@ -426,3 +767,36 @@ def test_manifest_tampering_is_detected_before_launch(tmp_path):
     assert not report.ready
     assert "manifest_hash_mismatch" in finding_codes(report.blockers)
     assert "preflight_manifest_file_hash_mismatch" in finding_codes(report.blockers)
+
+
+def test_passive_plan_must_bind_the_current_freezer_launcher(tmp_path):
+    manifest, preflight = valid_fixture(tmp_path)
+    bundle = json.loads(preflight.read_text())
+    plan_path = Path(bundle["passive_dose_plan"]["path"])
+    plan = json.loads(plan_path.read_text())
+    plan["provenance"]["launcher"]["sha256"] = "0" * 64
+    plan["dose_plan_sha256"] = DP.logical_sha256(plan)
+    write_json(plan_path, plan)
+    bundle["passive_dose_plan"]["sha256"] = PC.sha256_file(plan_path)
+    write_json(preflight, bundle)
+
+    report = PC.audit_probe_campaign(manifest, preflight)
+    assert "passive_dose_plan_provenance_invalid" in finding_codes(report.blockers)
+
+
+def test_directional_artifact_must_bind_clean_git_manifest_and_current_launcher(tmp_path):
+    manifest, preflight = valid_fixture(tmp_path)
+    bundle = json.loads(preflight.read_text())
+    directional_path = Path(bundle["directional_calibration_preregistration"]["path"])
+    directional = json.loads(directional_path.read_text())
+    directional["git"]["status_short"] = [" M posthoc.py"]
+    directional.pop("artifact_sha256")
+    directional["artifact_sha256"] = sha256_of(directional)
+    write_json(directional_path, directional)
+    bundle["directional_calibration_preregistration"]["sha256"] = PC.sha256_file(directional_path)
+    write_json(preflight, bundle)
+
+    report = PC.audit_probe_campaign(manifest, preflight)
+    assert "directional_calibration_preregistration_provenance_invalid" in finding_codes(
+        report.blockers
+    )

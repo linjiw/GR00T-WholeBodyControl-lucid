@@ -9,6 +9,8 @@ The fake motion library mirrors the attribute contract of
 ``TestUpstreamContract`` guards against drift between the fake and upstream.
 """
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -34,12 +36,16 @@ class FakeMotionLib:
         self.adp_samp_num_frames = torch.full(
             (num_motions,), bins_per_motion * BIN_SIZE, dtype=torch.long
         )
+        frames_per_motion = bins_per_motion * BIN_SIZE
+        self.adp_samp_frame_to_bin = torch.arange(num_motions * frames_per_motion) // BIN_SIZE
 
         active = torch.arange(len(rows)) if active_bin_ids is None else torch.tensor(active_bin_ids)
         self.adp_samp_active_motion_bins = active
         n = active.numel()
-        p = torch.full((n,), 1.0 / n, dtype=torch.float64) if probs is None else torch.tensor(
-            probs, dtype=torch.float64
+        p = (
+            torch.full((n,), 1.0 / n, dtype=torch.float64)
+            if probs is None
+            else torch.tensor(probs, dtype=torch.float64)
         )
         self.adp_sampling_active_prob = p / p.sum()
 
@@ -159,7 +165,7 @@ class TestInterventionShape:
             adapter.set_intervention(adapter.context_for_bin(1), epsilon=1.5)
 
     def test_rejects_context_absent_from_the_resident_batch(self, lib):
-        partial = FakeMotionLib(active_bin_ids=[0, 1, 2, 3])   # motion 0 only
+        partial = FakeMotionLib(active_bin_ids=[0, 1, 2, 3])  # motion 0 only
         full = PracticeSamplerAdapter(FakeMotionLib())
         adapter = PracticeSamplerAdapter(partial)
         with pytest.raises(ValueError, match="not resident"):
@@ -195,7 +201,7 @@ class TestResidualDistribution:
 
 class TestContextKeys:
     def test_fields_match_the_bin_table(self, adapter):
-        context = adapter.context_for_bin(5)   # motion 1, bin 1
+        context = adapter.context_for_bin(5)  # motion 1, bin 1
         assert context.motion_key == "motion_01"
         assert (context.bin_start_frame, context.bin_end_frame) == (50, 100)
         assert context.bin_index == 1
@@ -227,7 +233,7 @@ class TestContextKeys:
         """The bug the first live run found: float(tensor_of_N) raises."""
         del lib._sim_fps
         adapter = PracticeSamplerAdapter(lib)
-        assert adapter._timeline_fps() == 50.0          # falls back, does not raise
+        assert adapter._timeline_fps() == 50.0  # falls back, does not raise
         assert adapter.context_for_bin(0).motion_hash
 
     def test_scalar_fps_tensor_is_accepted(self, lib):
@@ -296,6 +302,102 @@ class TestDoseAccounting:
         assert report.completed_kernel_steps == pytest.approx(140.0)
         assert report.completed_env_steps == pytest.approx(140.0)
 
+    def test_passive_histogram_is_recorded_without_an_intervention(self, adapter):
+        adapter.record_completion(
+            torch.tensor([1, 1, 2]),
+            torch.tensor([1.0, 1.0, 1.0]),
+            torch.tensor([False, True, False]),
+        )
+        report = adapter.get_exact_dose_report()
+        assert report.per_bin_completed == {1: 2.0, 2: 1.0}
+        assert report.completed_env_steps == 3.0
+        assert report.completion_hook_calls == 1
+        assert report.completion_observations == 3
+        assert report.termination_observations == 3
+        assert report.early_terminations == 1
+
+    def test_passive_projection_is_pure_and_kernel_specific(self, adapter):
+        adapter.record_completion(torch.tensor([0, 1, 2, 7]), torch.ones(4))
+        before = adapter.get_exact_dose_report()
+        projection = adapter.project_completed_kernel_steps(
+            adapter.context_for_bin(1),
+            verified_registry_sha256=adapter.verify_dose_registry(),
+            kernel_radius=0,
+        )
+        after = adapter.get_exact_dose_report()
+        assert projection.completed_kernel_steps == pytest.approx(1.0)
+        assert projection.membership_by_global_bin == {1: 1.0}
+        assert before.per_bin_completed == after.per_bin_completed
+        assert adapter.override_active is False
+
+    def test_projection_requires_exact_bin_end(self, adapter):
+        context = dataclasses.replace(adapter.context_for_bin(1), bin_end_frame=99)
+        with pytest.raises(ValueError, match="maps to 0 global bins"):
+            adapter.project_completed_kernel_steps(
+                context,
+                verified_registry_sha256=adapter.verify_dose_registry(),
+                kernel_radius=0,
+            )
+
+    def test_projection_requires_bin_index_to_match_reference_start(self, adapter):
+        context = dataclasses.replace(adapter.context_for_bin(1), bin_index=2)
+        with pytest.raises(ValueError, match="bin_index does not match"):
+            adapter.project_completed_kernel_steps(
+                context,
+                verified_registry_sha256=adapter.verify_dose_registry(),
+                kernel_radius=0,
+            )
+
+    def test_passive_projection_rejects_a_stale_registry(self, adapter, lib):
+        adapter.record_completion(torch.tensor([1]), torch.ones(1))
+        lib.adp_samp_bins[1, 1] += 1
+        with pytest.raises(RuntimeError, match="registry"):
+            adapter.verify_dose_registry()
+
+    def test_passive_projection_survives_resident_batch_rotation(self, adapter, lib):
+        context = adapter.context_for_bin(1)
+        adapter.record_completion(torch.tensor([1]), torch.ones(1))
+        lib.adp_samp_active_motion_bins = torch.arange(8)
+        projection = adapter.project_completed_kernel_steps(
+            context,
+            verified_registry_sha256=adapter.verify_dose_registry(),
+            kernel_radius=0,
+        )
+        assert projection.completed_kernel_steps == pytest.approx(1.0)
+
+    def test_completion_hot_path_does_not_rehash_the_registry(self, adapter, monkeypatch):
+        calls = 0
+        original = adapter.dose_registry_sha256
+
+        def counted():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(adapter, "dose_registry_sha256", counted)
+        for _ in range(10):
+            adapter.record_completion(torch.tensor([1, 2]), torch.ones(2))
+        assert calls == 0
+        assert (
+            adapter.verify_dose_registry() == adapter.get_exact_dose_report().dose_registry_sha256
+        )
+        assert calls == 1
+
+    def test_total_episodes_counts_observed_sampler_draws_not_env_steps(self, adapter):
+        adapter.record_draw(torch.tensor([1, 2, 3]))
+        for _ in range(5):
+            adapter.record_completion(torch.tensor([1, 2, 3]), torch.ones(3))
+        report = adapter.get_exact_dose_report()
+        assert report.total_episodes == report.drawn_episodes == 3.0
+        assert report.completion_observations == 15
+
+    def test_completion_rejects_unmappable_bins_without_partial_count(self, adapter):
+        with pytest.raises(ValueError, match="unmappable"):
+            adapter.record_completion(torch.tensor([999]), torch.ones(1))
+        report = adapter.get_exact_dose_report()
+        assert report.completed_env_steps == 0.0
+        assert report.completion_hook_calls == 0
+
     def test_early_termination_reduces_realized_dose(self, adapter):
         """The point of counting steps rather than episodes."""
         adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.1, kernel_radius=0)
@@ -304,7 +406,7 @@ class TestDoseAccounting:
             torch.tensor([1, 1]), torch.tensor([200.0, 3.0]), torch.tensor([False, True])
         )
         report = adapter.get_exact_dose_report()
-        assert report.drawn_episodes == 2.0          # both episodes were started
+        assert report.drawn_episodes == 2.0  # both episodes were started
         assert report.completed_kernel_steps == 203.0  # but one delivered almost nothing
         assert report.early_terminations == 1
 
@@ -325,7 +427,7 @@ class TestDoseAccounting:
 
     def test_stale_kernel_is_detected_after_a_motion_resample(self, adapter, lib):
         adapter.set_intervention(adapter.context_for_bin(1), epsilon=0.1)
-        lib.adp_samp_active_motion_bins = torch.arange(8)   # library reloaded
+        lib.adp_samp_active_motion_bins = torch.arange(8)  # library reloaded
         with pytest.raises(RuntimeError, match="stale"):
             adapter.record_draw(torch.tensor([1]))
 
@@ -343,9 +445,7 @@ class TestDuplicateResidentBins:
     def duplicated_lib(self):
         # Motion 0's four bins appear twice, as if it were resident twice.
         lib = FakeMotionLib()
-        lib.adp_samp_active_motion_bins = torch.tensor(
-            [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7]
-        )
+        lib.adp_samp_active_motion_bins = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7])
         n = lib.adp_samp_active_motion_bins.numel()
         lib.adp_sampling_active_prob = torch.full((n,), 1.0 / n, dtype=torch.float64)
         return lib
@@ -396,6 +496,18 @@ class TestDuplicateResidentBins:
         adapter.record_completion(torch.tensor([1, 1]), torch.tensor([100.0, 50.0]))
         assert adapter.get_exact_dose_report().completed_kernel_steps == pytest.approx(150.0)
 
+    def test_passive_projection_counts_a_duplicated_global_bin_once(self):
+        lib = self.duplicated_lib()
+        adapter = PracticeSamplerAdapter(lib)
+        adapter.record_completion(torch.tensor([1, 1]), torch.tensor([1.0, 1.0]))
+        projection = adapter.project_completed_kernel_steps(
+            adapter.context_for_bin(1),
+            verified_registry_sha256=adapter.verify_dose_registry(),
+            kernel_radius=0,
+        )
+        assert projection.membership_by_global_bin == {1: 1.0}
+        assert projection.completed_kernel_steps == pytest.approx(2.0)
+
 
 class TestPairedBranchesShareABase:
     """Control and intervention must differ only through the intervention."""
@@ -423,9 +535,7 @@ class TestPairedBranchesShareABase:
 
         out_c = control.apply(lib_c.adp_sampling_active_prob)
         out_t = treated.apply(lib_t.adp_sampling_active_prob)
-        expected = I.mix_intervention(
-            lib_c.adp_sampling_active_prob, treated._kernel_weights, 0.10
-        )
+        expected = I.mix_intervention(lib_c.adp_sampling_active_prob, treated._kernel_weights, 0.10)
         assert torch.allclose(out_t, expected)
         assert not torch.allclose(out_t, out_c)
 
@@ -491,5 +601,7 @@ class TestUpstreamContract:
         from gear_sonic.utils.motion_lib import motion_lib_base
 
         source = inspect.getsource(motion_lib_base.MotionLibBase.sample_motion_ids_and_time_steps)
-        assert "bins[:, 0], bins[:, 1], bins[:, 2]" in source.replace(" ", "").replace("\n", "") \
+        assert (
+            "bins[:, 0], bins[:, 1], bins[:, 2]" in source.replace(" ", "").replace("\n", "")
             or "orig_motion_ids, bin_start, bin_end" in source
+        )
