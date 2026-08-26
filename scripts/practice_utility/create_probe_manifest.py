@@ -394,6 +394,60 @@ def group_snapshot_paths(items: list[str]) -> dict[str, list[Path]]:
     return grouped
 
 
+def _canonical_snapshot_rows(snapshot: dict[str, Any], label: str) -> dict[str, dict[str, Any]]:
+    """Collapse exact with-replacement copies and retain their total probability."""
+    contexts = snapshot.get("contexts")
+    if not isinstance(contexts, list) or not contexts:
+        raise ValueError(f"{label} contains no resident contexts")
+    declared_count = snapshot.get("num_active_bins")
+    if (
+        not isinstance(declared_count, int)
+        or isinstance(declared_count, bool)
+        or declared_count != len(contexts)
+    ):
+        raise ValueError(f"{label} num_active_bins does not match its raw serialized context rows")
+
+    indexed: dict[str, dict[str, Any]] = {}
+    exemplars: dict[str, dict[str, Any]] = {}
+    for raw in contexts:
+        if not isinstance(raw, dict):
+            raise ValueError(f"{label} contains a non-object context")
+        context = ContextKey.from_dict(raw)
+        context_id = raw.get("context_id")
+        if context_id != context.context_id:
+            raise ValueError(f"{label} context hash mismatch for {context.motion_key!r}")
+        probability = raw.get("sampling_probability")
+        if isinstance(probability, bool):
+            raise ValueError(f"{label} context {context_id} has invalid sampling_probability")
+        try:
+            probability = float(probability)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{label} context {context_id} has invalid sampling_probability"
+            ) from error
+        if not math.isfinite(probability) or probability < 0.0:
+            raise ValueError(f"{label} context {context_id} has invalid sampling_probability")
+
+        if context_id in indexed:
+            if raw != exemplars[context_id]:
+                raise ValueError(
+                    f"{label} duplicate context {context_id} has conflicting serialized rows"
+                )
+            row = indexed[context_id]
+            row["sampling_probability"] = math.fsum(
+                (float(row["sampling_probability"]), probability)
+            )
+            row["resident_multiplicity"] = int(row["resident_multiplicity"]) + 1
+            continue
+
+        exemplars[context_id] = dict(raw)
+        row = dict(raw)
+        row["sampling_probability"] = probability
+        row["resident_multiplicity"] = 1
+        indexed[context_id] = row
+    return indexed
+
+
 def _validated_snapshot_rows(
     snapshot: dict[str, Any], clips: dict[str, dict[str, Any]], label: str
 ) -> dict[str, dict[str, Any]]:
@@ -402,19 +456,9 @@ def _validated_snapshot_rows(
         or snapshot.get("schema_version") != 1
     ):
         raise ValueError(f"{label} has the wrong kind or schema version")
-    contexts = snapshot.get("contexts")
-    if not isinstance(contexts, list) or not contexts:
-        raise ValueError(f"{label} contains no resident contexts")
-    indexed: dict[str, dict[str, Any]] = {}
-    for raw in contexts:
-        if not isinstance(raw, dict):
-            raise ValueError(f"{label} contains a non-object context")
+    indexed = _canonical_snapshot_rows(snapshot, label)
+    for raw in indexed.values():
         context = ContextKey.from_dict(raw)
-        context_id = raw.get("context_id")
-        if context_id != context.context_id:
-            raise ValueError(f"{label} context hash mismatch for {context.motion_key!r}")
-        if context_id in indexed:
-            raise ValueError(f"{label} contains duplicate context {context_id}")
         record = clips.get(context.motion_key)
         if record is None:
             raise ValueError(f"{label} context motion {context.motion_key!r} is absent from pool")
@@ -423,9 +467,6 @@ def _validated_snapshot_rows(
                 f"{label} ContextKey motion hash mismatch for {context.motion_key!r}: "
                 "snapshot is not bound to the selected pool"
             )
-        indexed[context_id] = dict(raw)
-    if snapshot.get("num_active_bins") not in (None, len(indexed)):
-        raise ValueError(f"{label} num_active_bins does not match its context rows")
     return indexed
 
 
@@ -434,18 +475,8 @@ def intersect_snapshots(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     if not snapshots:
         raise ValueError("at least one snapshot is required")
     indexed: list[dict[str, dict[str, Any]]] = []
-    for snapshot in snapshots:
-        rows: dict[str, dict[str, Any]] = {}
-        for raw in snapshot.get("contexts", []):
-            row = dict(raw)
-            context = ContextKey.from_dict(row)
-            context_id = str(row.get("context_id") or context.context_id)
-            if context_id in rows:
-                raise ValueError(f"snapshot contains duplicate context {context_id}")
-            if context.context_id != context_id:
-                raise ValueError(f"snapshot context hash mismatch for {context_id}")
-            rows[context_id] = row
-        indexed.append(rows)
+    for index, snapshot in enumerate(snapshots):
+        indexed.append(_canonical_snapshot_rows(snapshot, f"snapshot {index}"))
 
     common = set(indexed[0])
     for rows in indexed[1:]:
@@ -463,6 +494,10 @@ def intersect_snapshots(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
         row["sampling_probability"] = statistics.fmean(
             float(version.get("sampling_probability", 0.0)) for version in versions
         )
+        row.pop("resident_multiplicity", None)
+        row["resident_multiplicity_by_origin"] = [
+            int(version["resident_multiplicity"]) for version in versions
+        ]
         row["origin_count"] = len(versions)
         merged.append(row)
     return {
@@ -600,6 +635,21 @@ def load_origin_stages(
             if row.get("num_resident_contexts") != len(rows):
                 raise ValueError(
                     f"origin-map resident count does not match snapshot {stage!r}/seed={seed}"
+                )
+            raw_context_count = len(snapshot["contexts"])
+            serialized_raw_count = row.get("num_active_context_rows")
+            if serialized_raw_count is not None and serialized_raw_count != raw_context_count:
+                raise ValueError(
+                    f"origin-map active row count does not match snapshot {stage!r}/seed={seed}"
+                )
+            serialized_duplicate_count = row.get("num_duplicate_active_context_rows")
+            actual_duplicate_count = raw_context_count - len(rows)
+            if (
+                serialized_duplicate_count is not None
+                and serialized_duplicate_count != actual_duplicate_count
+            ):
+                raise ValueError(
+                    f"origin-map duplicate row count does not match snapshot {stage!r}/seed={seed}"
                 )
             sources.append(SnapshotSource(seed, path, actual_hash, snapshot))
             snapshot_paths.add(path)
@@ -803,11 +853,7 @@ def main(argv=None) -> int:
     candidates_per_stage: dict[str, list[PM.ContextCandidate]] = {}
     selection_counts: dict[str, dict[str, Any]] = {}
     for stage, (source_snapshots, paths) in stage_snapshots.items():
-        snapshot = (
-            intersect_snapshots(source_snapshots)
-            if len(source_snapshots) > 1
-            else source_snapshots[0]
-        )
+        snapshot = intersect_snapshots(source_snapshots)
         candidates, skipped_partition, skipped_missing = build_candidates(
             snapshot,
             clips,
@@ -881,6 +927,12 @@ def main(argv=None) -> int:
                     "file_sha256": source.file_sha256,
                     "global_step": source.payload.get("global_step"),
                     "context_count": len(source.payload.get("contexts", [])),
+                    "raw_context_row_count": len(source.payload.get("contexts", [])),
+                    "unique_context_count": len(
+                        _canonical_snapshot_rows(
+                            source.payload, f"receipt snapshot {stage!r}/seed={source.seed}"
+                        )
+                    ),
                 }
                 for source in origin.snapshots
             },

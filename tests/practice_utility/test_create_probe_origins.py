@@ -158,16 +158,18 @@ def test_stability_requires_two_complete_windows():
 
 def test_snapshot_must_match_capsule_counters_and_frozen_pool():
     snapshot = {
+        "num_active_bins": 1,
         "contexts": [
             {
                 "context_id": "ctx",
                 "motion_key": "motion",
                 "motion_hash": "a" * 64,
                 "global_bin_id": 1,
+                "sampling_probability": 0.25,
                 "num_episodes": 8.0,
                 "num_failures": 3.0,
             }
-        ]
+        ],
     }
     capsule = {
         "native_sampler_state": {
@@ -175,13 +177,74 @@ def test_snapshot_must_match_capsule_counters_and_frozen_pool():
             "adp_samp_num_failures": torch.tensor([0.0, 3.0]),
         }
     }
-    assert (
-        O.validate_snapshot_against_capsule_and_pool(snapshot, capsule, {"motion": "a" * 64}) == []
+    rows, blockers = O.validate_snapshot_against_capsule_and_pool(
+        snapshot, capsule, {"motion": "a" * 64}
     )
+    assert blockers == []
+    assert set(rows) == {"ctx"}
 
     snapshot["contexts"][0]["motion_hash"] = "b" * 64
-    blockers = O.validate_snapshot_against_capsule_and_pool(snapshot, capsule, {"motion": "a" * 64})
+    _, blockers = O.validate_snapshot_against_capsule_and_pool(
+        snapshot, capsule, {"motion": "a" * 64}
+    )
     assert any("motion hash differs" in blocker for blocker in blockers)
+
+
+def test_snapshot_canonicalizes_identical_resident_copies_without_summing_counters():
+    context = {
+        "context_id": "ctx",
+        "motion_key": "motion",
+        "motion_hash": "a" * 64,
+        "global_bin_id": 1,
+        "sampling_probability": 0.25,
+        "num_episodes": 8.0,
+        "num_failures": 3.0,
+    }
+    snapshot = {"num_active_bins": 2, "contexts": [context, dict(context)]}
+    capsule = {
+        "native_sampler_state": {
+            "adp_samp_num_episodes": torch.tensor([0.0, 8.0]),
+            "adp_samp_num_failures": torch.tensor([0.0, 3.0]),
+        }
+    }
+
+    rows, blockers = O.validate_snapshot_against_capsule_and_pool(
+        snapshot, capsule, {"motion": "a" * 64}
+    )
+
+    assert blockers == []
+    assert rows["ctx"]["sampling_probability"] == pytest.approx(0.5)
+    assert rows["ctx"]["resident_multiplicity"] == 2
+    assert rows["ctx"]["num_episodes"] == 8.0
+    assert rows["ctx"]["num_failures"] == 3.0
+
+
+def test_snapshot_rejects_conflicting_resident_copies():
+    context = {
+        "context_id": "ctx",
+        "motion_key": "motion",
+        "motion_hash": "a" * 64,
+        "global_bin_id": 1,
+        "sampling_probability": 0.25,
+        "num_episodes": 8.0,
+        "num_failures": 3.0,
+    }
+    snapshot = {
+        "num_active_bins": 2,
+        "contexts": [context, {**context, "num_failures": 4.0}],
+    }
+    capsule = {
+        "native_sampler_state": {
+            "adp_samp_num_episodes": torch.tensor([0.0, 8.0]),
+            "adp_samp_num_failures": torch.tensor([0.0, 3.0]),
+        }
+    }
+
+    _, blockers = O.validate_snapshot_against_capsule_and_pool(
+        snapshot, capsule, {"motion": "a" * 64}
+    )
+
+    assert any("conflicting serialized rows" in blocker for blocker in blockers)
 
 
 def test_exported_checkpoint_must_link_exact_capsule_and_step(tmp_path):
@@ -221,15 +284,26 @@ def test_origin_validation_requires_exact_resumed_interval(tmp_path, monkeypatch
             {
                 "global_step": 36,
                 "snapshot_timeline_fps": 50.0,
+                "num_active_bins": 2,
                 "contexts": [
                     {
                         "context_id": "ctx",
                         "motion_key": "motion",
                         "motion_hash": "a" * 64,
                         "global_bin_id": 0,
+                        "sampling_probability": 0.5,
                         "num_episodes": 8.0,
                         "num_failures": 3.0,
-                    }
+                    },
+                    {
+                        "context_id": "ctx",
+                        "motion_key": "motion",
+                        "motion_hash": "a" * 64,
+                        "global_bin_id": 0,
+                        "sampling_probability": 0.5,
+                        "num_episodes": 8.0,
+                        "num_failures": 3.0,
+                    },
                 ],
             }
         )
@@ -253,7 +327,7 @@ def test_origin_validation_requires_exact_resumed_interval(tmp_path, monkeypatch
         [O.RL.Iteration(index=index, metrics=metrics) for index in range(25, 37)],
     )
     monkeypatch.setattr(O.RL, "parse_run_log", lambda path: exact)
-    _, blockers = O.validate_origin(
+    origin, blockers = O.validate_origin(
         paths=paths,
         log_path=tmp_path / "run.log",
         start_step=24,
@@ -264,6 +338,10 @@ def test_origin_validation_requires_exact_resumed_interval(tmp_path, monkeypatch
         snapshot_timeline_fps=50.0,
     )
     assert blockers == []
+    assert origin["resident_context_ids"] == ["ctx"]
+    assert origin["num_resident_contexts"] == 1
+    assert origin["num_active_context_rows"] == 2
+    assert origin["num_duplicate_active_context_rows"] == 1
 
     shifted = O.RL.RunLog(
         "log",

@@ -377,36 +377,92 @@ def _scalar_at(value: Any, index: int) -> float:
     return float(selected.item() if hasattr(selected, "item") else selected)
 
 
+def canonicalize_snapshot_contexts(
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Collapse identical with-replacement rows without merging sampler statistics.
+
+    SONIC's active-bin draw is with replacement, so one ``ContextKey`` may occupy
+    several resident slots.  Those copies are valid only when their complete
+    serialized rows agree.  The slot probabilities add, but the global sampler
+    counters describe the underlying bin and therefore remain a single copy.
+    """
+    blockers: list[str] = []
+    rows = snapshot.get("contexts")
+    if not isinstance(rows, list) or not rows:
+        return {}, ["snapshot contains no resident contexts"]
+
+    raw_count = len(rows)
+    declared_count = snapshot.get("num_active_bins")
+    if (
+        not isinstance(declared_count, int)
+        or isinstance(declared_count, bool)
+        or declared_count != raw_count
+    ):
+        blockers.append(
+            "snapshot num_active_bins does not match the raw serialized context row count"
+        )
+
+    canonical: dict[str, dict[str, Any]] = {}
+    exemplars: dict[str, dict[str, Any]] = {}
+    for position, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            blockers.append(f"snapshot context row {position} is not an object")
+            continue
+        context_id = raw.get("context_id")
+        if not isinstance(context_id, str) or not context_id:
+            blockers.append(f"snapshot context row {position} has no context_id")
+            continue
+        probability = raw.get("sampling_probability")
+        if isinstance(probability, bool):
+            blockers.append(f"snapshot context {context_id} has invalid sampling_probability")
+            continue
+        try:
+            probability = float(probability)
+        except (TypeError, ValueError):
+            blockers.append(f"snapshot context {context_id} has invalid sampling_probability")
+            continue
+        if not math.isfinite(probability) or probability < 0.0:
+            blockers.append(f"snapshot context {context_id} has invalid sampling_probability")
+            continue
+
+        if context_id in canonical:
+            if raw != exemplars[context_id]:
+                blockers.append(
+                    f"snapshot duplicate context {context_id} has conflicting serialized rows"
+                )
+                continue
+            row = canonical[context_id]
+            row["sampling_probability"] = math.fsum(
+                (float(row["sampling_probability"]), probability)
+            )
+            row["resident_multiplicity"] = int(row["resident_multiplicity"]) + 1
+            continue
+
+        exemplars[context_id] = dict(raw)
+        row = dict(raw)
+        row["sampling_probability"] = probability
+        row["resident_multiplicity"] = 1
+        canonical[context_id] = row
+    return canonical, blockers
+
+
 def validate_snapshot_against_capsule_and_pool(
     snapshot: dict[str, Any],
     capsule: dict[str, Any],
     pool_hashes: dict[str, str],
-) -> list[str]:
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Check that the snapshot names the capsule's counters and frozen pool exactly."""
-    blockers: list[str] = []
-    rows = snapshot.get("contexts")
-    if not isinstance(rows, list) or not rows:
-        return ["snapshot contains no resident contexts"]
+    rows, blockers = canonicalize_snapshot_contexts(snapshot)
     sampler = capsule.get("native_sampler_state")
     if not isinstance(sampler, dict):
-        return ["capsule has no native sampler state"]
+        return rows, blockers + ["capsule has no native sampler state"]
     episodes = sampler.get("adp_samp_num_episodes")
     failures = sampler.get("adp_samp_num_failures")
     if episodes is None or failures is None:
-        return ["capsule sampler state has no episode/failure counters"]
+        return rows, blockers + ["capsule sampler state has no episode/failure counters"]
 
-    seen: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            blockers.append("snapshot contains a non-object context row")
-            continue
-        context_id = row.get("context_id")
-        if not isinstance(context_id, str) or not context_id:
-            blockers.append("snapshot context row has no context_id")
-        elif context_id in seen:
-            blockers.append(f"snapshot repeats context_id {context_id}")
-        else:
-            seen.add(context_id)
+    for row in rows.values():
         motion_key = row.get("motion_key")
         expected_hash = pool_hashes.get(str(motion_key))
         if expected_hash is None:
@@ -426,7 +482,7 @@ def validate_snapshot_against_capsule_and_pool(
             blockers.append(f"snapshot/capsule episode counter mismatch at bin {global_bin}")
         if not math.isclose(actual_failures, expected_failures, rel_tol=0.0, abs_tol=0.0):
             blockers.append(f"snapshot/capsule failure counter mismatch at bin {global_bin}")
-    return blockers
+    return rows, blockers
 
 
 def build_command(
@@ -555,13 +611,17 @@ def validate_origin(
         blockers.append("snapshot and capsule were not captured at the same step")
     if snapshot.get("snapshot_timeline_fps") != snapshot_timeline_fps:
         blockers.append("snapshot sampler-timeline FPS differs from preregistration")
-    blockers.extend(validate_snapshot_against_capsule_and_pool(snapshot, capsule, pool_hashes))
-    context_ids = sorted(
-        str(row.get("context_id")) for row in snapshot.get("contexts", []) if row.get("context_id")
+    canonical_rows, snapshot_blockers = validate_snapshot_against_capsule_and_pool(
+        snapshot, capsule, pool_hashes
     )
+    blockers.extend(snapshot_blockers)
+    context_ids = sorted(canonical_rows)
+    raw_context_count = len(snapshot.get("contexts", []))
     origin.update(
         resident_context_ids=context_ids,
         num_resident_contexts=len(context_ids),
+        num_active_context_rows=raw_context_count,
+        num_duplicate_active_context_rows=raw_context_count - len(context_ids),
     )
 
     checkpoint_blockers = validate_exported_checkpoint(

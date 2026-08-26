@@ -44,21 +44,45 @@ def test_group_snapshot_paths_rejects_malformed_argument():
 def test_intersection_keeps_only_contexts_present_in_every_origin():
     shared_a = row("alpha", 0.2, 0.1)
     shared_b = {**shared_a, "failure_rate": 0.6, "sampling_probability": 0.3}
-    first = {"contexts": [shared_a, row("beta", 0.9, 0.2)]}
-    second = {"contexts": [shared_b, row("gamma", 0.1, 0.4)]}
+    first_contexts = [shared_a, row("beta", 0.9, 0.2)]
+    second_contexts = [shared_b, row("gamma", 0.1, 0.4)]
+    first = {"num_active_bins": len(first_contexts), "contexts": first_contexts}
+    second = {"num_active_bins": len(second_contexts), "contexts": second_contexts}
     merged = C.intersect_snapshots([first, second])
     assert merged["num_origins"] == 2
     assert len(merged["contexts"]) == 1
     assert merged["contexts"][0]["context_id"] == shared_a["context_id"]
     assert merged["contexts"][0]["failure_rate"] == pytest.approx(0.4)
     assert merged["contexts"][0]["sampling_probability"] == pytest.approx(0.2)
+    assert merged["contexts"][0]["resident_multiplicity_by_origin"] == [1, 1]
     assert merged["contexts"][0]["origin_count"] == 2
 
 
-def test_intersection_rejects_duplicate_context_ids():
+def test_intersection_canonicalizes_identical_with_replacement_copies():
     duplicate = row("alpha", 0.2, 0.1)
-    with pytest.raises(ValueError, match="duplicate context"):
-        C.intersect_snapshots([{"contexts": [duplicate, duplicate]}])
+    duplicate.update(global_bin_id=7, num_episodes=8.0, num_failures=3.0)
+    merged = C.intersect_snapshots(
+        [{"num_active_bins": 2, "contexts": [duplicate, dict(duplicate)]}]
+    )
+    assert len(merged["contexts"]) == 1
+    canonical = merged["contexts"][0]
+    assert canonical["sampling_probability"] == pytest.approx(0.2)
+    assert canonical["resident_multiplicity_by_origin"] == [2]
+    assert canonical["num_episodes"] == 8.0
+    assert canonical["num_failures"] == 3.0
+
+
+def test_intersection_rejects_conflicting_with_replacement_copies():
+    duplicate = row("alpha", 0.2, 0.1)
+    conflict = {**duplicate, "num_failures": 4.0}
+    with pytest.raises(ValueError, match="conflicting serialized rows"):
+        C.intersect_snapshots([{"num_active_bins": 2, "contexts": [duplicate, conflict]}])
+
+
+def test_intersection_binds_num_active_bins_to_raw_rows_not_unique_contexts():
+    duplicate = row("alpha", 0.2, 0.1)
+    with pytest.raises(ValueError, match="raw serialized context rows"):
+        C.intersect_snapshots([{"num_active_bins": 1, "contexts": [duplicate, dict(duplicate)]}])
 
 
 def write_json(path: Path, payload: dict) -> Path:
@@ -169,6 +193,8 @@ def claim_grade_fixture(tmp_path: Path, seeds=(9300, 9301)):
             "snapshot_sha256": digest(snapshot_path),
             "resident_context_ids": sorted(item["context_id"] for item in contexts),
             "num_resident_contexts": len(contexts),
+            "num_active_context_rows": len(contexts),
+            "num_duplicate_active_context_rows": 0,
             "settled": True,
             "blockers": [],
         }
