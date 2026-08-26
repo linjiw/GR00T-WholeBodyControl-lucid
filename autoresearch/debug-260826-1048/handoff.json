@@ -7,24 +7,31 @@
   "completed": [
     "hash-bound settled-origin creation",
     "source-byte-rescanned manifest construction",
+    "two full step-56 origins passing the preregistered stability rule",
+    "outcome-blind v2 selection from 652 common resident contexts",
     "deterministic campaign preflight",
     "exploratory-only low-level branch execution",
     "blocked non-claim label receipt"
   ],
   "blocking_findings": [
+    "record_completion has no production call site, so all live branch-dose totals remain zero",
     "shared controls do not measure per-context realized completed-kernel exposure",
     "leakage-free directional latent calibration is not specified or implemented",
     "claim evaluations are not yet hash-linked to H_l policies, capsules, dev suite, physics seeds, and per-evaluation receipts"
   ],
   "next_actions": [
-    "generate the two preregistered settled origins from the clean committed tree",
     "freeze either passive per-context shared-control dose or independent epsilon-zero controls",
+    "freeze hash-linked encoder features, deployment J_eff, and a same-estimand noise floor",
     "implement and preregister the full directional latent test",
     "build a receipt-producing BranchSpec campaign launcher and deployment J_eff evaluator"
   ],
   "verification": {
-    "practice_utility_tests": "1047 passed",
+    "practice_utility_tests": "1051 passed",
     "style": "targeted Black, isort, Ruff, and git diff --check passed",
+    "settled_origin_receipt": "/data/robotixx/lucid-sonic/manifests/probe_origins_ne256_20260826_122253_365435.json",
+    "candidate_manifest": "/data/robotixx/lucid-sonic/manifests/probe_screen_v2_late_20260826.json",
+    "candidate_manifest_logical_sha256": "17c178dc4c4f5a0dbd378aebfa6097a34e8fc46684e272a0f28c1b3649fa9bc3",
+    "gpu_origins_generated": true,
     "gpu_screen_launched": false
   }
 }

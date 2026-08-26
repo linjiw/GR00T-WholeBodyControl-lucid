@@ -2,7 +2,7 @@
 
 - Started: 2026-08-26 10:48 America/New_York
 - Mode: `autoresearch debug`
-- Iteration budget: 5
+- Iteration budget: 5 code iterations, followed by receipted execution checks
 - Objective: make the frozen `probe_screen_v1_late` campaign claim-grade runnable
   without changing its scientific treatment, opening the final split, or crossing Gate B.
 - Keep metric: a dry-run campaign receipt must prove symmetric capsule restart, settled
@@ -64,7 +64,9 @@ is 24→36 with the live target-FPS override.
 Status: kept as a blocker, not repaired by assumption.
 
 The frozen screen's two shared controls do not carry a target kernel, so their live dose
-reports cannot measure per-context baseline completed-kernel steps. The advertised
+reports cannot measure per-context baseline completed-kernel steps. A deeper integration
+audit also found no production call site for `PracticeSamplerAdapter.record_completion()`,
+meaning both arms would currently report zero completed steps. The advertised
 realized-extra-dose denominator was therefore not executable. A second audit found that
 the directional latent test was only a method-name string. Preflight now remains blocked
 on both facts, and the low-level branch runner can execute only with an explicit
@@ -80,6 +82,27 @@ then emits only a machine-readable blocked receipt and returns 2. It never reads
 assembles labels, or runs Gate A/B until the shared-control, H_l policy/capsule,
 dev-suite, physics-seed, per-evaluation receipt, and latent-calibration links exist.
 
-Final verification: 1,047 practice-utility tests pass; targeted Black, isort, Ruff, and
+Final verification: 1,051 practice-utility tests pass; targeted Black, isort, Ruff, and
 `git diff --check` pass. The objective is intentionally incomplete: origin generation is
 ready, while the claim screen is correctly blocked instead of falsely runnable.
+
+## Receipted execution — settled origins and v2 selection
+
+The first preregistered 12-iteration continuation was retained as a blocked result rather
+than being overwritten: seed 9300 exceeded both operational-stability limits (+16.83%
+reward, +13.98% episode length), while seed 9301 passed. Its receipt is
+`/data/robotixx/lucid-sonic/manifests/probe_origins_ne256_20260826_120703_291332.json`.
+
+A fresh, preregistered 32-iteration continuation from clean commit `2bfcb6f` then produced
+two full step-56 origins. Seed 9300 changed +1.18% reward / -2.02% length and seed 9301
++4.16% / +5.75%; all four quantities passed the frozen 6.66% / 6.28% limits. The
+hash-bound map canonicalizes identical with-replacement sampler copies, retains 1,352 and
+1,707 unique resident contexts from 1,908 and 2,140 raw rows, and exposes 652 common
+contexts. Receipt:
+`/data/robotixx/lucid-sonic/manifests/probe_origins_ne256_20260826_122253_365435.json`.
+
+Outcome-blind selection from that intersection produced 24 late-stage contexts in
+`/data/robotixx/lucid-sonic/manifests/probe_screen_v2_late_20260826.json` (logical hash
+`17c178dc4c4f5a0d`, 48 interventions and 2 shared controls). The accompanying preflight
+audit remains deliberately blocked: no branch was launched, no utility label was built,
+and Gate A/B were not run.
