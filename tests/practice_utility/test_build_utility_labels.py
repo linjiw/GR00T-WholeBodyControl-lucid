@@ -1,5 +1,7 @@
 """Fail-closed contracts for the claim-bearing utility-label analysis."""
 
+# ruff: noqa: I001  # repository isort and Ruff force-sort rules conflict
+
 from __future__ import annotations
 
 import copy
@@ -8,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from gear_sonic.research.practice_utility import directional_calibration as DC
 from gear_sonic.research.practice_utility import proxy_audit as PA
 from gear_sonic.research.practice_utility.schema import ContextKey, motion_hash
 from scripts.practice_utility import build_utility_labels as B
@@ -197,6 +200,7 @@ def preregistration_payload(
                 "min_pairwise_accuracy": PA.SUFFICIENCY["min_pairwise_accuracy"],
             },
             "directional_test": "nested_cv_univariate_calibration",
+            "directional_calibration": DC.default_algorithm_artifact(),
             "raw_sign_accuracy_allowed": False,
         },
         "estimator_authorization": {
@@ -344,8 +348,12 @@ class TestClaimGradeBoundary:
             "branch_evaluation_dev_suite_binding_unimplemented",
             "branch_evaluation_physics_seed_binding_unimplemented",
             "per_evaluation_receipts_unimplemented",
-            "latent_directional_calibration_unimplemented",
         } == blocker_codes
+        directional = payload["latent_proxy_predictiveness"]["directional_test"]
+        assert directional["implemented"] is True
+        assert (
+            directional["algorithm_sha256"] == DC.default_algorithm_artifact()["algorithm_sha256"]
+        )
         assert payload["estimator_authorization_decision"]["inverse_of_proxy_sufficiency"] is True
         assert payload["estimator_authorization_decision"]["valid_for_authorization"] is False
         assert payload["estimator_authorization_decision"]["authorizes_estimator"] is False

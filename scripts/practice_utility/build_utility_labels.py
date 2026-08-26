@@ -33,8 +33,10 @@ control does not measure passive per-context control dose, and the evaluation
 artifact does not yet bind every result to its ``H_l`` policy/capsule, frozen
 development suite, physics seeds, and per-evaluation receipt.  Claim-grade mode
 therefore emits a blocked, non-claim receipt and does not assemble utility or
-run Gate A/B.  Raw sign accuracy is also excluded for the nonnegative latent
-gap; a preregistered leakage-free calibration remains required for Gate B.
+run Gate A/B.  The nonnegative latent gap now has an immutable leakage-free
+directional calibration, but it is recorded as not run until Gate A passes and
+the independent dose/evaluation-lineage blockers are resolved.  Raw proxy sign
+accuracy remains prohibited.
 """
 
 from __future__ import annotations
@@ -51,6 +53,9 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from gear_sonic.research.practice_utility import (  # noqa: E402
+    directional_calibration as DC,
+)
 from gear_sonic.research.practice_utility import proxy_audit as PA  # noqa: E402
 from gear_sonic.research.practice_utility import run_log as RL  # noqa: E402
 from gear_sonic.research.practice_utility import utility_label as UL  # noqa: E402
@@ -138,14 +143,6 @@ def claim_blockers() -> list[dict[str, str]]:
             "message": (
                 "quality-qualified branch rows are not yet transitively bound to immutable "
                 "per-evaluation receipts"
-            ),
-        },
-        {
-            "code": "latent_directional_calibration_unimplemented",
-            "scope": "latent_direction",
-            "message": (
-                "the preregistered nested-CV univariate calibration has no immutable "
-                "implementation, so raw nonnegative latent-gap signs cannot decide Gate B"
             ),
         },
     ]
@@ -488,6 +485,15 @@ def validate_preregistration(
         )
     if latent.get("raw_sign_accuracy_allowed") is not False:
         raise ValueError("raw sign accuracy must be excluded for nonnegative latent_gap_p90")
+    directional_algorithm = DC.validate_algorithm_artifact(latent.get("directional_calibration"))
+    directional_pass = directional_algorithm["latent_proxy_pass_rule"]
+    if expected_rank_thresholds != {
+        "min_abs_spearman": directional_pass["min_outer_oof_spearman"],
+        "min_pairwise_accuracy": directional_pass["min_outer_oof_pairwise_accuracy"],
+    }:
+        raise ValueError(
+            "latent-proxy rank thresholds differ from the directional-calibration pass rule"
+        )
 
     if authorization.get("horizon_label") != horizon_label:
         raise ValueError("estimator-authorization and Gate A horizons must match")
@@ -511,6 +517,7 @@ def validate_preregistration(
         "grouping": latent.get("grouping"),
         "latent_rank_thresholds": expected_rank_thresholds,
         "latent_directional_test": latent["directional_test"],
+        "latent_directional_calibration": directional_algorithm,
         "authorization_proxies": list(proxies),
     }
 
@@ -1186,11 +1193,13 @@ def claim_grade_main(args: argparse.Namespace, manifest: Mapping[str, Any]) -> i
             "gate_a_prerequisite_passed": False,
             "directional_test": {
                 "method": plan["latent_directional_test"],
-                "implemented": False,
-                "reason": (
-                    "nested-CV univariate calibration is preregistered but not implemented; "
-                    "raw sign accuracy is invalid for nonnegative latent_gap_p90"
-                ),
+                "implemented": True,
+                "algorithm_sha256": plan["latent_directional_calibration"]["algorithm_sha256"],
+                "algorithm": plan["latent_directional_calibration"],
+                "deadband_rule": plan["latent_directional_calibration"]["deadband"],
+                "pass_rule": plan["latent_directional_calibration"]["latent_proxy_pass_rule"],
+                "raw_proxy_sign_excluded": True,
+                "status": "not_run_until_gate_a_passes_and_other_claim_blockers_clear",
             },
             "decision_complete": False,
             "supports_latent_proxy_claim": False,
