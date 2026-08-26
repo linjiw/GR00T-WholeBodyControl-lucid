@@ -1,5 +1,7 @@
 """Tests for LUCID's PI controller and the lambda -> DR-range scaling."""
 
+import json
+
 import pytest
 
 from gear_sonic.research.practice_utility import dr_scaling as DS
@@ -82,7 +84,7 @@ class TestGuards:
     def test_a_recovering_return_resets_the_streak(self):
         c = controller(return_floor=5.0)
         c.update(gaps=[0.01] * 10, mean_return=1.0)
-        c.update(gaps=[0.01] * 10, mean_return=9.0)      # recovered
+        c.update(gaps=[0.01] * 10, mean_return=9.0)  # recovered
         step = c.update(gaps=[0.01] * 10, mean_return=1.0)
         assert step.guard_tripped is False
 
@@ -146,11 +148,18 @@ class TestPersistence:
 
 
 class TestConfigValidation:
-    @pytest.mark.parametrize("kwargs", [
-        {"quantile": 0.0}, {"quantile": 1.0}, {"alpha": 0.0},
-        {"integral_max": 0.0}, {"return_decay": 0.0}, {"low_return_patience": 0},
-        {"lambda_min": 0.5, "lambda_max": 0.5},
-    ])
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"quantile": 0.0},
+            {"quantile": 1.0},
+            {"alpha": 0.0},
+            {"integral_max": 0.0},
+            {"return_decay": 0.0},
+            {"low_return_patience": 0},
+            {"lambda_min": 0.5, "lambda_max": 0.5},
+        ],
+    )
     def test_rejects_invalid(self, kwargs):
         with pytest.raises(ValueError):
             PIConfig(**kwargs)
@@ -231,13 +240,17 @@ class Manager:
 
 
 def manager():
-    return Manager({
-        "randomize_rigid_body_mass": Term("reset", {
-            "mass_distribution_params": [0.8, 1.2], "operation": "scale"}),
-        "push_robot": Term("interval", {"velocity_range": {"x": [-0.5, 0.5]}}),
-        "physics_material": Term("startup", {
-            "static_friction_range": [0.3, 1.6], "num_buckets": 64}),
-    })
+    return Manager(
+        {
+            "randomize_rigid_body_mass": Term(
+                "reset", {"mass_distribution_params": [0.8, 1.2], "operation": "scale"}
+            ),
+            "push_robot": Term("interval", {"velocity_range": {"x": [-0.5, 0.5]}}),
+            "physics_material": Term(
+                "startup", {"static_friction_range": [0.3, 1.6], "num_buckets": 64}
+            ),
+        }
+    )
 
 
 class MaterialTerm:
@@ -249,21 +262,28 @@ class MaterialTerm:
 
     def __init__(self, n=32):
         import torch
-        self.material_buckets = torch.stack([
-            torch.empty(n).uniform_(0.3, 1.6),
-            torch.empty(n).uniform_(0.3, 1.2),
-            torch.empty(n).uniform_(0.0, 0.5),
-        ], dim=1)
+
+        self.material_buckets = torch.stack(
+            [
+                torch.empty(n).uniform_(0.3, 1.6),
+                torch.empty(n).uniform_(0.3, 1.2),
+                torch.empty(n).uniform_(0.0, 0.5),
+            ],
+            dim=1,
+        )
 
 
 class MaterialCfg(Term):
     def __init__(self, mode="reset"):
-        super().__init__(mode, {
-            "static_friction_range": [0.3, 1.6],
-            "dynamic_friction_range": [0.3, 1.2],
-            "restitution_range": [0.0, 0.5],
-            "num_buckets": 32,
-        })
+        super().__init__(
+            mode,
+            {
+                "static_friction_range": [0.3, 1.6],
+                "dynamic_friction_range": [0.3, 1.2],
+                "restitution_range": [0.0, 0.5],
+                "num_buckets": 32,
+            },
+        )
         self.func = MaterialTerm()
 
 
@@ -280,6 +300,7 @@ class TestMaterialBucketsFollowLambda:
         report = DS.apply_lambda(m, DS.capture_baseline(m), 0.2)
         assert "physics_material" in report.material_terms_resampled
         import torch
+
         assert not torch.allclose(before, term.material_buckets)
 
     def test_resampled_buckets_respect_the_scaled_range(self):
@@ -329,7 +350,8 @@ class TestApplyLambda:
         m = manager()
         DS.apply_lambda(m, DS.capture_baseline(m), 0.5)
         assert m._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([0.9, 1.1])
+            "mass_distribution_params"
+        ] == pytest.approx([0.9, 1.1])
         assert m._terms["push_robot"].params["velocity_range"]["x"] == pytest.approx([-0.25, 0.25])
 
     def test_scaling_is_computed_from_the_baseline_not_the_current_value(self):
@@ -339,7 +361,8 @@ class TestApplyLambda:
         for _ in range(5):
             DS.apply_lambda(m, baseline, 0.5)
         assert m._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([0.9, 1.1])
+            "mass_distribution_params"
+        ] == pytest.approx([0.9, 1.1])
 
     def test_lambda_one_restores_the_configured_maximum(self):
         m = manager()
@@ -347,13 +370,15 @@ class TestApplyLambda:
         DS.apply_lambda(m, baseline, 0.0)
         DS.apply_lambda(m, baseline, 1.0)
         assert m._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([0.8, 1.2])
+            "mass_distribution_params"
+        ] == pytest.approx([0.8, 1.2])
 
     def test_lambda_zero_disables_randomization(self):
         m = manager()
         DS.apply_lambda(m, DS.capture_baseline(m), 0.0)
         assert m._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([1.0, 1.0])
+            "mass_distribution_params"
+        ] == pytest.approx([1.0, 1.0])
         assert m._terms["push_robot"].params["velocity_range"]["x"] == pytest.approx([0.0, 0.0])
 
     def test_non_range_params_are_untouched(self):
@@ -361,12 +386,23 @@ class TestApplyLambda:
         DS.apply_lambda(m, DS.capture_baseline(m), 0.3)
         assert m._terms["randomize_rigid_body_mass"].params["operation"] == "scale"
 
+    def test_evaluation_can_scale_physics_without_scaling_latency(self):
+        m = manager()
+        m._terms["randomize_action_delay"] = Term("reset", {"delay_range": [0.0, 12.0]})
+        m.active_terms.append("randomize_action_delay")
+        m._term_cfgs.append(m._terms["randomize_action_delay"])
+        baseline = DS.capture_baseline(m)
+        DS.apply_lambda(m, baseline, 0.5, exclude_terms=("randomize_action_delay",))
+        assert m._terms["randomize_action_delay"].params["delay_range"] == [0.0, 12.0]
+        assert m._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ] == pytest.approx([0.9, 1.1])
+
     def test_baseline_capture_is_a_deep_copy(self):
         m = manager()
         baseline = DS.capture_baseline(m)
         DS.apply_lambda(m, baseline, 0.1)
-        assert baseline["randomize_rigid_body_mass"][
-            "mass_distribution_params"] == [0.8, 1.2]
+        assert baseline["randomize_rigid_body_mass"]["mass_distribution_params"] == [0.8, 1.2]
 
     def test_report_serializes(self):
         m = manager()
@@ -430,13 +466,16 @@ def curriculum(**overrides):
 class TestCurriculumWiring:
     def test_disabled_touches_nothing(self):
         env = FakeEnvWithEvents()
-        before = list(env.event_manager._terms[
-            "randomize_rigid_body_mass"].params["mass_distribution_params"])
+        before = list(
+            env.event_manager._terms["randomize_rigid_body_mass"].params["mass_distribution_params"]
+        )
         callback = curriculum(enabled=False)
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         callback.on_step_end(None, FakeStateWithHistory(1), None, env=env)
-        assert env.event_manager._terms[
-            "randomize_rigid_body_mass"].params["mass_distribution_params"] == before
+        assert (
+            env.event_manager._terms["randomize_rigid_body_mass"].params["mass_distribution_params"]
+            == before
+        )
         assert callback.history == []
 
     def test_binds_and_reports_scalable_terms(self):
@@ -452,14 +491,14 @@ class TestCurriculumWiring:
         callback = curriculum()
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=object())
         callback.on_step_end(None, FakeStateWithHistory(1), None, env=object())
-        assert callback.history          # still records, just cannot scale
+        assert callback.history  # still records, just cannot scale
 
     def test_initial_lambda_is_applied_before_the_first_rollout(self):
         env = FakeEnvWithEvents()
-        curriculum(initial_lambda=0.0).on_train_begin(
-            None, FakeStateWithHistory(0), None, env=env)
+        curriculum(initial_lambda=0.0).on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         assert env.event_manager._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([1.0, 1.0])
+            "mass_distribution_params"
+        ] == pytest.approx([1.0, 1.0])
 
     def test_rejects_an_unknown_mode(self):
         with pytest.raises(ValueError, match="unknown curriculum mode"):
@@ -467,6 +506,25 @@ class TestCurriculumWiring:
 
 
 class TestCurriculumModes:
+    @pytest.mark.parametrize(
+        ("mode", "fixed_lambda", "expected_range", "expected_lambda"),
+        [
+            ("lucid", 1.0, [1.0, 1.0], 0.0),
+            ("fixed", 0.5, [0.9, 1.1], 0.5),
+            ("off", 1.0, [1.0, 1.0], 0.0),
+        ],
+    )
+    def test_first_rollout_uses_the_mode_intensity(
+        self, mode, fixed_lambda, expected_range, expected_lambda
+    ):
+        env = FakeEnvWithEvents()
+        callback = curriculum(mode=mode, fixed_lambda=fixed_lambda, warmup_iterations=3)
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        assert callback.controller.lambda_value == pytest.approx(expected_lambda)
+        assert env.event_manager._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ] == pytest.approx(expected_range)
+
     def test_lucid_mode_raises_lambda_on_good_tracking(self):
         env = FakeEnvWithEvents()
         OBS.register_observer(StubObserver([0.01] * 20))
@@ -481,8 +539,9 @@ class TestCurriculumModes:
         callback = curriculum(alpha=0.5)
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         callback.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
-        low, high = env.event_manager._terms[
-            "randomize_rigid_body_mass"].params["mass_distribution_params"]
+        low, high = env.event_manager._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ]
         assert low < 1.0 < high
 
     def test_fixed_mode_pins_lambda(self):
@@ -493,7 +552,8 @@ class TestCurriculumModes:
             callback.on_step_end(None, FakeStateWithHistory(step, mean_reward=1.0), None, env=env)
         assert {r["lambda"] for r in callback.history} == {1.0}
         assert env.event_manager._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([0.8, 1.2])
+            "mass_distribution_params"
+        ] == pytest.approx([0.8, 1.2])
 
     def test_off_mode_disables_randomization(self):
         env = FakeEnvWithEvents()
@@ -501,7 +561,8 @@ class TestCurriculumModes:
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         callback.on_step_end(None, FakeStateWithHistory(1), None, env=env)
         assert env.event_manager._terms["randomize_rigid_body_mass"].params[
-            "mass_distribution_params"] == pytest.approx([1.0, 1.0])
+            "mass_distribution_params"
+        ] == pytest.approx([1.0, 1.0])
 
     def test_lucid_without_an_observer_holds_lambda_still(self):
         env = FakeEnvWithEvents()
@@ -518,10 +579,15 @@ class TestCurriculumModes:
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         for step in range(1, 7):
             callback.on_step_end(None, FakeStateWithHistory(step, mean_reward=10.0), None, env=env)
-        assert len(callback.history) == 2       # steps 3 and 6
+        assert len(callback.history) == 2  # steps 3 and 6
 
 
 class TestCurriculumReporting:
+    def test_reads_sonics_native_reward_log_key(self):
+        state = FakeStateWithHistory(1)
+        state.log_history = [{"objective/rewards": 7.25}]
+        assert LucidCurriculumCallback._mean_return(state) == pytest.approx(7.25)
+
     def test_records_the_gap_that_drove_the_decision(self):
         env = FakeEnvWithEvents()
         OBS.register_observer(StubObserver([0.05] * 20))
@@ -539,6 +605,7 @@ class TestCurriculumReporting:
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         callback.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
         import json as _json
+
         record = _json.loads((tmp_path / "curriculum_b0.jsonl").read_text().strip())
         assert record["mode"] == "lucid" and "lambda" in record
 
@@ -587,15 +654,17 @@ class TestCurriculumSurvivesResume:
         first, _ = self.trained(tmp_path)
         assert first.controller.lambda_value > 0.1
 
-        resumed = curriculum(resume_state_path=str(
-            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed = curriculum(
+            resume_state_path=str(tmp_path / f"curriculum_state_{first.branch_id}.json")
+        )
         resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
         assert resumed.controller.lambda_value == pytest.approx(first.controller.lambda_value)
 
     def test_integral_is_restored(self, tmp_path):
         first, _ = self.trained(tmp_path)
-        resumed = curriculum(resume_state_path=str(
-            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed = curriculum(
+            resume_state_path=str(tmp_path / f"curriculum_state_{first.branch_id}.json")
+        )
         resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
         assert resumed.controller.integral == pytest.approx(first.controller.integral)
 
@@ -610,19 +679,22 @@ class TestCurriculumSurvivesResume:
     def test_restored_intensity_is_applied_before_the_first_rollout(self, tmp_path):
         first, _ = self.trained(tmp_path)
         env = FakeEnvWithEvents()
-        resumed = curriculum(resume_state_path=str(
-            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed = curriculum(
+            resume_state_path=str(tmp_path / f"curriculum_state_{first.branch_id}.json")
+        )
         resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
-        low, high = env.event_manager._terms[
-            "randomize_rigid_body_mass"].params["mass_distribution_params"]
-        assert low < 1.0 < high        # DR already widened, not reset to nominal
+        low, high = env.event_manager._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ]
+        assert low < 1.0 < high  # DR already widened, not reset to nominal
 
     def test_resume_records_where_it_came_from(self, tmp_path):
         first, _ = self.trained(tmp_path)
         env = FakeEnvWithEvents()
         OBS.register_observer(StubObserver([0.01] * 20))
-        resumed = curriculum(resume_state_path=str(
-            tmp_path / f"curriculum_state_{first.branch_id}.json"))
+        resumed = curriculum(
+            resume_state_path=str(tmp_path / f"curriculum_state_{first.branch_id}.json")
+        )
         resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         resumed.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
         assert "resumed_from" in resumed.history[-1]
@@ -636,7 +708,8 @@ class TestCurriculumSurvivesResume:
         first, _ = self.trained(tmp_path, steps=10)
         resumed = curriculum(
             resume_state_path=str(tmp_path / f"curriculum_state_{first.branch_id}.json"),
-            max_lambda_step_on_resume=0.02)
+            max_lambda_step_on_resume=0.02,
+        )
         resumed.on_train_begin(None, FakeStateWithHistory(0), None, env=FakeEnvWithEvents())
         assert resumed.controller.lambda_value <= 0.02 + 1e-9
         assert resumed.controller.lambda_value < first.controller.lambda_value
@@ -657,6 +730,16 @@ class TestWarmupHold:
         assert all(r.get("warmup_hold") for r in callback.history)
         assert callback.controller.lambda_value == 0.0
 
+    def test_warmup_records_are_written(self, tmp_path):
+        env = FakeEnvWithEvents()
+        callback = curriculum(output_dir=str(tmp_path), warmup_iterations=2)
+        callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        callback.on_step_end(None, FakeStateWithHistory(1), None, env=env)
+        record = json.loads((tmp_path / "curriculum_b0.jsonl").read_text())
+        assert record["warmup_hold"] is True
+        assert record["lambda"] == 0.0
+        assert (tmp_path / "curriculum_state_b0.json").exists()
+
     def test_updates_resume_after_warmup(self):
         env = FakeEnvWithEvents()
         OBS.register_observer(StubObserver([0.001] * 20))
@@ -671,8 +754,9 @@ class TestWarmupHold:
         callback = curriculum(warmup_iterations=5, initial_lambda=0.6)
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         callback.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
-        low, high = env.event_manager._terms[
-            "randomize_rigid_body_mass"].params["mass_distribution_params"]
+        low, high = env.event_manager._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ]
         assert low == pytest.approx(1.0 - 0.6 * 0.2)
 
     def test_zero_warmup_updates_immediately(self):

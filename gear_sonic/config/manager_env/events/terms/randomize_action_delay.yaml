@@ -16,3 +16,8 @@ randomize_action_delay:
       _target_: isaaclab.managers.SceneEntityCfg
       name: "robot"
     delay_range: [0.0, 8.0]
+    # Historical curriculum runs sampled actuator groups independently. Keep
+    # this explicit so a paper-facing receipt cannot confuse that synthetic
+    # stress model with common command-pipeline latency.
+    distribution: "uniform"
+    coupling: "independent"

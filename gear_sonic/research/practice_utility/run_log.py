@@ -6,9 +6,11 @@ Two verifications depend on being able to compare two runs numerically:
 native run. Without this, every "research off" baseline in the programme is
 unaudited.
 
-**Resume equivalence** -- N iterations uninterrupted must match N/2, capsule,
-resume, N/2. Without this, a paired continuation from a capsule is not the same
-experiment as one that never stopped.
+**Restart-pair equivalence** -- two branches restored from the same capsule must
+match. SONIC does not serialize live simulator/episode state and always resets
+at a new ``train()`` call, so uninterrupted-vs-resumed trajectory identity is
+not a supported contract. Symmetric fresh restarts are the boundary used by the
+paired causal experiment.
 
 The trainer prints a Rich table that is re-rendered many times per iteration, so
 the same iteration appears repeatedly with identical values. Parsing keeps the
@@ -94,9 +96,7 @@ class RunLog:
 
     def median_iteration_seconds(self, skip_first: int = 1) -> float | None:
         values = [
-            it.wall_seconds
-            for it in self.iterations[skip_first:]
-            if it.wall_seconds is not None
+            it.wall_seconds for it in self.iterations[skip_first:] if it.wall_seconds is not None
         ]
         if not values:
             return None

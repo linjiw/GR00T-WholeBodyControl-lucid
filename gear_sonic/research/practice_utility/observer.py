@@ -37,6 +37,7 @@ from gear_sonic.research.practice_utility import quality_telemetry as QT
 try:  # pragma: no cover
     from transformers import TrainerCallback
 except Exception:  # pragma: no cover
+
     class TrainerCallback:  # type: ignore[no-redef]
         """Stand-in so this module imports without transformers."""
 
@@ -273,6 +274,14 @@ class PracticeObserverCallback(TrainerCallback):
     def _flush(self, global_step: int) -> dict[str, Any]:
         latent = L.summarize_gap(torch.tensor(self._latent_gaps)) if self._latent_gaps else None
         raw = L.summarize_gap(torch.tensor(self._raw_gaps)) if self._raw_gaps else None
+        delay_stats: dict[str, Any] = {}
+        robot = QT._scene_entity(self._env, "robot") if self._env is not None else None
+        if robot is not None:
+            from gear_sonic.research.practice_utility.events_reset_safe import (
+                action_delay_stats,
+            )
+
+            delay_stats = action_delay_stats(robot)
         record: dict[str, Any] = {
             "global_step": global_step,
             "branch_id": self.branch_id,
@@ -281,10 +290,14 @@ class PracticeObserverCallback(TrainerCallback):
             "num_gap_samples": len(self._latent_gaps),
             **(
                 {f"latent_{k.replace('gap_', '')}": v for k, v in latent.to_dict().items()}
-                if latent else {}
+                if latent
+                else {}
             ),
-            **({f"raw_{k.replace('gap_', '')}": v for k, v in raw.to_dict().items()} if raw else {}),
+            **(
+                {f"raw_{k.replace('gap_', '')}": v for k, v in raw.to_dict().items()} if raw else {}
+            ),
             **self.quality.snapshot(),
+            **delay_stats,
         }
         self._last_flushed_gaps = list(self._latent_gaps)
         self._latent_gaps.clear()

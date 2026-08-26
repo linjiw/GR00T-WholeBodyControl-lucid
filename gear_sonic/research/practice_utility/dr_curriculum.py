@@ -20,7 +20,10 @@ from typing import Any
 
 from gear_sonic.research.practice_utility import dr_scaling as DS
 from gear_sonic.research.practice_utility import observer as OBS
-from gear_sonic.research.practice_utility.dr_controller import LucidDRController, PIConfig
+from gear_sonic.research.practice_utility.dr_controller import (
+    LucidDRController,
+    PIConfig,
+)
 
 #: Active curriculum callbacks, so a checkpoint writer can capture their state
 #: without Hydra having to wire the two callbacks together.
@@ -42,9 +45,11 @@ def get_active_curriculum(branch_id: str | None = None) -> "LucidCurriculumCallb
 def clear_curricula() -> None:
     _ACTIVE_CURRICULA.clear()
 
+
 try:  # pragma: no cover
     from transformers import TrainerCallback
 except Exception:  # pragma: no cover
+
     class TrainerCallback:  # type: ignore[no-redef]
         """Stand-in so this module imports without transformers."""
 
@@ -93,12 +98,25 @@ class LucidCurriculumCallback(TrainerCallback):
         self._start_step: int | None = None
         self._resumed_from: dict[str, Any] | None = None
 
+        if mode == "lucid":
+            starting_lambda = initial_lambda
+        elif mode == "fixed":
+            starting_lambda = fixed_lambda
+        else:
+            starting_lambda = 0.0
+
         self.controller = LucidDRController(
             PIConfig(
-                kp=kp, ki=ki, alpha=alpha, integral_max=integral_max, quantile=quantile,
-                delta_target=delta_target, return_floor=return_floor, return_decay=return_decay,
+                kp=kp,
+                ki=ki,
+                alpha=alpha,
+                integral_max=integral_max,
+                quantile=quantile,
+                delta_target=delta_target,
+                return_floor=return_floor,
+                return_decay=return_decay,
             ),
-            initial_lambda=initial_lambda if mode == "lucid" else fixed_lambda,
+            initial_lambda=starting_lambda,
         )
         self.baseline: dict[str, dict[str, Any]] | None = None
         self.scalable: list[str] = []
@@ -136,17 +154,28 @@ class LucidCurriculumCallback(TrainerCallback):
         if step - self._start_step < self.warmup_iterations:
             # Hold, but keep applying, so the restored intensity is in force.
             self._apply(self.controller.lambda_value)
-            self.history.append({
-                "global_step": step, "mode": self.mode, "lambda": self.controller.lambda_value,
-                "gap_quantile": None, "warmup_hold": True,
-            })
+            record = {
+                "global_step": step,
+                "mode": self.mode,
+                "lambda": self.controller.lambda_value,
+                "gap_quantile": None,
+                "warmup_hold": True,
+                "scalable_terms": self.scalable,
+            }
+            self.history.append(record)
+            self._write(record)
+            self.save_state_file()
             return control
         if step % self.update_every:
             return control
 
         if self.mode == "fixed":
-            record = {"global_step": step, "mode": "fixed",
-                      "lambda": self.fixed_lambda, "gap_quantile": None}
+            record = {
+                "global_step": step,
+                "mode": "fixed",
+                "lambda": self.fixed_lambda,
+                "gap_quantile": None,
+            }
             self._apply(self.fixed_lambda)
         elif self.mode == "off":
             record = {"global_step": step, "mode": "off", "lambda": 0.0, "gap_quantile": None}
@@ -156,8 +185,12 @@ class LucidCurriculumCallback(TrainerCallback):
             mean_return = self._mean_return(state)
             outcome = self.controller.update(gaps=gaps, mean_return=mean_return)
             self._apply(outcome.lambda_after)
-            record = {"global_step": step, "mode": "lucid", "lambda": outcome.lambda_after,
-                      **outcome.to_dict()}
+            record = {
+                "global_step": step,
+                "mode": "lucid",
+                "lambda": outcome.lambda_after,
+                **outcome.to_dict(),
+            }
 
         record["scalable_terms"] = self.scalable
         if self._resumed_from is not None:
@@ -193,7 +226,13 @@ class LucidCurriculumCallback(TrainerCallback):
         """Most recent mean reward from the trainer's log history, if present."""
         history = getattr(state, "log_history", None) or []
         for entry in reversed(history):
-            for key in ("mean_reward", "Mean rewards", "rewards/mean", "train/mean_reward"):
+            for key in (
+                "objective/rewards",
+                "mean_reward",
+                "Mean rewards",
+                "rewards/mean",
+                "train/mean_reward",
+            ):
                 if key in entry:
                     try:
                         return float(entry[key])
@@ -238,9 +277,14 @@ class LucidCurriculumCallback(TrainerCallback):
         }
 
     def save_state_file(self, path: str | None = None) -> str | None:
-        target = Path(path) if path else (
-            Path(self.output_dir) / f"curriculum_state_{self.branch_id}.json"
-            if self.output_dir else None
+        target = (
+            Path(path)
+            if path
+            else (
+                Path(self.output_dir) / f"curriculum_state_{self.branch_id}.json"
+                if self.output_dir
+                else None
+            )
         )
         if target is None:
             return None

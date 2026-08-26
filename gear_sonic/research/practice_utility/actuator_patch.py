@@ -64,9 +64,10 @@ def enable_delayed_actuators(
     if not 0 <= min_delay <= max_delay:
         raise ValueError(f"require 0 <= min_delay <= max_delay, got {min_delay}, {max_delay}")
 
+    from isaaclab.actuators import ImplicitActuatorCfg
+
     from gear_sonic.envs.manager_env.mdp.actuators import DelayedImplicitActuatorCfg
     from gear_sonic.envs.manager_env.robots import g1
-    from isaaclab.actuators import ImplicitActuatorCfg
 
     swapped: dict[str, list[str]] = {}
     for name in config_names:
@@ -74,15 +75,13 @@ def enable_delayed_actuators(
         actuators = getattr(robot_cfg, "actuators", None)
         if not isinstance(actuators, dict):
             continue
-        groups = []
-        for group, cfg in list(actuators.items()):
-            if isinstance(cfg, DelayedImplicitActuatorCfg):
-                groups.append(f"{group} (already delayed)")
-                continue
-            if not isinstance(cfg, ImplicitActuatorCfg):
-                continue
-            actuators[group] = _to_delayed(cfg, DelayedImplicitActuatorCfg, min_delay, max_delay)
-            groups.append(group)
+        groups = _replace_actuator_mapping(
+            actuators,
+            ImplicitActuatorCfg,
+            DelayedImplicitActuatorCfg,
+            min_delay,
+            max_delay,
+        )
         if groups:
             swapped[name] = groups
 
@@ -92,6 +91,63 @@ def enable_delayed_actuators(
         "swapped": swapped,
         "num_groups": sum(len(v) for v in swapped.values()),
     }
+
+
+def enable_delayed_actuators_on_cfg(
+    robot_cfg: Any,
+    max_delay: int,
+    min_delay: int = 0,
+) -> dict[str, Any]:
+    """Swap the actuators on the resolved environment robot configuration.
+
+    Patching the module-level G1 template is not sufficient evidence: Hydra's
+    environment construction may already hold a copied ``scene.robot``.  This
+    function operates on that resolved object at the ``custom_instantiate``
+    seam, immediately before Isaac constructs the live articulation.
+    """
+    if max_delay < 0 or not 0 <= min_delay <= max_delay:
+        raise ValueError(f"require 0 <= min_delay <= max_delay, got {min_delay}, {max_delay}")
+
+    from isaaclab.actuators import ImplicitActuatorCfg
+
+    from gear_sonic.envs.manager_env.mdp.actuators import DelayedImplicitActuatorCfg
+
+    actuators = getattr(robot_cfg, "actuators", None)
+    if not isinstance(actuators, dict):
+        return {"num_groups": 0, "groups": [], "resolved": False}
+    groups = _replace_actuator_mapping(
+        actuators,
+        ImplicitActuatorCfg,
+        DelayedImplicitActuatorCfg,
+        min_delay,
+        max_delay,
+    )
+    return {
+        "num_groups": len(groups),
+        "groups": groups,
+        "resolved": True,
+        "max_delay_steps": max_delay,
+        "min_delay_steps": min_delay,
+    }
+
+
+def _replace_actuator_mapping(
+    actuators: dict[str, Any],
+    implicit_cls: type,
+    delayed_cls: type,
+    min_delay: int,
+    max_delay: int,
+) -> list[str]:
+    groups = []
+    for group, cfg in list(actuators.items()):
+        if isinstance(cfg, delayed_cls):
+            groups.append(f"{group} (already delayed)")
+            continue
+        if not isinstance(cfg, implicit_cls):
+            continue
+        actuators[group] = _to_delayed(cfg, delayed_cls, min_delay, max_delay)
+        groups.append(group)
+    return groups
 
 
 def describe_actuators(config_name: str = G1_CONFIG_NAMES[0]) -> dict[str, str]:
@@ -117,7 +173,11 @@ def _to_delayed(cfg: Any, delayed_cls: type, min_delay: int, max_delay: int) -> 
 
     values = {}
     for field in dataclasses.fields(cfg):
-        if field.name in ("min_delay", "max_delay"):
+        # ``class_type`` is the factory discriminator. Carrying the parent's
+        # ImplicitActuator value into the delayed config creates an object that
+        # prints as DelayedImplicitActuatorCfg but still instantiates the plain
+        # actuator -- exactly the live-only defect the lag audit caught.
+        if field.name in ("class_type", "min_delay", "max_delay"):
             continue
         values[field.name] = copy.deepcopy(getattr(cfg, field.name))
     values["min_delay"] = min_delay

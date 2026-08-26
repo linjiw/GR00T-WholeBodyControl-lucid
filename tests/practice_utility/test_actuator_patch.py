@@ -15,6 +15,14 @@ import pytest
 from gear_sonic.research.practice_utility import actuator_patch as AP
 
 
+class FakeImplicitActuator:
+    pass
+
+
+class FakeDelayedActuator(FakeImplicitActuator):
+    pass
+
+
 @dataclasses.dataclass
 class FakeImplicitCfg:
     joint_names_expr: list
@@ -23,10 +31,12 @@ class FakeImplicitCfg:
     damping: dict
     armature: float = 0.01
     velocity_limit_sim: float = 100.0
+    class_type: type = FakeImplicitActuator
 
 
 @dataclasses.dataclass
 class FakeDelayedCfg(FakeImplicitCfg):
+    class_type: type = FakeDelayedActuator
     min_delay: int = 0
     max_delay: int = 0
 
@@ -46,7 +56,13 @@ class TestFieldPreservation:
         source = implicit()
         result = AP._to_delayed(source, FakeDelayedCfg, min_delay=0, max_delay=8)
         for field in dataclasses.fields(source):
+            if field.name == "class_type":
+                continue
             assert getattr(result, field.name) == getattr(source, field.name), field.name
+
+    def test_factory_discriminator_changes_to_the_delayed_actuator(self):
+        result = AP._to_delayed(implicit(), FakeDelayedCfg, min_delay=0, max_delay=8)
+        assert result.class_type is FakeDelayedActuator
 
     def test_delay_fields_are_set(self):
         result = AP._to_delayed(implicit(), FakeDelayedCfg, min_delay=2, max_delay=8)
@@ -71,19 +87,46 @@ class TestFieldPreservation:
     def test_existing_delay_fields_on_the_source_are_not_carried(self):
         """Re-swapping must take the new bounds, not the old ones."""
         already = FakeDelayedCfg(
-            joint_names_expr=[], effort_limit_sim={}, stiffness={}, damping={},
-            min_delay=3, max_delay=5,
+            joint_names_expr=[],
+            effort_limit_sim={},
+            stiffness={},
+            damping={},
+            min_delay=3,
+            max_delay=5,
         )
         result = AP._to_delayed(already, FakeDelayedCfg, min_delay=0, max_delay=8)
         assert (result.min_delay, result.max_delay) == (0, 8)
 
+    def test_resolved_mapping_is_swapped_in_place(self):
+        actuators = {"legs": implicit(), "arms": implicit()}
+        groups = AP._replace_actuator_mapping(
+            actuators, FakeImplicitCfg, FakeDelayedCfg, min_delay=0, max_delay=8
+        )
+        assert groups == ["legs", "arms"]
+        assert all(isinstance(cfg, FakeDelayedCfg) for cfg in actuators.values())
+        assert all(cfg.max_delay == 8 for cfg in actuators.values())
+
+    def test_resolved_mapping_reports_already_delayed_groups(self):
+        actuators = {
+            "legs": FakeDelayedCfg(
+                joint_names_expr=[], effort_limit_sim={}, stiffness={}, damping={}
+            )
+        }
+        groups = AP._replace_actuator_mapping(
+            actuators, FakeImplicitCfg, FakeDelayedCfg, min_delay=0, max_delay=8
+        )
+        assert groups == ["legs (already delayed)"]
+
 
 class TestValidation:
-    @pytest.mark.parametrize("kwargs", [
-        {"max_delay": -1},
-        {"max_delay": 4, "min_delay": 5},
-        {"max_delay": 4, "min_delay": -1},
-    ])
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_delay": -1},
+            {"max_delay": 4, "min_delay": 5},
+            {"max_delay": 4, "min_delay": -1},
+        ],
+    )
     def test_rejects_invalid_bounds(self, kwargs):
         params = {"max_delay": 8, "min_delay": 0}
         params.update(kwargs)
@@ -97,7 +140,7 @@ class TestValidation:
         except ValueError:
             pytest.fail("max_delay=0 must be allowed; it is the baseline condition")
         except Exception:
-            pass          # IsaacLab unavailable on CPU; the bounds check passed
+            pass  # IsaacLab unavailable on CPU; the bounds check passed
 
 
 class TestReporting:
@@ -108,4 +151,4 @@ class TestReporting:
         try:
             assert isinstance(AP.describe_actuators(), dict)
         except Exception:
-            pass          # import-time Isaac dependency, exercised live instead
+            pass  # import-time Isaac dependency, exercised live instead

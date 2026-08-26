@@ -35,7 +35,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from gear_sonic.research.practice_utility.branch_capsule import Provenance, save_capsule
+from gear_sonic.research.practice_utility.branch_capsule import (
+    Provenance,
+    load_capsule,
+    save_capsule,
+)
 from gear_sonic.research.practice_utility.rng_capsule import RngState
 from gear_sonic.research.practice_utility.sampler_adapter import PracticeSamplerAdapter
 from gear_sonic.research.practice_utility.schema import ContextKey, MotionPoolManifest
@@ -43,6 +47,7 @@ from gear_sonic.research.practice_utility.schema import ContextKey, MotionPoolMa
 try:  # pragma: no cover - transformers is present in the training env
     from transformers import TrainerCallback
 except Exception:  # pragma: no cover - keeps CPU tests import-light
+
     class TrainerCallback:  # type: ignore[no-redef]
         """Minimal stand-in so this module imports without transformers."""
 
@@ -124,11 +129,7 @@ class PracticeContextCallback(TrainerCallback):
             self._arm(step)
         if self._armed:
             self._armed_steps += 1
-        if (
-            self.snapshot_path
-            and not self._snapshot_written
-            and step >= self.snapshot_at_step > 0
-        ):
+        if self.snapshot_path and not self._snapshot_written and step >= self.snapshot_at_step > 0:
             self.write_snapshot(step)
             self._snapshot_written = True
         if (
@@ -173,9 +174,7 @@ class PracticeContextCallback(TrainerCallback):
 
         def update_with_override(*args, **kwargs):
             result = self._original_update(*args, **kwargs)
-            motion_lib.adp_sampling_active_prob = adapter.apply(
-                motion_lib.adp_sampling_active_prob
-            )
+            motion_lib.adp_sampling_active_prob = adapter.apply(motion_lib.adp_sampling_active_prob)
             return result
 
         def sample_and_record(n, *args, **kwargs):
@@ -403,7 +402,7 @@ class PracticeCapsuleCallback(TrainerCallback):
         step = getattr(state, "global_step", 0)
         for label, horizon in self.horizons.items():
             if step == horizon and label not in self.saved:
-                self.saved[label] = self.save(label, step, kwargs)
+                self.saved[label] = self.save(label, step, {**kwargs, "state": state})
         return control
 
     def save(self, horizon_label: str, global_step: int, kwargs: dict[str, Any]) -> str:
@@ -448,6 +447,46 @@ class PracticeCapsuleCallback(TrainerCallback):
             provenance=self.provenance,
         )
         return str(path)
+
+
+class PracticeCapsuleResumeCallback(TrainerCallback):
+    """Restore a capsule's RNG stream just before SONIC resets a resumed env.
+
+    SONIC loads model, optimizer, trainer, and environment state while building
+    the trainer, but its exported checkpoint format has no RNG field. Loading
+    here is deliberately late: ``on_train_begin`` runs after checkpoint loading
+    and immediately before ``reset_all()``, so construction-time draws cannot
+    displace the resumed rollout stream.
+    """
+
+    def __init__(self, enabled: bool = False, capsule_path: str | None = None) -> None:
+        self.enabled = bool(enabled)
+        self.capsule_path = capsule_path
+        self.restored: dict[str, Any] | None = None
+
+    def on_train_begin(self, args, state, control, **kwargs):  # noqa: ARG002
+        if not self.enabled:
+            return control
+        if not self.capsule_path:
+            raise ValueError("enabled capsule resume requires capsule_path")
+        payload = load_capsule(self.capsule_path, restore_rng=True)
+        expected_step = int(payload["global_step"])
+        actual_step = int(getattr(state, "global_step", 0))
+        if actual_step != expected_step:
+            raise RuntimeError(
+                f"resume step {actual_step} does not match capsule step {expected_step}"
+            )
+        self.restored = {
+            "capsule_path": self.capsule_path,
+            "capsule_sha256": payload.get("capsule_sha256"),
+            "global_step": expected_step,
+            "pair_id": payload.get("pair_id"),
+        }
+        print(
+            f"[practice-resume] restored capsule RNG at step {expected_step}",
+            flush=True,
+        )
+        return control
 
 
 # ------------------------------------------------------------------ helpers --

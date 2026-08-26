@@ -2,9 +2,9 @@
 # Requires practice_observer for the gap. Disabled by default.
 #
 # NOTE ON COVERAGE: only reset- and interval-mode event terms can be rescaled at
-# runtime. friction, base CoM, and joint-default offsets are startup-mode and
-# are therefore NOT scheduled; the callback logs scalable_terms so a run states
-# exactly which channels it moved.
+# runtime. Use manager_env/events=tracking/lucid_curriculum, whose reset-safe
+# replacements expose all six channels. The callback logs scalable_terms so a
+# run states exactly which channels it moved.
 lucid_curriculum:
   _target_: gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback
   enabled: false

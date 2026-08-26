@@ -141,7 +141,8 @@ def randomize_joint_default_pos(
     base = asset.data.default_joint_pos[rows, joint_ids]
     low, high = float(pos_distribution_params[0]), float(pos_distribution_params[1])
     samples = sample_uniform(
-        torch.tensor(low, device=base.device), torch.tensor(high, device=base.device),
+        torch.tensor(low, device=base.device),
+        torch.tensor(high, device=base.device),
         tuple(base.shape),
     ).to(base.dtype)
     asset.data.default_joint_pos[rows, joint_ids] = apply_operation(base, samples, operation)
@@ -174,12 +175,21 @@ def resample_material_buckets(
 
     current = buckets.clone()
     ranges = [
-        static_friction_range if static_friction_range is not None
-        else (float(current[:, 0].min()), float(current[:, 0].max())),
-        dynamic_friction_range if dynamic_friction_range is not None
-        else (float(current[:, 1].min()), float(current[:, 1].max())),
-        restitution_range if restitution_range is not None
-        else (float(current[:, 2].min()), float(current[:, 2].max())),
+        (
+            static_friction_range
+            if static_friction_range is not None
+            else (float(current[:, 0].min()), float(current[:, 0].max()))
+        ),
+        (
+            dynamic_friction_range
+            if dynamic_friction_range is not None
+            else (float(current[:, 1].min()), float(current[:, 1].max()))
+        ),
+        (
+            restitution_range
+            if restitution_range is not None
+            else (float(current[:, 2].min()), float(current[:, 2].max()))
+        ),
     ]
     bounds = torch.tensor(ranges, dtype=current.dtype, device=current.device)
     resampled = sample_uniform(bounds[:, 0], bounds[:, 1], (current.shape[0], 3))
@@ -197,9 +207,7 @@ def sample_uniform(low: torch.Tensor, high: torch.Tensor, shape: tuple[int, ...]
     return torch.rand(shape, device=low.device) * (high - low) + low
 
 
-def apply_operation(
-    base: torch.Tensor, samples: torch.Tensor, operation: str
-) -> torch.Tensor:
+def apply_operation(base: torch.Tensor, samples: torch.Tensor, operation: str) -> torch.Tensor:
     """Combine a random draw with a nominal value, as IsaacLab's ops do."""
     if operation == "add":
         return base + samples
@@ -268,6 +276,7 @@ def _sync_action_offset(env: Any, asset: Articulation, env_ids: torch.Tensor) ->
 
 #: Attribute names of the delay buffers on a delayed actuator.
 DELAY_BUFFERS = ("positions_delay_buffer", "velocities_delay_buffer", "efforts_delay_buffer")
+DELAY_PROCESS_TELEMETRY = "_practice_action_delay_process"
 
 
 def randomize_action_delay(
@@ -275,6 +284,11 @@ def randomize_action_delay(
     env_ids: torch.Tensor | None,
     delay_range: tuple[float, float] = (0.0, 0.0),
     asset_cfg: "SceneEntityCfg | None" = None,
+    distribution: Literal["uniform", "clipped_normal", "two_point"] = "uniform",
+    coupling: Literal["independent", "common"] = "independent",
+    normal_mean: float | None = None,
+    normal_std: float | None = None,
+    high_probability: float = 0.1,
 ) -> int:
     """Sample a per-environment actuation delay, in physics steps.
 
@@ -284,9 +298,14 @@ def randomize_action_delay(
     no delay at all. That exact identity is what gives the curriculum a clean A/B
     baseline.
 
-    Returns the number of actuators whose lag was set, so a config that forgot to
-    use ``DelayedImplicitActuatorCfg`` reports zero instead of silently training
-    without latency.
+    ``coupling="independent"`` preserves the original experiment: each actuator
+    group receives its own lag. ``coupling="common"`` applies one per-env draw
+    to every group, matching a shared command/transport pipeline. Interval-mode
+    event terms can call the same function to model within-episode jitter.
+
+    Returns the number of actuators whose lag was set, so a config that forgot
+    to use ``DelayedImplicitActuatorCfg`` reports zero instead of silently
+    training without latency.
     """
     asset = env.scene[asset_cfg.name if asset_cfg is not None else "robot"]
     actuators = getattr(asset, "actuators", None)
@@ -301,20 +320,53 @@ def randomize_action_delay(
     low = max(0, int(round(float(delay_range[0]))))
     high = max(low, int(round(float(delay_range[1]))))
 
-    touched = 0
+    delayed = []
     for actuator in actuators.values():
         buffers = [getattr(actuator, name, None) for name in DELAY_BUFFERS]
         buffers = [b for b in buffers if b is not None]
         if not buffers:
             continue
         capacity = _buffer_capacity(buffers[0])
-        if capacity is not None:
-            # max_delay sizes the buffer at construction and set_time_lag raises
-            # above it, so clamp rather than let a curriculum crash the run.
-            high = min(high, capacity)
-            low = min(low, high)
-        lags = torch.randint(
-            low, high + 1, (env_ids.numel(),), dtype=torch.int, device=asset.device
+        delayed.append((buffers, capacity))
+    if not delayed:
+        return 0
+
+    if coupling not in ("independent", "common"):
+        raise ValueError(f"unsupported delay coupling {coupling!r}")
+
+    common_lags = None
+    if coupling == "common":
+        capacities = [capacity for _, capacity in delayed if capacity is not None]
+        common_high = min([high, *capacities]) if capacities else high
+        common_low = min(low, common_high)
+        common_lags = sample_action_lags(
+            env_ids.numel(),
+            common_low,
+            common_high,
+            asset.device,
+            distribution,
+            normal_mean,
+            normal_std,
+            high_probability,
+        )
+
+    assigned = []
+    for buffers, capacity in delayed:
+        group_high = min(high, capacity) if capacity is not None else high
+        group_low = min(low, group_high)
+        lags = (
+            common_lags
+            if common_lags is not None
+            else sample_action_lags(
+                env_ids.numel(),
+                group_low,
+                group_high,
+                asset.device,
+                distribution,
+                normal_mean,
+                normal_std,
+                high_probability,
+            )
         )
         for buffer in buffers:
             buffer.set_time_lag(lags, env_ids)
@@ -322,8 +374,145 @@ def randomize_action_delay(
             # from the previous episode's joint-default offset, which
             # randomize_joint_default_pos has just changed.
             buffer.reset(env_ids)
-        touched += 1
-    return touched
+        assigned.append(lags)
+    _record_action_delay_process(asset, torch.stack(assigned), distribution, coupling)
+    return len(delayed)
+
+
+def sample_action_lags(
+    num_envs: int,
+    low: int,
+    high: int,
+    device: Any,
+    distribution: str = "uniform",
+    normal_mean: float | None = None,
+    normal_std: float | None = None,
+    high_probability: float = 0.1,
+) -> torch.Tensor:
+    """Draw integer physics-step lags from a declared synthetic family."""
+    if distribution == "uniform":
+        return torch.randint(low, high + 1, (num_envs,), dtype=torch.int, device=device)
+    if distribution == "clipped_normal":
+        mean = 0.5 * (low + high) if normal_mean is None else float(normal_mean)
+        std = max((high - low) / 6.0, 1e-6) if normal_std is None else float(normal_std)
+        if std < 0:
+            raise ValueError(f"normal_std must be >= 0, got {std}")
+        samples = torch.randn(num_envs, device=device) * std + mean
+        return samples.round().clamp(low, high).to(torch.int)
+    if distribution == "two_point":
+        if not 0.0 <= high_probability <= 1.0:
+            raise ValueError(f"high_probability must be in [0, 1], got {high_probability}")
+        high_mask = torch.rand(num_envs, device=device) < high_probability
+        return torch.where(high_mask, high, low).to(torch.int)
+    raise ValueError(f"unsupported delay distribution {distribution!r}")
+
+
+def reset_action_delay_process(asset: Any) -> None:
+    """Clear aggregate delay-process telemetry before a scored evaluation."""
+    setattr(asset, DELAY_PROCESS_TELEMETRY, _new_delay_process_telemetry())
+
+
+def _new_delay_process_telemetry() -> dict[str, Any]:
+    return {
+        "invocations": 0,
+        "resampled_envs": 0,
+        "assignments": 0,
+        "sum_steps": 0,
+        "histogram": [],
+        "cross_group_equal_envs": 0,
+        "distribution_counts": {},
+        "coupling_counts": {},
+    }
+
+
+def _record_action_delay_process(
+    asset: Any,
+    assigned: torch.Tensor,
+    distribution: str,
+    coupling: str,
+) -> None:
+    state = getattr(asset, DELAY_PROCESS_TELEMETRY, None)
+    if not isinstance(state, dict):
+        state = _new_delay_process_telemetry()
+        setattr(asset, DELAY_PROCESS_TELEMETRY, state)
+    cpu = assigned.detach().long().cpu()
+    flat = cpu.flatten()
+    histogram = torch.bincount(flat, minlength=int(flat.max().item()) + 1).tolist()
+    if len(state["histogram"]) < len(histogram):
+        state["histogram"].extend([0] * (len(histogram) - len(state["histogram"])))
+    for index, count in enumerate(histogram):
+        state["histogram"][index] += int(count)
+    state["invocations"] += 1
+    state["resampled_envs"] += int(cpu.shape[1])
+    state["assignments"] += int(flat.numel())
+    state["sum_steps"] += int(flat.sum().item())
+    state["cross_group_equal_envs"] += int((cpu == cpu[:1]).all(dim=0).sum().item())
+    state["distribution_counts"][distribution] = (
+        state["distribution_counts"].get(distribution, 0) + 1
+    )
+    state["coupling_counts"][coupling] = state["coupling_counts"].get(coupling, 0) + 1
+
+
+def action_delay_stats(asset: Any) -> dict[str, Any]:
+    """Summarize the lags currently installed on live actuator buffers.
+
+    Configuration and class names are insufficient evidence: a reset event can
+    be present yet touch no real buffer, or a later reset can overwrite its
+    draw.  These values come from ``DelayBuffer.time_lags`` on the instantiated
+    robot and therefore audit what the actuator will actually execute.
+    """
+    actuators = getattr(asset, "actuators", None) or {}
+    lag_tensors = []
+    delayed_groups = 0
+    for actuator in actuators.values():
+        buffer = getattr(actuator, "positions_delay_buffer", None)
+        lags = getattr(buffer, "time_lags", None)
+        if not isinstance(lags, torch.Tensor):
+            continue
+        delayed_groups += 1
+        lag_tensors.append(lags.detach().long().flatten().cpu())
+    if not lag_tensors:
+        return {
+            "action_delay_actuator_groups": 0,
+            "action_delay_num_lags": 0,
+        }
+
+    combined = torch.cat(lag_tensors)
+    by_group = torch.stack(lag_tensors)
+    histogram = torch.bincount(combined, minlength=int(combined.max().item()) + 1)
+    result = {
+        "action_delay_actuator_groups": delayed_groups,
+        "action_delay_num_lags": int(combined.numel()),
+        "action_delay_min_steps": int(combined.min().item()),
+        "action_delay_max_steps": int(combined.max().item()),
+        "action_delay_mean_steps": float(combined.float().mean().item()),
+        "action_delay_nonzero_fraction": float((combined > 0).float().mean().item()),
+        "action_delay_histogram": histogram.tolist(),
+        "action_delay_cross_group_equal_fraction": float(
+            (by_group == by_group[:1]).all(dim=0).float().mean().item()
+        ),
+        "action_delay_cross_group_range_mean_steps": float(
+            (by_group.max(dim=0).values - by_group.min(dim=0).values).float().mean().item()
+        ),
+    }
+    process = getattr(asset, DELAY_PROCESS_TELEMETRY, None)
+    if isinstance(process, dict) and process.get("assignments", 0) > 0:
+        resampled = int(process["resampled_envs"])
+        result.update(
+            {
+                "action_delay_process_invocations": int(process["invocations"]),
+                "action_delay_process_resampled_envs": resampled,
+                "action_delay_process_assignments": int(process["assignments"]),
+                "action_delay_process_mean_steps": process["sum_steps"] / process["assignments"],
+                "action_delay_process_histogram": process["histogram"],
+                "action_delay_process_cross_group_equal_fraction": (
+                    process["cross_group_equal_envs"] / resampled if resampled else None
+                ),
+                "action_delay_process_distribution_counts": process["distribution_counts"],
+                "action_delay_process_coupling_counts": process["coupling_counts"],
+            }
+        )
+    return result
 
 
 def _buffer_capacity(buffer: Any) -> int | None:
@@ -439,6 +628,7 @@ def _build_event_cfg():
         """SONIC's events plus a curriculum-scalable actuation-latency term."""
 
         randomize_action_delay = None
+        randomize_action_delay_interval = None
 
     return LucidEventCfg
 

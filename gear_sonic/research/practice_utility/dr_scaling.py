@@ -13,18 +13,18 @@ control problem, which is what makes a PI controller a defensible choice.
 
 Which terms can actually be scaled at runtime
 ---------------------------------------------
-Only some. IsaacLab event terms declare a mode:
+IsaacLab event terms declare a mode:
 
 ``startup``   applied once when the scene is built. Rescaling later does nothing
-              -- friction, base CoM, and joint-default offsets are in this group
               and are therefore **outside** a runtime curriculum.
-``reset``     re-applied on every episode reset. Scalable. (body mass)
-``interval``  re-applied periodically. Scalable. (pushes)
+``reset``     re-applied on every episode reset. Scalable.
+``interval``  re-applied periodically. Scalable.
 
 This is a property of the configuration, not a limitation of the controller, and
 it is reported rather than worked around: :func:`scalable_terms` names exactly
 which channels a run is really scheduling, so a curriculum cannot silently claim
-credit for randomization it never moved.
+credit for randomization it never moved. The LUCID event preset supplies
+reset-safe versions of the stock startup-only channels and exposes all six.
 """
 
 from __future__ import annotations
@@ -46,11 +46,11 @@ MATERIAL_RANGE_KEYS = (
 #: Parameter names understood as randomization ranges, with their nominal value.
 #: The nominal is the value at which the channel contributes no randomization.
 RANGE_NOMINALS: dict[str, float] = {
-    "mass_distribution_params": 1.0,       # multiplicative: 1.0 is unscaled
-    "pos_distribution_params": 0.0,        # additive offsets
+    "mass_distribution_params": 1.0,  # multiplicative: 1.0 is unscaled
+    "pos_distribution_params": 0.0,  # additive offsets
     "velocity_range": 0.0,
     "com_range": 0.0,
-    "static_friction_range": None,         # nominal taken from the midpoint
+    "static_friction_range": None,  # nominal taken from the midpoint
     "dynamic_friction_range": None,
     "restitution_range": 0.0,
     # Actuation latency, in physics steps. Nominal 0 means lambda=0 collapses to
@@ -109,8 +109,10 @@ def scale_params(baseline: Any, lambda_value: float, nominal: float | None) -> A
     """Scale a range, or a dict of named ranges, leaving anything else alone."""
     if isinstance(baseline, dict):
         return {k: scale_params(v, lambda_value, nominal) for k, v in baseline.items()}
-    if isinstance(baseline, (list, tuple)) and len(baseline) == 2 and all(
-        isinstance(v, (int, float)) for v in baseline
+    if (
+        isinstance(baseline, (list, tuple))
+        and len(baseline) == 2
+        and all(isinstance(v, (int, float)) for v in baseline)
     ):
         return scale_range(baseline, lambda_value, nominal)
     return baseline
@@ -130,6 +132,7 @@ def apply_lambda(
     baseline: dict[str, dict[str, Any]],
     lambda_value: float,
     include_startup: bool = False,
+    exclude_terms: Iterable[str] = (),
 ) -> ScalingReport:
     """Rescale every runtime-scalable range to ``lambda`` of its baseline.
 
@@ -140,8 +143,9 @@ def apply_lambda(
             ``lambda`` epoch after epoch would drive every range to zero.
     """
     scaled, skipped_startup, skipped_unknown, material_resampled = [], [], [], []
+    excluded = set(exclude_terms)
     for name, cfg in _iter_terms(event_manager):
-        if name not in baseline:
+        if name not in baseline or name in excluded:
             continue
         mode = getattr(cfg, "mode", None)
         if mode not in RUNTIME_MODES and not include_startup:
@@ -185,9 +189,7 @@ def capture_baseline(event_manager: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(params, dict):
             continue
         captured = {
-            key: _deep_copy(value)
-            for key, value in params.items()
-            if key in RANGE_NOMINALS
+            key: _deep_copy(value) for key, value in params.items() if key in RANGE_NOMINALS
         }
         if captured:
             baseline[name] = captured

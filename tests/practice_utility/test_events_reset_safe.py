@@ -100,11 +100,11 @@ class TestComDoesNotCompound:
         coms = torch.zeros(NUM_ENVS, NUM_BODIES, 3)
         for _ in range(50):
             coms += torch.empty(NUM_ENVS, 1, 3).uniform_(-0.05, 0.05)
-        assert float(coms.abs().max()) > 0.05      # far outside the range
+        assert float(coms.abs().max()) > 0.05  # far outside the range
 
     def test_nominal_is_captured_before_any_randomization(self):
         env = FakeEnv()
-        env.asset.root_physx_view.coms[..., :3] = 0.7      # a non-zero nominal
+        env.asset.root_physx_view.coms[..., :3] = 0.7  # a non-zero nominal
         E.randomize_rigid_body_com(env, None, COM_RANGE, Cfg())
         nominal = getattr(env.asset, E.NOMINAL_COM)
         assert float(nominal[..., 0].min()) == pytest.approx(0.7)
@@ -197,11 +197,14 @@ class TestJointDefaultsDoNotCompound:
 class TestMaterialBuckets:
     class Term:
         def __init__(self, n=64):
-            self.material_buckets = torch.stack([
-                torch.empty(n).uniform_(0.3, 1.6),
-                torch.empty(n).uniform_(0.3, 1.2),
-                torch.empty(n).uniform_(0.0, 0.5),
-            ], dim=1)
+            self.material_buckets = torch.stack(
+                [
+                    torch.empty(n).uniform_(0.3, 1.6),
+                    torch.empty(n).uniform_(0.3, 1.2),
+                    torch.empty(n).uniform_(0.0, 0.5),
+                ],
+                dim=1,
+            )
 
     def test_resampling_changes_the_distribution(self):
         """Without this, scaling friction ranges at runtime does nothing."""
@@ -346,11 +349,96 @@ class TestActionDelay:
         assert E.randomize_action_delay(env, None, (0.0, 8.0), Cfg()) == 0
 
     def test_counts_every_delayed_actuator_group(self):
-        env = env_with_actuators({
-            "legs": FakeDelayedActuator(), "arms": FakeDelayedActuator(),
-            "hands": FakePlainActuator(),
-        })
+        env = env_with_actuators(
+            {
+                "legs": FakeDelayedActuator(),
+                "arms": FakeDelayedActuator(),
+                "hands": FakePlainActuator(),
+            }
+        )
         assert E.randomize_action_delay(env, None, (0.0, 4.0), Cfg()) == 2
+
+    def test_common_coupling_applies_one_pipeline_lag_to_all_groups(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator(), "arms": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (0.0, 8.0), Cfg(), coupling="common")
+        legs = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        arms = env.asset.actuators["arms"].positions_delay_buffer.time_lags
+        assert torch.equal(legs, arms)
+
+    def test_independent_coupling_preserves_historical_groupwise_sampling(self):
+        torch.manual_seed(123)
+        env = env_with_actuators({"legs": FakeDelayedActuator(), "arms": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (0.0, 8.0), Cfg(), coupling="independent")
+        legs = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        arms = env.asset.actuators["arms"].positions_delay_buffer.time_lags
+        assert not torch.equal(legs, arms)
+
+    def test_two_point_distribution_models_rare_high_latency_bursts(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator(history_length=12)})
+        E.randomize_action_delay(
+            env,
+            None,
+            (0.0, 12.0),
+            Cfg(),
+            distribution="two_point",
+            high_probability=1.0,
+        )
+        lags = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        assert torch.all(lags == 12)
+
+    def test_clipped_normal_distribution_uses_declared_mean(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        E.randomize_action_delay(
+            env,
+            None,
+            (0.0, 8.0),
+            Cfg(),
+            distribution="clipped_normal",
+            normal_mean=3.0,
+            normal_std=0.0,
+        )
+        lags = env.asset.actuators["legs"].positions_delay_buffer.time_lags
+        assert torch.all(lags == 3)
+
+    def test_unknown_distribution_is_rejected(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        with pytest.raises(ValueError, match="unsupported delay distribution"):
+            E.randomize_action_delay(env, None, (0.0, 8.0), Cfg(), distribution="lognormal")
+
+    def test_unknown_coupling_is_rejected(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator()})
+        with pytest.raises(ValueError, match="unsupported delay coupling"):
+            E.randomize_action_delay(env, None, (0.0, 8.0), Cfg(), coupling="per_joint")
+
+    def test_live_lag_stats_report_the_instantiated_buffers(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator(), "arms": FakeDelayedActuator()})
+        E.randomize_action_delay(env, None, (3.0, 3.0), Cfg())
+        stats = E.action_delay_stats(env.asset)
+        assert stats["action_delay_actuator_groups"] == 2
+        assert stats["action_delay_num_lags"] == 2 * NUM_ENVS
+        assert stats["action_delay_min_steps"] == stats["action_delay_max_steps"] == 3
+        assert stats["action_delay_mean_steps"] == pytest.approx(3.0)
+        assert stats["action_delay_nonzero_fraction"] == pytest.approx(1.0)
+        assert stats["action_delay_histogram"][3] == 2 * NUM_ENVS
+        assert stats["action_delay_process_invocations"] == 1
+        assert stats["action_delay_process_assignments"] == 2 * NUM_ENVS
+        assert stats["action_delay_process_mean_steps"] == pytest.approx(3.0)
+
+    def test_process_telemetry_accumulates_interval_resamples(self):
+        env = env_with_actuators({"legs": FakeDelayedActuator(), "arms": FakeDelayedActuator()})
+        E.reset_action_delay_process(env.asset)
+        E.randomize_action_delay(env, torch.tensor([0, 1]), (2.0, 2.0), Cfg(), coupling="common")
+        E.randomize_action_delay(env, torch.tensor([2, 3, 4]), (4.0, 4.0), Cfg(), coupling="common")
+        stats = E.action_delay_stats(env.asset)
+        assert stats["action_delay_process_invocations"] == 2
+        assert stats["action_delay_process_resampled_envs"] == 5
+        assert stats["action_delay_process_assignments"] == 10
+        assert stats["action_delay_process_cross_group_equal_fraction"] == 1.0
+        assert stats["action_delay_process_coupling_counts"] == {"common": 2}
+
+    def test_live_lag_stats_make_plain_actuators_explicit(self):
+        stats = E.action_delay_stats(env_with_actuators({"legs": FakePlainActuator()}).asset)
+        assert stats == {"action_delay_actuator_groups": 0, "action_delay_num_lags": 0}
 
     def test_no_actuators_is_survivable(self):
         env = env_with_actuators({})
@@ -358,8 +446,10 @@ class TestActionDelay:
 
     def test_empty_env_ids_is_a_no_op(self):
         env = env_with_actuators({"legs": FakeDelayedActuator()})
-        assert E.randomize_action_delay(
-            env, torch.tensor([], dtype=torch.long), (0.0, 8.0), Cfg()) == 0
+        assert (
+            E.randomize_action_delay(env, torch.tensor([], dtype=torch.long), (0.0, 8.0), Cfg())
+            == 0
+        )
 
     def test_inverted_range_is_tolerated(self):
         env = env_with_actuators({"legs": FakeDelayedActuator()})
@@ -375,7 +465,10 @@ class TestActionDelay:
 class TestDelayIsCurriculumScalable:
     def test_lambda_maps_to_the_papers_training_range(self):
         """LUCID v1 trains over 0-40 ms; at 200 Hz that is 0-8 physics steps."""
-        from gear_sonic.research.practice_utility.dr_scaling import RANGE_NOMINALS, scale_range
+        from gear_sonic.research.practice_utility.dr_scaling import (
+            RANGE_NOMINALS,
+            scale_range,
+        )
 
         assert RANGE_NOMINALS["delay_range"] == 0.0
         assert scale_range([0.0, 8.0], 0.0, 0.0) == [0.0, 0.0]
@@ -413,7 +506,7 @@ class TestStickyResampling:
         torch.manual_seed(0)
         env, ids = self.Env(), torch.arange(12)
         total = sum(E.due_for_resample(env, ids, 4, "k").numel() for _ in range(40))
-        assert total / 40 == pytest.approx(3.0, abs=0.35)   # 12 envs / every 4
+        assert total / 40 == pytest.approx(3.0, abs=0.35)  # 12 envs / every 4
 
     def test_phases_are_staggered_not_lockstep(self):
         """A zero-init counter redraws the whole batch at once -- a synchronised
@@ -468,7 +561,7 @@ class TestStickyResampling:
         wrapped = E.sticky(lambda e, ids: calls.append(ids), "k", every=1000)
         for _ in range(3):
             wrapped(env, torch.arange(12))
-        assert len(calls) <= 1        # at most the initially-phased envs
+        assert len(calls) <= 1  # at most the initially-phased envs
 
     def test_sticky_wrapper_preserves_arguments(self):
         env = self.Env()

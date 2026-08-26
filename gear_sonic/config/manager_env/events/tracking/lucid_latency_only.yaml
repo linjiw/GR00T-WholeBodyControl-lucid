@@ -1,0 +1,9 @@
+# Delay-only fixed-lambda mechanism check. Both arms use delayed actuators;
+# the launcher overrides delay_range to [0, 0] or [0, 8]. No other domain-
+# randomization term is present, so any paired divergence is attributable to
+# actuation latency rather than friction, mass, CoM, pushes, or joint offsets.
+
+defaults:
+  - terms/randomize_action_delay@_here_
+
+_target_: gear_sonic.research.practice_utility.events_reset_safe.LucidEventCfg

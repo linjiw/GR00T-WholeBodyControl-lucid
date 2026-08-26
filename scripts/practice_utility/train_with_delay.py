@@ -42,11 +42,15 @@ sys.path.insert(0, str(REPO))
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--max-delay", type=int, default=8,
-                        help="delay-buffer capacity in physics steps "
-                             "(8 = 40 ms at 200 Hz, LUCID's training range)")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=int,
+        default=8,
+        help="delay-buffer capacity in physics steps (8 = 40 ms at 200 Hz, LUCID's training range)",
+    )
     parser.add_argument("--min-delay", type=int, default=0)
     known, passthrough = parser.parse_known_args(argv)
     if passthrough and passthrough[0] == "--":
@@ -57,12 +61,12 @@ def main(argv=None) -> int:
     from gear_sonic.trl.utils import common as sonic_common
 
     original_instantiate = sonic_common.custom_instantiate
-    state = {"patched": False}
+    state = {"template_patched": False, "resolved_patched": False}
 
     def instantiate_with_delay(d, *args, **kwargs):
         # Fires for every instantiate call; the actuator swap is only valid once
         # Isaac is up, which is true by the time any env config is built.
-        if not state["patched"]:
+        if not state["template_patched"]:
             try:
                 from gear_sonic.research.practice_utility.actuator_patch import (
                     describe_actuators,
@@ -72,7 +76,7 @@ def main(argv=None) -> int:
                 report = enable_delayed_actuators(
                     max_delay=known.max_delay, min_delay=known.min_delay
                 )
-                state["patched"] = True
+                state["template_patched"] = True
                 print(
                     f"[latency] swapped {report['num_groups']} actuator groups, "
                     f"max_delay={known.max_delay} steps "
@@ -82,12 +86,32 @@ def main(argv=None) -> int:
                 for group, klass in describe_actuators().items():
                     print(f"[latency]   {group}: {klass}", flush=True)
                 if report["num_groups"] == 0:
-                    print("[latency] WARNING: nothing swapped; this run has NO latency",
-                          flush=True)
+                    print("[latency] WARNING: nothing swapped; this run has NO latency", flush=True)
             except ImportError:
                 # Isaac not up yet; try again on the next instantiate call.
                 pass
-        return original_instantiate(d, *args, **kwargs)
+        result = original_instantiate(d, *args, **kwargs)
+
+        # The module template can already have been copied into the resolved
+        # environment config. Audit and patch that exact object before the live
+        # articulation is constructed; this is the object Isaac consumes.
+        if not state["resolved_patched"]:
+            robot_cfg = getattr(getattr(result, "scene", None), "robot", None)
+            if robot_cfg is not None:
+                from gear_sonic.research.practice_utility.actuator_patch import (
+                    enable_delayed_actuators_on_cfg,
+                )
+
+                resolved = enable_delayed_actuators_on_cfg(
+                    robot_cfg, max_delay=known.max_delay, min_delay=known.min_delay
+                )
+                state["resolved_patched"] = True
+                print(
+                    f"[latency] resolved env cfg has {resolved['num_groups']} delayed "
+                    f"actuator groups: {resolved['groups']}",
+                    flush=True,
+                )
+        return result
 
     sonic_common.custom_instantiate = instantiate_with_delay
 
