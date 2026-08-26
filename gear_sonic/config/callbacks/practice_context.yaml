@@ -15,3 +15,4 @@ practice_context:
   manifest_path: null
   snapshot_path: null      # dump the native distribution + resident contexts on install
   snapshot_at_step: 0      # >0: snapshot after warm-up, when failure stats mean something
+  snapshot_timeline_fps: 50.0  # SONIC control/resampling timeline for bin bounds

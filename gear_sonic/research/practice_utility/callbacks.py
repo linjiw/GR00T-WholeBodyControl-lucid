@@ -32,6 +32,7 @@ Configured through Hydra like every other SONIC callback::
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,7 @@ class PracticeContextCallback(TrainerCallback):
         manifest_path: str | None = None,
         snapshot_path: str | None = None,
         snapshot_at_step: int = 0,
+        snapshot_timeline_fps: float = 50.0,
     ) -> None:
         self.enabled = bool(enabled)
         self.role = role
@@ -87,6 +89,10 @@ class PracticeContextCallback(TrainerCallback):
         # no information. A campaign stratified on that would have no
         # difficulty axis at all. Snapshot after warm-up instead.
         self.snapshot_at_step = int(snapshot_at_step)
+        self.snapshot_timeline_fps = float(snapshot_timeline_fps)
+        if self.snapshot_timeline_fps <= 0:
+            raise ValueError("snapshot_timeline_fps must be positive")
+        self._verified_snapshot_timeline_fps: float | None = None
         self._snapshot_written = False
         # A context is only armable while its motion is resident. SONIC keeps a
         # subset of the pool loaded (195 of 512 motions in a measured run), so a
@@ -161,6 +167,8 @@ class PracticeContextCallback(TrainerCallback):
                 "adaptive sampling is disabled; there is no bin distribution to "
                 "intervene on and dose cannot be attributed to a context"
             )
+        if self.snapshot_path:
+            self._verified_snapshot_timeline_fps = self._motion_lib_timeline_fps(motion_lib)
 
         manifest = self._load_manifest()
         self._motion_lib = motion_lib
@@ -217,6 +225,25 @@ class PracticeContextCallback(TrainerCallback):
         self._patched_attributes = []
         self.adapter = None
         self._armed = False
+        self._verified_snapshot_timeline_fps = None
+
+    def _motion_lib_timeline_fps(self, motion_lib: Any) -> float:
+        """Return the live target FPS only when it matches the frozen callback value."""
+        raw = getattr(motion_lib, "target_fps", None)
+        if isinstance(raw, bool):
+            raise RuntimeError("motion library target_fps is not a positive finite number")
+        try:
+            actual = float(raw)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("motion library has no numeric target_fps") from error
+        if not math.isfinite(actual) or actual <= 0:
+            raise RuntimeError("motion library target_fps is not a positive finite number")
+        if not math.isclose(actual, self.snapshot_timeline_fps, rel_tol=0.0, abs_tol=1e-9):
+            raise RuntimeError(
+                "live motion library target_fps differs from snapshot_timeline_fps: "
+                f"actual={actual}, frozen={self.snapshot_timeline_fps}"
+            )
+        return actual
 
     @staticmethod
     def is_patched(motion_lib: Any) -> bool:
@@ -291,6 +318,8 @@ class PracticeContextCallback(TrainerCallback):
         """
         if self.adapter is None or not self.snapshot_path:
             return None
+        timeline_fps = self._motion_lib_timeline_fps(self._motion_lib)
+        self._verified_snapshot_timeline_fps = timeline_fps
         snapshot = self.adapter.snapshot_native_distribution(global_step)
         contexts = []
         for position, bin_id in enumerate(snapshot.active_bin_ids):
@@ -315,6 +344,7 @@ class PracticeContextCallback(TrainerCallback):
                     "schema_version": 1,
                     "global_step": global_step,
                     "branch_id": self.branch_id,
+                    "snapshot_timeline_fps": timeline_fps,
                     "num_bins": snapshot.num_bins,
                     "num_active_bins": len(snapshot.active_bin_ids),
                     "distribution_sha256": snapshot.distribution_sha256,

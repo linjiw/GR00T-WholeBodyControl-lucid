@@ -1,4 +1,4 @@
-"""Random-state capture and counter-based streams for paired branches.
+"""Random-state capture and counter-based stream primitives for paired branches.
 
 Why a plain seed is not enough
 ------------------------------
@@ -8,15 +8,16 @@ global RNG differently, and from then on they diverge in push timing, sampled
 physics parameters, action noise, and minibatch order. The measured difference
 would then contain both the intervention effect and unmatched trajectory noise.
 
-Counter-based streams fix this. Every non-context random channel derives its
+Counter-based streams can fix this. Every non-context random channel derives its
 seed from a *content key* rather than from stream position::
 
     seed = H(pair_id, env_id, episode_index, channel_name)
 
-Control and intervention therefore draw the *same* friction, the *same* push
-time, and the *same* action noise for the same (env, episode) -- only the
-context selector differs. This is the standard common-random-numbers variance
-reduction, and for a paired difference it removes the dominant nuisance term.
+When every production random channel is wired through these primitives, control
+and intervention draw the *same* friction, push time, and action noise for the
+same (env, episode), while only the context selector differs. The helpers in
+this module do not themselves install that wiring. Until a live channel audit
+proves those call sites, capsules must record ``counter_rng_enabled=False``.
 
 What this module does not claim
 -------------------------------
@@ -25,6 +26,10 @@ exact trajectory equality unattainable. So this is a *receipt*, not a proof.
 The empirical noise floor comes from the epsilon=0 paired branches, and no
 report may describe "same seed" as "identical trajectory".
 """
+
+# Ruff's force-sort-within-sections setting conflicts with the repository's
+# authoritative isort profile for mixed import/from-import blocks.
+# ruff: noqa: I001
 
 from __future__ import annotations
 
@@ -96,8 +101,14 @@ class RngState:
     deterministic_flags: dict[str, Any]
 
     @staticmethod
-    def capture(pair_id: str, counter_rng_enabled: bool = True) -> RngState:
-        """Capture the current global random state of the process."""
+    def capture(pair_id: str, counter_rng_enabled: bool = False) -> RngState:
+        """Capture the current global random state of the process.
+
+        ``counter_rng_enabled`` is evidence about production integration, not
+        about whether :func:`derive_seed` exists. It therefore defaults to
+        false and may only be set true by a caller that has audited every
+        declared matched channel end to end.
+        """
         cuda_states: list[torch.Tensor] = []
         if torch.cuda.is_available():
             cuda_states = [s.clone() for s in torch.cuda.get_rng_state_all()]

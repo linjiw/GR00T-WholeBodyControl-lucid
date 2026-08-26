@@ -77,12 +77,20 @@ class TestPairedBranchesShareMatchedChannels:
     def test_matched_draws_survive_interleaved_global_consumption(self):
         """A branch that consumes extra global randomness still matches."""
         control = self.draw("p", 1, 1, "friction")
-        torch.rand(1000)          # intervention branch did more work
+        torch.rand(1000)  # intervention branch did more work
         random.random()
         assert torch.equal(self.draw("p", 1, 1, "friction"), control)
 
 
 class TestRngStateCapture:
+    def test_capture_does_not_claim_unwired_counter_rng(self):
+        state = R.RngState.capture("p")
+        assert state.counter_rng_enabled is False
+
+    def test_audited_caller_can_record_counter_rng_integration(self):
+        state = R.RngState.capture("p", counter_rng_enabled=True)
+        assert state.counter_rng_enabled is True
+
     def test_restore_reproduces_python_stream(self):
         state = R.RngState.capture("p")
         expected = [random.random() for _ in range(5)]

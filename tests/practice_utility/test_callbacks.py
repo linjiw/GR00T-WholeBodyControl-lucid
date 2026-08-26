@@ -44,6 +44,7 @@ class FakeMotionLib:
         self._motion_data_keys = self._keys
         self._motion_fps = torch.full((NUM_MOTIONS,), 30.0)  # per-motion tensor upstream
         self._sim_fps = 50.0
+        self.target_fps = 50.0
         self._device = torch.device("cpu")
 
         frames_per_motion = BINS_PER_MOTION * BIN_SIZE
@@ -271,6 +272,25 @@ class TestDoseRecording:
     def test_no_report_without_a_directory(self, env):
         callback = self.install(env)
         assert callback.write_dose_report(10) is None
+
+    def test_snapshot_records_its_timeline_rate(self, env, tmp_path):
+        path = tmp_path / "snapshot.json"
+        callback = self.install(
+            env,
+            snapshot_path=str(path),
+            snapshot_timeline_fps=50.0,
+        )
+        callback.write_snapshot(global_step=12)
+        assert json.loads(path.read_text())["snapshot_timeline_fps"] == 50.0
+
+    def test_snapshot_refuses_self_report_that_differs_from_live_target_fps(self, env, tmp_path):
+        env._motion_lib.target_fps = 60.0
+        with pytest.raises(RuntimeError, match="live motion library target_fps differs"):
+            self.install(
+                env,
+                snapshot_path=str(tmp_path / "snapshot.json"),
+                snapshot_timeline_fps=50.0,
+            )
 
 
 class TestStaleKernelHandling:
