@@ -1,0 +1,56 @@
+# Full-envelope evaluation with both reset and within-episode latency draws.
+# The launcher overrides the two delay terms for each preregistered process.
+# Non-latency ranges remain at their training-envelope maxima here; the frozen
+# evaluation callback may scale only those five channels without touching delay.
+
+defaults:
+  - terms/physics_material@_here_
+  - terms/add_joint_default_pos@_here_
+  - terms/base_com@_here_
+  - terms/push_robot@_here_
+  - terms/randomize_rigid_body_mass@_here_
+  - terms/randomize_action_delay@_here_
+
+_target_: gear_sonic.research.practice_utility.events_reset_safe.LucidEventCfg
+
+randomize_rigid_body_mass:
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      body_names: ".*wrist_yaw.*|torso_link"
+    mass_distribution_params: [0.8, 1.5]
+    operation: "scale"
+
+base_com:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_rigid_body_com
+  mode: "reset"
+
+add_joint_default_pos:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_joint_default_pos
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    pos_distribution_params: [-0.01, 0.01]
+    operation: "add"
+
+physics_material:
+  mode: "reset"
+
+randomize_action_delay_interval:
+  _target_: isaaclab.managers.EventTermCfg
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_action_delay
+  mode: "interval"
+  interval_range_s: [0.20, 0.50]
+  is_global_time: false
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+    delay_range: [0.0, 8.0]
+    distribution: "uniform"
+    coupling: "common"

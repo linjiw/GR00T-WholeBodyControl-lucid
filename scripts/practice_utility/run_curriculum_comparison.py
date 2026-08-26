@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Train and compare SONIC LUCID, fixed-DR, and no-DR branches."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import statistics
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+
+from gear_sonic.research.practice_utility import branch_capsule as BC  # noqa: E402
+from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
+from scripts.practice_utility import run_throughput_probe as TP
+
+OBSERVER = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
+CURRICULUM = "gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback"
+CAPSULE = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleCallback"
+MODES = ("lucid", "fixed", "off")
+TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
+QUALITY_METRICS = (
+    "latent_p90",
+    "foot_slip_per_step_m",
+    "torque_saturation",
+    "energy_proxy",
+    "action_delay_mean_steps",
+    "action_delay_nonzero_fraction",
+)
+REWARD_FLOOR = 0.0333
+LENGTH_FLOOR = 0.0314
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--iterations", type=int, default=32)
+    parser.add_argument("--warmup-iterations", type=int, default=10)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--max-delay", type=int, default=8)
+    parser.add_argument("--delta-target", type=float, default=0.778)
+    parser.add_argument("--kp", type=float, default=1.0)
+    parser.add_argument("--ki", type=float, default=0.02)
+    parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--integral-max", type=float, default=1.0)
+    parser.add_argument("--return-floor", type=float, default=8.0)
+    parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
+    parser.add_argument(
+        "--encoder",
+        default="/data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        default=Path("/data/robotixx/lucid-sonic/artifacts/curriculum_comparison"),
+    )
+    parser.add_argument("--log-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/outputs"))
+    parser.add_argument(
+        "--receipt-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/manifests")
+    )
+    parser.add_argument("--min-free-mib", type=int, default=6000)
+    parser.add_argument("--execute", action="store_true")
+    args = parser.parse_args(argv)
+    if args.iterations <= args.warmup_iterations:
+        parser.error("iterations must exceed warmup iterations")
+    return args
+
+
+def arm_order(modes: list[str], seed_index: int) -> list[str]:
+    """Rotate arm order by seed to avoid confounding mode with wall-clock order."""
+    offset = seed_index % len(modes)
+    return modes[offset:] + modes[:offset]
+
+
+def build_command(args, mode: str, seed: int, branch_id: str, artifact_dir: Path) -> list[str]:
+    if mode not in MODES:
+        raise ValueError(f"unsupported mode {mode!r}")
+    capsule_dir = artifact_dir / "capsules"
+    return [
+        sys.executable,
+        str(REPO / "scripts" / "practice_utility" / "train_with_delay.py"),
+        "--max-delay",
+        str(args.max_delay),
+        "--",
+        f"+exp={args.exp}",
+        f"checkpoint={args.checkpoint}",
+        f"num_envs={args.num_envs}",
+        "headless=true",
+        "use_wandb=false",
+        f"seed={seed}",
+        "manager_env/events=tracking/lucid_curriculum",
+        f"++algo.config.num_learning_iterations={args.iterations}",
+        "++algo.config.save_interval=100000",
+        "++manager_env.commands.motion.motion_lib_cfg.motion_file=data/motion_lib_bones_seed/robot_filtered",
+        "++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=data/motion_lib_bones_seed/smpl_filtered",
+        f"++callbacks.practice_observer._target_={OBSERVER}",
+        "++callbacks.practice_observer.enabled=true",
+        f"++callbacks.practice_observer.encoder_path={args.encoder}",
+        f"++callbacks.practice_observer.branch_id={branch_id}",
+        f"++callbacks.practice_observer.output_dir={artifact_dir}",
+        f"++callbacks.lucid_curriculum._target_={CURRICULUM}",
+        "++callbacks.lucid_curriculum.enabled=true",
+        f"++callbacks.lucid_curriculum.mode={mode}",
+        f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
+        f"++callbacks.lucid_curriculum.branch_id={branch_id}",
+        f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
+        "++callbacks.lucid_curriculum.initial_lambda=0.0",
+        "++callbacks.lucid_curriculum.fixed_lambda=1.0",
+        f"++callbacks.lucid_curriculum.delta_target={args.delta_target}",
+        f"++callbacks.lucid_curriculum.kp={args.kp}",
+        f"++callbacks.lucid_curriculum.ki={args.ki}",
+        f"++callbacks.lucid_curriculum.alpha={args.alpha}",
+        f"++callbacks.lucid_curriculum.integral_max={args.integral_max}",
+        f"++callbacks.lucid_curriculum.return_floor={args.return_floor}",
+        f"++callbacks.lucid_curriculum.warmup_iterations={args.warmup_iterations}",
+        f"++callbacks.practice_capsule._target_={CAPSULE}",
+        "++callbacks.practice_capsule.enabled=true",
+        f"++callbacks.practice_capsule.capsule_dir={capsule_dir}",
+        f"++callbacks.practice_capsule.pair_id=curriculum_seed_{seed}",
+        "++callbacks.practice_capsule.role=control",
+        f"++callbacks.practice_capsule.branch_id={branch_id}",
+        f"++callbacks.practice_capsule.horizons.final={args.iterations}",
+    ]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def trailing(values: dict[int, float], window: int = 4) -> float | None:
+    ordered = [values[index] for index in sorted(values)]
+    return statistics.fmean(ordered[-window:]) if len(ordered) >= window else None
+
+
+def aggregate(arms: dict[str, dict[str, Any]], modes: list[str]) -> dict[str, Any]:
+    result = {}
+    for mode in modes:
+        members = [arm for arm in arms.values() if arm["mode"] == mode]
+        metrics = {}
+        for metric in TRAINING_METRICS:
+            values = [arm["training"][metric]["last4_mean"] for arm in members]
+            values = [float(value) for value in values if value is not None]
+            metrics[metric] = {
+                "per_seed": {
+                    str(arm["seed"]): arm["training"][metric]["last4_mean"] for arm in members
+                },
+                "mean": statistics.fmean(values) if values else None,
+                "sample_std": statistics.stdev(values) if len(values) > 1 else None,
+            }
+        for metric in QUALITY_METRICS:
+            values = [arm["observer_last4_mean"].get(metric) for arm in members]
+            values = [float(value) for value in values if value is not None]
+            metrics[f"observer/{metric}"] = {
+                "mean": statistics.fmean(values) if values else None,
+                "sample_std": statistics.stdev(values) if len(values) > 1 else None,
+            }
+        final_lambdas = [arm.get("final_lambda") for arm in members]
+        final_lambdas = [float(value) for value in final_lambdas if value is not None]
+        result[mode] = {
+            "num_seeds": len(members),
+            "metrics": metrics,
+            "final_lambda_mean": statistics.fmean(final_lambdas) if final_lambdas else None,
+            "all_complete": all(arm["complete"] for arm in members),
+        }
+    return result
+
+
+def relative(left: float | None, right: float | None) -> float | None:
+    if left is None or right is None or left == 0:
+        return None
+    return (right - left) / abs(left)
+
+
+def comparisons(summary: dict[str, Any]) -> dict[str, Any]:
+    if "lucid" not in summary:
+        return {}
+    output = {}
+    for other in ("fixed", "off"):
+        if other not in summary:
+            continue
+        pair = {}
+        for metric, floor in (("Mean rewards", REWARD_FLOOR), ("Mean length", LENGTH_FLOOR)):
+            lucid = summary["lucid"]["metrics"][metric]["mean"]
+            reference = summary[other]["metrics"][metric]["mean"]
+            delta = relative(reference, lucid)
+            pair[metric] = {
+                "lucid": lucid,
+                other: reference,
+                "relative_lucid_minus_other": delta,
+                "outside_settled_noise_floor": delta is not None and abs(delta) > floor,
+            }
+        output[f"lucid_vs_{other}"] = pair
+    return output
+
+
+def source_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    experiment_id = f"curriculum_comparison_ne{args.num_envs}_{stamp}"
+    modes = list(dict.fromkeys(args.modes))
+    run_specs = []
+    for seed_index, seed in enumerate(args.seeds):
+        for mode in arm_order(modes, seed_index):
+            branch_id = f"{experiment_id}_s{seed}_{mode}"
+            artifact_dir = args.artifact_root / experiment_id / f"seed_{seed}" / mode
+            run_specs.append((seed, mode, branch_id, artifact_dir))
+    commands = {
+        branch_id: build_command(args, mode, seed, branch_id, artifact_dir)
+        for seed, mode, branch_id, artifact_dir in run_specs
+    }
+    for seed, mode, branch_id, _ in run_specs:
+        print(f"[seed={seed} mode={mode} branch={branch_id}]")
+        print("\n".join(commands[branch_id]))
+    if not args.execute:
+        print("dry run; pass --execute")
+        return 0
+
+    args.log_dir.mkdir(parents=True, exist_ok=True)
+    args.receipt_dir.mkdir(parents=True, exist_ok=True)
+    runtime = {}
+    arms: dict[str, dict[str, Any]] = {}
+    for seed, mode, branch_id, artifact_dir in run_specs:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        log_path = args.log_dir / f"{branch_id}.log"
+        runtime[branch_id] = LA.run_arm(commands[branch_id], log_path, args.min_free_mib)
+        observer_path = artifact_dir / f"observer_{branch_id}.jsonl"
+        arm = LA.summarize_arm(log_path, observer_path, args.iterations)
+        curriculum_path = artifact_dir / f"curriculum_{branch_id}.jsonl"
+        curriculum = read_jsonl(curriculum_path)
+        capsule = artifact_dir / "capsules" / f"{branch_id}_final.capsule.pt"
+        checkpoint = artifact_dir / "final_checkpoint.pt"
+        if runtime[branch_id]["exit_code"] == 0 and capsule.is_file():
+            BC.export_sonic_checkpoint(capsule, checkpoint)
+        arm.update(
+            {
+                "seed": seed,
+                "mode": mode,
+                "branch_id": branch_id,
+                "curriculum_path": str(curriculum_path),
+                "curriculum_rows": len(curriculum),
+                "final_lambda": curriculum[-1].get("lambda") if curriculum else None,
+                "final_integral": curriculum[-1].get("integral") if curriculum else None,
+                "mean_return_observed": any(
+                    row.get("mean_return") is not None for row in curriculum
+                ),
+                "return_guard_trips": sum(bool(row.get("guard_tripped")) for row in curriculum),
+                "scalable_terms": curriculum[-1].get("scalable_terms", []) if curriculum else [],
+                "capsule": str(capsule),
+                "checkpoint": str(checkpoint),
+                "checkpoint_exported": checkpoint.is_file(),
+            }
+        )
+        arms[branch_id] = arm
+        runtime[branch_id]["log_path"] = str(log_path)
+        runtime[branch_id]["observer_path"] = str(observer_path)
+
+    mode_summary = aggregate(arms, modes)
+    comparison = comparisons(mode_summary)
+    expected_terms = {
+        "add_joint_default_pos",
+        "base_com",
+        "physics_material",
+        "push_robot",
+        "randomize_action_delay",
+        "randomize_rigid_body_mass",
+    }
+    mechanics_ok = all(
+        runtime[branch_id]["exit_code"] == 0
+        and arm["complete"]
+        and arm["actuator_groups_swapped"] == 5
+        and arm["checkpoint_exported"]
+        and set(arm["scalable_terms"]) == expected_terms
+        for branch_id, arm in arms.items()
+    )
+    if "lucid" in modes:
+        lucid_arms = [arm for arm in arms.values() if arm["mode"] == "lucid"]
+        mechanics_ok = mechanics_ok and all(arm["mean_return_observed"] for arm in lucid_arms)
+
+    receipt = {
+        "kind": "lucid_three_arm_training_comparison",
+        "schema_version": 1,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "experiment_id": experiment_id,
+        "git_sha": TP.git_sha(),
+        "git_status_short": TP.git_status(),
+        "launcher_sha256": source_sha256(),
+        "config": {
+            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "num_envs": args.num_envs,
+            "iterations": args.iterations,
+            "warmup_iterations": args.warmup_iterations,
+            "seeds": args.seeds,
+            "modes": modes,
+            "arm_order": [
+                {"seed": seed, "modes": arm_order(modes, index)}
+                for index, seed in enumerate(args.seeds)
+            ],
+            "event_preset": "tracking/lucid_curriculum",
+            "max_delay_steps": args.max_delay,
+            "max_delay_ms": args.max_delay * 5,
+            "controller": {
+                "delta_target": args.delta_target,
+                "kp": args.kp,
+                "ki": args.ki,
+                "alpha": args.alpha,
+                "integral_max": args.integral_max,
+                "return_floor": args.return_floor,
+                "calibration": (
+                    "manuscript mu+3sigma lambda=0 target; integral contribution "
+                    "capped at ki*integral_max=0.02"
+                ),
+            },
+            "training_noise_floors": {"reward": REWARD_FLOOR, "length": LENGTH_FLOOR},
+        },
+        "commands": commands,
+        "runtime": runtime,
+        "arms": arms,
+        "mode_summary": mode_summary,
+        "training_comparison": comparison,
+        "verified": (
+            [
+                "every branch completed and exported a final SONIC-compatible checkpoint",
+                "all five live actuator groups used delayed actuators",
+                "all six DR channels were runtime-scalable",
+                "LUCID received SONIC objective/rewards for its return guard",
+            ]
+            if mechanics_ok
+            else []
+        ),
+        "not_yet_verified": [
+            "held-out ID-clean, OOD-heavy, and 60 ms checkpoint evaluation",
+            "training curves alone do not establish final policy generalization",
+            *("three-seed confirmation" for _ in [0] if len(args.seeds) < 3),
+        ],
+    }
+    receipt_path = args.receipt_dir / f"{experiment_id}.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+    print(json.dumps({"mode_summary": mode_summary, "training_comparison": comparison}, indent=2))
+    print(f"receipt {receipt_path}")
+    return 0 if mechanics_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

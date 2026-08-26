@@ -1,0 +1,44 @@
+# Deployment stress: full six-channel training-envelope DR, except actuation
+# latency is fixed at 12 physics steps (60 ms), beyond the 0-40 ms train range.
+
+defaults:
+  - terms/physics_material@_here_
+  - terms/add_joint_default_pos@_here_
+  - terms/base_com@_here_
+  - terms/push_robot@_here_
+  - terms/randomize_rigid_body_mass@_here_
+  - terms/randomize_action_delay@_here_
+
+_target_: gear_sonic.research.practice_utility.events_reset_safe.LucidEventCfg
+
+randomize_rigid_body_mass:
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      body_names: ".*wrist_yaw.*|torso_link"
+    mass_distribution_params: [0.8, 1.5]
+    operation: "scale"
+
+base_com:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_rigid_body_com
+  mode: "reset"
+
+add_joint_default_pos:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_joint_default_pos
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    pos_distribution_params: [-0.01, 0.01]
+    operation: "add"
+
+physics_material:
+  mode: "reset"
+
+randomize_action_delay:
+  params:
+    delay_range: [12.0, 12.0]
