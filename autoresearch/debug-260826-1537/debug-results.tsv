@@ -1,0 +1,5 @@
+iteration	status	metric	note
+0	discard	claim_launch_safe=false	legacy driver has late receipt, no resume/collision safety, and a weak GPU gate
+1	keep	matrix=51_branches/6912_iterations	one exclusive hash-bound preregistration and combined evaluator index
+2	keep	resume=artifact_verified	atomic blocked/failed/interrupted receipts and fresh retry directories
+3	keep	tests=14/14	strict idle-GPU sampling, forced two-step dry-run/execute, Ruff and diff checks pass

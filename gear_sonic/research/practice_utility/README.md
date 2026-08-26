@@ -130,3 +130,43 @@ python scripts/practice_utility/build_motion_pool.py \
     --pool-id   debug512 \
     --output-dir /data/robotixx/lucid-sonic/manifests
 ```
+
+### Horizon-scaling training
+
+`run_curriculum_comparison.py` remains the compatible single-budget mechanism
+driver. Paper-facing horizon scaling uses
+`run_curriculum_horizon_scaling.py`, whose matrix is fixed to 51 new branches:
+seeds 8603–8604 at 32 iterations and seeds 8600–8604 at 64, 128, and 256
+iterations, with `lucid`, `fixed`, and `off` at every cell.
+
+The first command is deliberately a dry run. It requires a clean Git tree,
+exclusively reserves the campaign paths, audits the sealed historical 32-step
+receipt, and writes the immutable preregistration plus an initially incomplete
+training index. It does not query the GPU.
+
+```bash
+python scripts/practice_utility/run_curriculum_horizon_scaling.py \
+    --campaign-id curriculum_horizon_scaling_v1_20260826
+```
+
+After reviewing that preregistration, the same arguments can execute only via
+the frozen resume path:
+
+```bash
+python scripts/practice_utility/run_curriculum_horizon_scaling.py \
+    --campaign-id curriculum_horizon_scaling_v1_20260826 \
+    --resume --execute
+```
+
+Execution refuses a GPU with any compute process, more than 5% utilization, or
+less than 28,000 MiB free in any of three samples. Every retry gets a fresh,
+collision-exclusive attempt directory. Mutable status and budget receipts are
+atomically updated after every transition; resume re-hashes all completed
+artifacts before skipping them. The combined index points the existing frozen
+evaluator to one legacy-shaped receipt per budget. The 32-step receipt retains
+the historical and new launcher lineages explicitly: its commands and configs
+are audited as equivalent, but their launcher byte hashes differ.
+
+The launcher does not yet enforce disk headroom. Before execution, verify at
+least 90 GiB free on the artifact filesystem for the approximately 74 GiB
+51-branch matrix; adding an immutable storage gate remains a launch blocker.

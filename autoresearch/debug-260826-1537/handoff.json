@@ -1,0 +1,36 @@
+{
+  "kind": "autoresearch_handoff",
+  "schema_version": 1,
+  "mode": "debug",
+  "objective": "Make the exact Track-B horizon matrix safely preregistrable and resumable without launching it.",
+  "status": "implementation_complete_uncommitted",
+  "completed": [
+    "deterministic 51-branch and 6912-iteration matrix",
+    "exclusive immutable preregistration before any GPU query",
+    "hash-bound checkpoint, encoder, code, and configuration inputs",
+    "historical step-32 command/config/artifact compatibility audit",
+    "atomic incremental status and evaluator-compatible budget receipts",
+    "artifact-verified resume with isolated retry attempts",
+    "strict zero-compute-process idle-GPU gate"
+  ],
+  "blocking_findings": [
+    "the implementation must be reviewed and committed before its clean-tree production dry run can succeed",
+    "execution has no automated disk-headroom gate; require at least 90 GiB free for the approximately 74 GiB matrix before launch",
+    "the numerical non-inferiority margin and deployment panels still require a separate immutable evaluator preregistration",
+    "the historical and new step-32 arms have equivalent frozen commands/config but different launcher byte hashes"
+  ],
+  "next_actions": [
+    "run the full practice-utility CPU suite after concurrent Track-A edits settle",
+    "review and commit the Track-B launcher, tests, documentation, and this ledger",
+    "create the production dry-run preregistration only after the GPU is idle and disk headroom is rechecked",
+    "freeze the deployment evaluator margin and panels before opening outcomes"
+  ],
+  "verification": {
+    "focused_tests": "14 passed",
+    "full_suite": "deferred after 1017 passed, 16 failed, and 45 errors in concurrent Track-A sampler work",
+    "style": "targeted Ruff and git diff --check passed",
+    "gpu_queried": false,
+    "gpu_campaign_launched": false,
+    "committed": false
+  }
+}
