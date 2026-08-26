@@ -30,7 +30,7 @@ scan_pool ──► build_split ──► build_probe_manifest ──► [ paire
 | `probe_manifest.py` | Stratified context selection, frozen before any branch runs |
 | `intervention.py` | Local kernels, `(1-ε)ρ + εκ`, identity-preserving residual reweighting |
 | `sampler_adapter.py` | Read/override SONIC's live bin distribution; realized-dose accounting |
-| `rng_capsule.py` | Counter-based common random numbers; full RNG capture |
+| `rng_capsule.py` | Full RNG capture plus counter-stream primitives; production channels are not yet wired to those primitives |
 | `branch_capsule.py` | Save/load/fork paired branches with provenance guards |
 | `quality_metrics.py` | Physical-quality outcomes and quality-qualified success |
 | `latent_gap_probe.py` | LUCID's temporal-VAE gap, as an audited predictor |
@@ -69,6 +69,14 @@ the quantity that drives it makes any improvement partly definitional.
 **Gate B is hard to pass toward more machinery.** Any sufficient simple proxy
 blocks the estimator — and that outcome is a publishable result.
 
+**The current randomness contract is stochastic, not channel-wise CRN.** The
+symmetric-restart identity test proves that two unchanged fresh restarts from one
+full capsule agree. Once an intervention changes the trajectory, however, the live
+friction, push, action-noise, and minibatch channels do not call the counter-stream
+primitives. Claim-bearing probe receipts must therefore say
+`stochastic_potential_outcomes_no_channelwise_crn` and estimate a same-estimand
+noise floor; they must not infer matched random channels from capsule metadata.
+
 ## Verified live
 
 Paired control/intervention branches ran inside real SONIC training. The
@@ -100,17 +108,22 @@ upstream reality:
 | adaptation transient | reward 0.48 → 17.83, episode length 13 → 223 over 24 iterations |
 | frozen campaign | 24 contexts, all 4 failure quartiles, 10 families, **31.4 GPU-hours** |
 
-## Not yet built
+## Not yet claim-ready
 
-Dev-suite `J_eff` evaluation (one pass per branch per horizon), the utility
-estimator, and the residual allocator. The last two are **gated**: Gate B
-authorizes them or nothing does.
+The historical probe manifest has no matched settled origins. The hardened path
+now creates hash-bound origin maps, rebuilds a manifest only from the origins'
+common resident contexts, and audits a separate preregistration bundle before any
+branch can be called claim-grade. Still required are frozen per-context latent-gap
+features, same-estimand noise, deployment-side `J_eff`, calibrated directional
+proxy testing, and a receipt-producing campaign launcher. The utility estimator
+and residual allocator remain **gated**: inverse estimator authorization permits
+them or nothing does.
 
 ## Running
 
 ```bash
 source /data/robotixx/lucid-sonic/lucid_env.sh
-python -m pytest tests/practice_utility/ -q          # 530 tests
+python -m pytest tests/practice_utility/ -q
 
 python scripts/practice_utility/build_motion_pool.py \
     --pool-dir  /data/robotixx/lucid-sonic/pools/debug512/robot_filtered \

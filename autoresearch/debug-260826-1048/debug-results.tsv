@@ -1,0 +1,6 @@
+iteration	status	metric	note
+0	discard	claim_ready=false	baseline lacks capsule resume, receipts, latent-gap feature path, and correct floor
+1	keep	origin_builder_tests=13/13	full origin capsule, checkpoint, and snapshot share one absolute step; dry run resolves 24->36
+2	keep	origin_provenance=bound	robot+SMPL trees and live target FPS are hash-bound; manifest rescans source bytes
+3	keep	preflight_ready=false	shared-control realized dose and directional latent calibration are explicit launch blockers
+4	keep	tests=1047/1047	label path emits only a blocked non-claim receipt until evaluation lineage exists
