@@ -33,7 +33,13 @@ ARMS: dict[str, tuple[str, float, str | None]] = {
     "ta_lucid_50": ("lucid", 0.50, None),
     "ta_yoked_25": ("yoked", 0.25, "ta_lucid_25"),
     "ta_yoked_50": ("yoked", 0.50, "ta_lucid_50"),
+    # Cross-seed yoking: seed s replays the schedule learned on the *next* seed.
+    # Same-seed yoking is bit-identical to its source (deterministic simulator),
+    # so it cannot test online feedback; this can.
+    "ta_yoked_25x": ("yoked", 0.25, "ta_lucid_25"),
+    "ta_yoked_50x": ("yoked", 0.50, "ta_lucid_50"),
 }
+CROSS_SEED_ARMS = {"ta_yoked_25x", "ta_yoked_50x"}
 MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
@@ -56,6 +62,12 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-iterations", type=int, default=10)
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=["lucid", "fixed", "off"])
+    parser.add_argument(
+        "--yoked-source-receipt",
+        type=Path,
+        default=None,
+        help="take yoked schedules from this earlier training receipt instead of this run",
+    )
     parser.add_argument(
         "--consolidation-fraction",
         type=float,
@@ -255,10 +267,11 @@ def main(argv=None) -> int:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"curriculum_comparison_ne{args.num_envs}_{stamp}"
     modes = list(dict.fromkeys(args.modes))
+    source_receipt = json.loads(args.yoked_source_receipt.read_text()) if args.yoked_source_receipt else None
     for mode in modes:
         source = ARMS[mode][2]
-        if source is not None and source not in modes:
-            raise SystemExit(f"arm {mode!r} requires its source arm {source!r} in --modes")
+        if source is not None and source not in modes and source_receipt is None:
+            raise SystemExit(f"arm {mode!r} requires its source arm {source!r} in --modes or --yoked-source-receipt")
     run_specs = []
     for seed_index, seed in enumerate(args.seeds):
         ordered = arm_order(modes, seed_index)
@@ -273,8 +286,17 @@ def main(argv=None) -> int:
         source = ARMS[mode][2]
         if source is None:
             return None
-        source_branch = f"{experiment_id}_s{seed}_{source}"
-        return args.artifact_root / experiment_id / f"seed_{seed}" / source / f"curriculum_{source_branch}.jsonl"
+        source_seed = seed
+        if mode in CROSS_SEED_ARMS:
+            seeds = list(args.seeds)
+            source_seed = seeds[(seeds.index(seed) + 1) % len(seeds)]
+        if source_receipt is not None:
+            for arm in source_receipt["arms"].values():
+                if arm["mode"] == source and int(arm["seed"]) == source_seed:
+                    return Path(arm["curriculum_path"])
+            raise SystemExit(f"no {source!r} seed {source_seed} in {args.yoked_source_receipt}")
+        source_branch = f"{experiment_id}_s{source_seed}_{source}"
+        return args.artifact_root / experiment_id / f"seed_{source_seed}" / source / f"curriculum_{source_branch}.jsonl"
 
     commands = {
         branch_id: build_command(args, mode, seed, branch_id, artifact_dir, schedule_for(seed, mode))
@@ -321,6 +343,8 @@ def main(argv=None) -> int:
                     "curriculum_mode": ARMS[mode][0],
                     "anchor_ratio": ARMS[mode][1],
                     "yoked_source": ARMS[mode][2],
+                    "yoked_cross_seed": mode in CROSS_SEED_ARMS,
+                    "yoked_schedule_path": str(schedule_for(seed, mode)) if ARMS[mode][2] else None,
                 },
                 "tace_final": curriculum[-1].get("tace") if curriculum else None,
                 "consolidation_rows": sum(bool(row.get("consolidation")) for row in curriculum),

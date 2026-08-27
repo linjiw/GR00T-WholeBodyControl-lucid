@@ -75,3 +75,33 @@ def test_tace_arms_build_anchor_and_yoked_overrides(tmp_path):
     import pytest
     with pytest.raises(ValueError, match="schedule"):
         R.build_command(args, "ta_yoked_25", 8600, "b", tmp_path)
+
+
+def test_cross_seed_yoked_uses_next_seed_schedule_from_source_receipt(tmp_path):
+    receipt = {
+        "arms": {
+            f"b{s}": {"mode": "ta_lucid_25", "seed": s, "curriculum_path": f"/art/seed_{s}/c.jsonl"}
+            for s in (8600, 8601, 8602)
+        }
+    }
+    path = tmp_path / "src.json"
+    path.write_text(__import__("json").dumps(receipt))
+    args = R.parse_args(["--checkpoint", "/x.pt", "--iterations", "8", "--warmup-iterations", "2",
+                         "--seeds", "8600", "8601", "8602", "--modes", "ta_yoked_25x",
+                         "--yoked-source-receipt", str(path)])
+    assert "ta_yoked_25x" in R.CROSS_SEED_ARMS
+    # exercise the resolution logic through main's dry run
+    import io, contextlib
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert R.main(["--checkpoint", "/x.pt", "--iterations", "8", "--warmup-iterations", "2",
+                       "--seeds", "8600", "8601", "8602", "--modes", "ta_yoked_25x",
+                       "--yoked-source-receipt", str(path)]) == 0
+    lines = [l for l in out.getvalue().splitlines() if l.startswith("[seed=") or "yoked_schedule_path" in l]
+    pairs = [(lines[k], lines[k + 1]) for k in range(0, len(lines), 2)]
+    resolved = {h.split("seed=")[1].split(" ")[0]: v.split("=")[-1] for h, v in pairs}
+    assert resolved == {
+        "8600": "/art/seed_8601/c.jsonl",
+        "8601": "/art/seed_8602/c.jsonl",
+        "8602": "/art/seed_8600/c.jsonl",
+    }

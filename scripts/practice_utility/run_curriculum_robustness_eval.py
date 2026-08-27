@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO))
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
 
-MODES = ("lucid", "fixed", "off", "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50")
+MODES = ("lucid", "fixed", "off", "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50", "ta_yoked_25x", "ta_yoked_50x")
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
