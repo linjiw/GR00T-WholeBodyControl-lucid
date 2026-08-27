@@ -22,7 +22,19 @@ from scripts.practice_utility import run_throughput_probe as TP
 OBSERVER = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
 CURRICULUM = "gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback"
 CAPSULE = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleCallback"
-MODES = ("lucid", "fixed", "off")
+#: Arm name -> (curriculum mode, anchor ratio, yoked source arm). The TACE arms
+#: pin a fixed cohort of envs to the full envelope (see tace.py); the yoked arm
+#: replays its source arm's lambda trajectory for the same seed with no feedback.
+ARMS: dict[str, tuple[str, float, str | None]] = {
+    "lucid": ("lucid", 0.0, None),
+    "fixed": ("fixed", 0.0, None),
+    "off": ("off", 0.0, None),
+    "ta_lucid_25": ("lucid", 0.25, None),
+    "ta_lucid_50": ("lucid", 0.50, None),
+    "ta_yoked_25": ("yoked", 0.25, "ta_lucid_25"),
+    "ta_yoked_50": ("yoked", 0.50, "ta_lucid_50"),
+}
+MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
     "latent_p90",
@@ -43,7 +55,13 @@ def parse_args(argv=None):
     parser.add_argument("--iterations", type=int, default=32)
     parser.add_argument("--warmup-iterations", type=int, default=10)
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=["lucid", "fixed", "off"])
+    parser.add_argument(
+        "--consolidation-fraction",
+        type=float,
+        default=0.0,
+        help="TACE arms only: final fraction of the budget with every env on the full envelope",
+    )
     parser.add_argument("--max-delay", type=int, default=8)
     parser.add_argument("--delta-target", type=float, default=0.778)
     parser.add_argument("--kp", type=float, default=1.0)
@@ -79,10 +97,34 @@ def arm_order(modes: list[str], seed_index: int) -> list[str]:
     return modes[offset:] + modes[:offset]
 
 
-def build_command(args, mode: str, seed: int, branch_id: str, artifact_dir: Path) -> list[str]:
+def build_command(
+    args,
+    mode: str,
+    seed: int,
+    branch_id: str,
+    artifact_dir: Path,
+    yoked_schedule: Path | None = None,
+) -> list[str]:
     if mode not in MODES:
         raise ValueError(f"unsupported mode {mode!r}")
+    curriculum_mode, anchor_ratio, source = ARMS[mode]
+    if curriculum_mode == "yoked" and yoked_schedule is None:
+        raise ValueError(f"arm {mode!r} needs the {source!r} schedule for seed {seed}")
     capsule_dir = artifact_dir / "capsules"
+    tace = (
+        [
+            f"++callbacks.lucid_curriculum.anchor_ratio={anchor_ratio}",
+            f"++callbacks.lucid_curriculum.anchor_seed={seed}",
+            f"++callbacks.lucid_curriculum.consolidation_fraction={args.consolidation_fraction}",
+        ]
+        if anchor_ratio > 0.0
+        else []
+    )
+    yoked = (
+        [f"++callbacks.lucid_curriculum.yoked_schedule_path={yoked_schedule}"]
+        if curriculum_mode == "yoked"
+        else []
+    )
     return [
         sys.executable,
         str(REPO / "scripts" / "practice_utility" / "train_with_delay.py"),
@@ -107,7 +149,9 @@ def build_command(args, mode: str, seed: int, branch_id: str, artifact_dir: Path
         f"++callbacks.practice_observer.output_dir={artifact_dir}",
         f"++callbacks.lucid_curriculum._target_={CURRICULUM}",
         "++callbacks.lucid_curriculum.enabled=true",
-        f"++callbacks.lucid_curriculum.mode={mode}",
+        f"++callbacks.lucid_curriculum.mode={curriculum_mode}",
+        *tace,
+        *yoked,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
@@ -211,14 +255,29 @@ def main(argv=None) -> int:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"curriculum_comparison_ne{args.num_envs}_{stamp}"
     modes = list(dict.fromkeys(args.modes))
+    for mode in modes:
+        source = ARMS[mode][2]
+        if source is not None and source not in modes:
+            raise SystemExit(f"arm {mode!r} requires its source arm {source!r} in --modes")
     run_specs = []
     for seed_index, seed in enumerate(args.seeds):
-        for mode in arm_order(modes, seed_index):
+        ordered = arm_order(modes, seed_index)
+        # A yoked arm replays its source's schedule, so it must run after it.
+        ordered = [m for m in ordered if ARMS[m][2] is None] + [m for m in ordered if ARMS[m][2]]
+        for mode in ordered:
             branch_id = f"{experiment_id}_s{seed}_{mode}"
             artifact_dir = args.artifact_root / experiment_id / f"seed_{seed}" / mode
             run_specs.append((seed, mode, branch_id, artifact_dir))
+
+    def schedule_for(seed: int, mode: str) -> Path | None:
+        source = ARMS[mode][2]
+        if source is None:
+            return None
+        source_branch = f"{experiment_id}_s{seed}_{source}"
+        return args.artifact_root / experiment_id / f"seed_{seed}" / source / f"curriculum_{source_branch}.jsonl"
+
     commands = {
-        branch_id: build_command(args, mode, seed, branch_id, artifact_dir)
+        branch_id: build_command(args, mode, seed, branch_id, artifact_dir, schedule_for(seed, mode))
         for seed, mode, branch_id, artifact_dir in run_specs
     }
     for seed, mode, branch_id, _ in run_specs:
@@ -258,6 +317,13 @@ def main(argv=None) -> int:
                 ),
                 "return_guard_trips": sum(bool(row.get("guard_tripped")) for row in curriculum),
                 "scalable_terms": curriculum[-1].get("scalable_terms", []) if curriculum else [],
+                "arm_spec": {
+                    "curriculum_mode": ARMS[mode][0],
+                    "anchor_ratio": ARMS[mode][1],
+                    "yoked_source": ARMS[mode][2],
+                },
+                "tace_final": curriculum[-1].get("tace") if curriculum else None,
+                "consolidation_rows": sum(bool(row.get("consolidation")) for row in curriculum),
                 "capsule": str(capsule),
                 "checkpoint": str(checkpoint),
                 "checkpoint_exported": checkpoint.is_file(),
@@ -288,6 +354,12 @@ def main(argv=None) -> int:
     if "lucid" in modes:
         lucid_arms = [arm for arm in arms.values() if arm["mode"] == "lucid"]
         mechanics_ok = mechanics_ok and all(arm["mean_return_observed"] for arm in lucid_arms)
+    for arm in arms.values():
+        ratio = ARMS[arm["mode"]][1]
+        if ratio > 0.0:
+            tace = arm.get("tace_final") or {}
+            expected = round(ratio * args.num_envs)
+            mechanics_ok = mechanics_ok and tace.get("num_anchor") == expected
 
     receipt = {
         "kind": "lucid_three_arm_training_comparison",
@@ -309,6 +381,8 @@ def main(argv=None) -> int:
                 for index, seed in enumerate(args.seeds)
             ],
             "event_preset": "tracking/lucid_curriculum",
+            "arms": {mode: ARMS[mode] for mode in modes},
+            "consolidation_fraction": args.consolidation_fraction,
             "max_delay_steps": args.max_delay,
             "max_delay_ms": args.max_delay * 5,
             "controller": {

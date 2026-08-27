@@ -20,6 +20,8 @@ from typing import Any
 
 from gear_sonic.research.practice_utility import dr_scaling as DS
 from gear_sonic.research.practice_utility import observer as OBS
+from gear_sonic.research.practice_utility import quality_telemetry as QT
+from gear_sonic.research.practice_utility import tace as TACE
 from gear_sonic.research.practice_utility.dr_controller import (
     LucidDRController,
     PIConfig,
@@ -78,9 +80,39 @@ class LucidCurriculumCallback(TrainerCallback):
         warmup_iterations: int = 0,
         resume_state_path: str | None = None,
         max_lambda_step_on_resume: float | None = None,
+        anchor_ratio: float = 0.0,
+        anchor_seed: int | None = None,
+        anchor_reserved_focus_envs: tuple[int, ...] | list[int] = (0,),
+        consolidation_fraction: float = 0.0,
+        yoked_schedule_path: str | None = None,
     ) -> None:
-        if mode not in ("lucid", "fixed", "off"):
-            raise ValueError(f"unknown curriculum mode {mode!r}; expected lucid/fixed/off")
+        if mode not in ("lucid", "fixed", "off", "yoked"):
+            raise ValueError(
+                f"unknown curriculum mode {mode!r}; expected lucid/fixed/off/yoked"
+            )
+        if not 0.0 <= float(anchor_ratio) <= 1.0:
+            raise ValueError(f"anchor_ratio must be in [0, 1], got {anchor_ratio}")
+        if not 0.0 <= float(consolidation_fraction) < 1.0:
+            raise ValueError(
+                f"consolidation_fraction must be in [0, 1), got {consolidation_fraction}"
+            )
+        if mode == "yoked" and not yoked_schedule_path:
+            raise ValueError("mode='yoked' requires yoked_schedule_path")
+        # --- TACE: target-anchored exposure -------------------------------
+        # A fixed cohort of environments always samples the full (lambda = 1)
+        # envelope; the curriculum only moves the rest. alpha = 0 is the plain
+        # curriculum, alpha = 1 is fixed DR under another name.
+        self.anchor_ratio = float(anchor_ratio)
+        self.anchor_seed = anchor_seed
+        self.anchor_reserved_focus_envs = tuple(int(i) for i in anchor_reserved_focus_envs)
+        self.consolidation_fraction = float(consolidation_fraction)
+        self.assignment: TACE.CohortAssignment | None = None
+        self.dispatchers: dict[str, TACE.CohortDispatch] = {}
+        self._consolidating = False
+        self.yoked_schedule_path = yoked_schedule_path
+        self._yoked_schedule: list[float] = []
+        if mode == "yoked":
+            self._yoked_schedule = _load_yoked_schedule(yoked_schedule_path)
         self.enabled = bool(enabled)
         self.mode = mode
         self.observer_branch_id = observer_branch_id
@@ -102,6 +134,8 @@ class LucidCurriculumCallback(TrainerCallback):
             starting_lambda = initial_lambda
         elif mode == "fixed":
             starting_lambda = fixed_lambda
+        elif mode == "yoked":
+            starting_lambda = self._yoked_schedule[0] if self._yoked_schedule else initial_lambda
         else:
             starting_lambda = 0.0
 
@@ -122,6 +156,7 @@ class LucidCurriculumCallback(TrainerCallback):
         self.scalable: list[str] = []
         self.history: list[dict[str, Any]] = []
         self._event_manager: Any = None
+        self._env: Any = None
 
     # ------------------------------------------------------------ lifecycle --
 
@@ -169,7 +204,16 @@ class LucidCurriculumCallback(TrainerCallback):
         if step % self.update_every:
             return control
 
-        if self.mode == "fixed":
+        if self._enter_consolidation_if_due(args, state, step):
+            record = {
+                "global_step": step,
+                "mode": self.mode,
+                "lambda": 1.0,
+                "gap_quantile": None,
+                "consolidation": True,
+            }
+            self._apply(1.0)
+        elif self.mode == "fixed":
             record = {
                 "global_step": step,
                 "mode": "fixed",
@@ -180,6 +224,22 @@ class LucidCurriculumCallback(TrainerCallback):
         elif self.mode == "off":
             record = {"global_step": step, "mode": "off", "lambda": 0.0, "gap_quantile": None}
             self._apply(0.0)
+        elif self.mode == "yoked":
+            # Replay a recorded lambda trajectory, indexed by iteration since
+            # (re)start, with no feedback. The attribution control for TA-LUCID:
+            # same schedule shape and dose, minus the online gap.
+            index = step - (self._start_step or 0)
+            lam = self._yoked_lambda(index)
+            self.controller.lambda_value = lam
+            self._apply(lam)
+            record = {
+                "global_step": step,
+                "mode": "yoked",
+                "lambda": lam,
+                "gap_quantile": None,
+                "yoked_index": index,
+                "yoked_schedule_length": len(self._yoked_schedule),
+            }
         else:
             gaps = self._gaps()
             mean_return = self._mean_return(state)
@@ -195,6 +255,8 @@ class LucidCurriculumCallback(TrainerCallback):
         record["scalable_terms"] = self.scalable
         if self._resumed_from is not None:
             record["resumed_from"] = self._resumed_from
+        if self.assignment is not None:
+            record["tace"] = self._tace_telemetry()
         self.history.append(record)
         self._write(record)
         # Persist every update, so a run killed between checkpoints still
@@ -211,6 +273,18 @@ class LucidCurriculumCallback(TrainerCallback):
         self._event_manager = manager
         self.baseline = DS.capture_baseline(manager)
         self.scalable = DS.scalable_terms(manager)
+        self._env = env
+        if self.anchor_ratio > 0.0 and self.assignment is None:
+            num_envs = _num_envs_of(env, manager)
+            if num_envs is None:
+                raise RuntimeError("TACE needs the environment count to assign cohorts")
+            reserved = self.anchor_reserved_focus_envs
+            observer = OBS.get_active_observer(self.observer_branch_id)
+            if observer is not None:
+                reserved = tuple(sorted({*reserved, int(observer.tracked_env)}))
+            seed = self.anchor_seed if self.anchor_seed is not None else 0
+            self.assignment = TACE.assign_cohorts(num_envs, self.anchor_ratio, seed, reserved)
+            self.dispatchers = TACE.install(manager, self.baseline, self.assignment)
 
     def _apply(self, lambda_value: float) -> None:
         if self._event_manager is None or self.baseline is None:
@@ -240,6 +314,49 @@ class LucidCurriculumCallback(TrainerCallback):
                         continue
         return None
 
+    # ------------------------------------------------------------------ TACE --
+
+    def _enter_consolidation_if_due(self, args: Any, state: Any, step: int) -> bool:
+        """Final target-only phase: every cohort on the full envelope."""
+        if self.consolidation_fraction <= 0.0:
+            return False
+        if self._consolidating:
+            return True
+        total = None
+        for source in (state, args):
+            value = getattr(source, "max_steps", None) if source is not None else None
+            if isinstance(value, (int, float)) and value > 0:
+                total = float(value)
+                break
+        if total is None:
+            return False
+        if step >= total * (1.0 - self.consolidation_fraction):
+            self._consolidating = True
+            for dispatch in self.dispatchers.values():
+                dispatch.all_envs_mode = True
+            return True
+        return False
+
+    def _yoked_lambda(self, index: int) -> float:
+        if not self._yoked_schedule:
+            return self.controller.lambda_value
+        index = max(0, min(int(index), len(self._yoked_schedule) - 1))
+        return float(self._yoked_schedule[index])
+
+    def _tace_telemetry(self) -> dict[str, Any]:
+        assert self.assignment is not None
+        out: dict[str, Any] = {
+            "num_anchor": self.assignment.num_anchor,
+            "num_focus": self.assignment.num_focus,
+            "anchor_ratio": self.assignment.anchor_ratio,
+            "consolidating": self._consolidating,
+            "dispatch": {name: d.telemetry() for name, d in self.dispatchers.items()},
+        }
+        robot = QT._scene_entity(self._env, "robot") if self._env is not None else None
+        if robot is not None:
+            out.update(TACE.cohort_delay_stats(robot, self.assignment.mask()))
+        return out
+
     # ------------------------------------------------------------ persistence --
 
     def state_dict(self) -> dict[str, Any]:
@@ -250,6 +367,8 @@ class LucidCurriculumCallback(TrainerCallback):
             "branch_id": self.branch_id,
             "controller": self.controller.state_dict(),
             "scalable_terms": self.scalable,
+            "tace": self.assignment.to_dict() if self.assignment is not None else None,
+            "consolidating": self._consolidating,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -316,3 +435,35 @@ def _event_manager_of(env: Any) -> Any:
         if manager is not None:
             return manager
     return None
+
+
+def _num_envs_of(env: Any, manager: Any) -> int | None:
+    for candidate in (env, getattr(env, "env", None), getattr(env, "unwrapped", None), manager):
+        if candidate is None:
+            continue
+        scene = getattr(candidate, "scene", None)
+        for holder in (scene, candidate):
+            value = getattr(holder, "num_envs", None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def _load_yoked_schedule(path: str | None) -> list[float]:
+    """Lambda per iteration from a curriculum jsonl written by a lucid run."""
+    if not path:
+        return []
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(f"yoked schedule not found: {path}")
+    values: list[float] = []
+    for line in source.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        if "lambda" in record:
+            values.append(float(record["lambda"]))
+    if not values:
+        raise ValueError(f"yoked schedule has no lambda records: {path}")
+    return values

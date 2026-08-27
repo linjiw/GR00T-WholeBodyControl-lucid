@@ -18,12 +18,18 @@ sys.path.insert(0, str(REPO))
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
 
-MODES = ("lucid", "fixed", "off")
+MODES = ("lucid", "fixed", "off", "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50")
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
     "latency_60ms": "tracking/lucid_eval_latency_60ms",
+    # Robustness-profile cells: full latency envelope with the five non-latency
+    # channels scaled to a fraction of their training maximum.
+    "dr_025": "tracking/lucid_curriculum",
+    "dr_050": "tracking/lucid_curriculum",
+    "dr_075": "tracking/lucid_curriculum",
 }
+PRESET_DR_SCALE = {"dr_025": 0.25, "dr_050": 0.5, "dr_075": 0.75}
 CALLBACK = "gear_sonic.research.practice_utility.eval_callback.PracticeRobustnessEvalCallback"
 SUMMARY_METRICS = (
     "success_rate",
@@ -59,7 +65,9 @@ def parse_args(argv=None):
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
-    parser.add_argument("--presets", nargs="+", choices=tuple(PRESETS), default=list(PRESETS))
+    parser.add_argument(
+        "--presets", nargs="+", choices=tuple(PRESETS), default=["id_clean", "dr_full", "latency_60ms"]
+    )
     parser.add_argument("--eval-seed-base", type=int, default=8700)
     parser.add_argument("--max-delay", type=int, default=12)
     parser.add_argument(
@@ -234,6 +242,11 @@ def build_command(
         f"++callbacks.practice_eval.output_dir={output_dir}",
         f"++callbacks.practice_eval.preset_id={preset}",
         f"++callbacks.practice_eval.branch_id={branch_id}",
+        *(
+            [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
+            if preset in PRESET_DR_SCALE
+            else []
+        ),
     ]
 
 
@@ -328,7 +341,7 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
         return False
     if preset == "id_clean":
         return delay.get("action_delay_max_steps") == 0
-    if preset == "dr_full":
+    if preset == "dr_full" or preset in PRESET_DR_SCALE:
         return (
             delay.get("action_delay_min_steps", -1) >= 0
             and delay.get("action_delay_max_steps") == 8

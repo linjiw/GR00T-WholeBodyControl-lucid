@@ -39,3 +39,20 @@ lucid_curriculum:
   # Optional cap on how far lambda may jump on resume, for when the restored
   # intensity does not match the environment about to be trained in.
   max_lambda_step_on_resume: null
+
+  # ---- TACE: target-anchored curriculum exposure -------------------------
+  # Fraction of parallel envs pinned to the full (lambda=1) envelope for the whole
+  # run; the curriculum only moves the remaining "focus" envs. 0 disables.
+  # Cohorts are a fixed seeded permutation recorded in the curriculum state; the
+  # observer's tracked env is always focus so the controller never reads anchor
+  # evidence. The cohort tag never reaches the policy observation.
+  anchor_ratio: 0.0
+  anchor_seed: null            # defaults to 0; campaigns pass the training seed
+  anchor_reserved_focus_envs: [0]
+  # Final fraction of the budget on which every env samples the full envelope
+  # and the controller is frozen. 0 disables (the default -- an abrupt post-hoc
+  # full-DR phase was a measured negative result, so this is a tested variable).
+  consolidation_fraction: 0.0
+  # mode=yoked replays the lambda column of a lucid run's curriculum_*.jsonl,
+  # iteration by iteration, with no feedback: the attribution control.
+  yoked_schedule_path: null
