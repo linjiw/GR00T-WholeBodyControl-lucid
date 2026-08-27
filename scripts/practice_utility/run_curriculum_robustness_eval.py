@@ -64,7 +64,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=MODES,
+        default=None,
+        help="defaults to the arms present in the training receipt",
+    )
     parser.add_argument(
         "--presets", nargs="+", choices=tuple(PRESETS), default=["id_clean", "dr_full", "latency_60ms"]
     )
@@ -309,15 +315,17 @@ def aggregate(runs: dict[str, dict[str, Any]]) -> dict[str, Any]:
 def paired_comparisons(summary: dict[str, Any]) -> dict[str, Any]:
     comparisons = {}
     for preset, modes in summary.items():
-        if "lucid" not in modes:
-            continue
         comparisons[preset] = {}
-        for other in ("fixed", "off"):
-            if other not in modes:
-                continue
+        pairs = [
+            (treatment, other)
+            for treatment in modes
+            for other in ("fixed", "off", "lucid")
+            if other in modes and treatment != other and treatment not in ("fixed", "off")
+        ]
+        for treatment, other in pairs:
             metrics = {}
             for metric in SUMMARY_METRICS:
-                lucid = modes["lucid"]["metrics"][metric]["per_checkpoint_seed"]
+                lucid = modes[treatment]["metrics"][metric]["per_checkpoint_seed"]
                 reference = modes[other]["metrics"][metric]["per_checkpoint_seed"]
                 common = sorted(set(lucid) & set(reference))
                 deltas = {
@@ -327,11 +335,12 @@ def paired_comparisons(summary: dict[str, Any]) -> dict[str, Any]:
                 }
                 values = list(deltas.values())
                 metrics[metric] = {
+                    "treatment_minus_reference_per_seed": deltas,
                     "lucid_minus_reference_per_seed": deltas,
                     "mean_delta": statistics.fmean(values) if values else None,
                     "favorable_direction": "positive" if metric in HIGHER_IS_BETTER else "negative",
                 }
-            comparisons[preset][f"lucid_vs_{other}"] = metrics
+            comparisons[preset][f"{treatment}_vs_{other}"] = metrics
     return comparisons
 
 
@@ -357,7 +366,8 @@ def main(argv=None) -> int:
         args.pool_manifest, args.split_manifest, args.partition, args.suite_root
     )
     checkpoints = checkpoint_index(training_receipt)
-    modes = list(dict.fromkeys(args.modes))
+    receipt_modes = list(dict.fromkeys(arm["mode"] for arm in training_receipt["arms"].values()))
+    modes = list(dict.fromkeys(args.modes)) if args.modes else receipt_modes
     presets = list(dict.fromkeys(args.presets))
     specs = []
     for seed_index, checkpoint_seed in enumerate(args.seeds):

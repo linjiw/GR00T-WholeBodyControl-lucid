@@ -208,12 +208,33 @@ def source_sha256() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+def wait_for_gpu(min_free_mib: int, max_wait_seconds: float, poll_seconds: float = 30.0) -> dict[str, float]:
+    """Block until the shared GPU has ``min_free_mib`` free, or give up.
+
+    The GPU is shared with other users, so a campaign must be able to queue
+    behind their jobs rather than die at the first arm. Training metrics are
+    valid under contention; only wall-clock is not, and it is recorded.
+    """
+    import time
+
+    deadline = time.monotonic() + max_wait_seconds
+    snapshot = TP.gpu_snapshot()
+    while snapshot["free_mib"] < min_free_mib:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"GPU capacity gate failed: {snapshot['free_mib']:.0f} MiB free < {min_free_mib} MiB"
+                f" after waiting {max_wait_seconds:.0f} s"
+            )
+        time.sleep(poll_seconds)
+        snapshot = TP.gpu_snapshot()
+    return snapshot
+
+
 def run_arm(command: list[str], log_path: Path, min_free_mib: int) -> dict[str, Any]:
-    initial_gpu = TP.gpu_snapshot()
-    if initial_gpu["free_mib"] < min_free_mib:
-        raise RuntimeError(
-            f"GPU capacity gate failed: {initial_gpu['free_mib']:.0f} MiB free < {min_free_mib} MiB"
-        )
+    import os
+
+    max_wait = float(os.environ.get("LUCID_GPU_WAIT_SECONDS", "0"))
+    initial_gpu = wait_for_gpu(min_free_mib, max_wait)
     samples: list[dict[str, float]] = []
     stop = threading.Event()
 
