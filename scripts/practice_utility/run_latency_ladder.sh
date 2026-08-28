@@ -20,10 +20,11 @@ LOG="$OUT/lucid_s_driver.log"
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 receipt_of() { grep -o "receipt [^ ]*json" "$1" | tail -1 | cut -d' ' -f2; }
 
-# Chained behind the budget curve rather than behind stages 9/10, so the two
-# never contend for the one card.
-say "stage 11 (latency ladder) armed; waiting for the budget curve"
-while ! grep -q "budget curve done" "$LOG" 2>/dev/null; do sleep 120; done
+# Last in the chain, so it can ladder every arm the programme produced --
+# including the latency-only arms, which are the ones the ladder exists to
+# measure. One card, so the drivers are strictly sequential.
+say "stage 11 (latency ladder) armed; waiting for stage 13"
+while ! grep -q "stage 13 done" "$LOG" 2>/dev/null; do sleep 120; done
 
 ladder() {  # $1 label, $2 training receipt, $3 stdout log, $4.. modes
   local label="$1" receipt="$2" log="$3"; shift 3
@@ -41,6 +42,7 @@ ladder() {  # $1 label, $2 training receipt, $3 stdout log, $4.. modes
 S7=$(receipt_of "$OUT/stage7_chattr_stdout.log")
 S8=$(receipt_of "$OUT/stage8_lucids_stdout.log")
 S9=$(receipt_of "$OUT/stage9_latcap_stdout.log")
+S13=$(receipt_of "$OUT/stage13_latonly_stdout.log")
 
 ladder "origin" "$LUCID_ROOT/manifests/origin_step24_local_pseudo_receipt.json" \
   "$OUT/ladder_origin_stdout.log"
@@ -48,5 +50,10 @@ ladder "stage7 (off, fixed)" "$S7" "$OUT/ladder_stage7_stdout.log" off fixed
 ladder "stage8 (ta_lucid_50_s4_rg)" "$S8" "$OUT/ladder_stage8_stdout.log" ta_lucid_50_s4_rg
 ladder "stage9 (ta_lucid_50_latcap_s4_rg)" "$S9" "$OUT/ladder_stage9_stdout.log" \
   ta_lucid_50_latcap_s4_rg
+# The latency-only arms are the ones this ladder was built to measure: they are
+# the only arms whose training targeted the axis it varies.
+ladder "stage13 (latency-only)" "$S13" "$OUT/ladder_stage13_stdout.log" \
+  lucid_latonly_s4_rg ta_lucid_50_latonly_s4_rg
+ladder "stage7 (fixed_latonly)" "$S7" "$OUT/ladder_fixed_latonly_stdout.log" fixed_latonly
 
 say "=== latency ladder done ==="
