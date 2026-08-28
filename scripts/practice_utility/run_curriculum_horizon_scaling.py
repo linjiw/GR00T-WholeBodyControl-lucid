@@ -36,6 +36,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from gear_sonic.research.practice_utility import branch_capsule as BC  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 from scripts.practice_utility import (  # noqa: E402
     run_curriculum_comparison as CC,
     run_latency_ab as LA,
@@ -191,25 +192,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
     parser.add_argument(
         "--encoder",
-        default="/data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt",
+        default=str(LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"),
     )
     parser.add_argument(
         "--historical-32-receipt",
         type=Path,
-        default=Path(
-            "/data/robotixx/lucid-sonic/manifests/"
-            "curriculum_comparison_ne128_20260820_143058.json"
-        ),
+        default=LUCID_ROOT / "manifests/curriculum_comparison_ne128_20260820_143058.json",
     )
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/curriculum_horizon_scaling"),
+        default=LUCID_ROOT / "artifacts/curriculum_horizon_scaling",
     )
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     parser.add_argument("--min-free-mib", type=int, default=28000)
     parser.add_argument("--max-gpu-util-pct", type=float, default=5.0)

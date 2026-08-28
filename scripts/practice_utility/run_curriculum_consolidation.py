@@ -21,6 +21,7 @@ from gear_sonic.research.practice_utility import branch_capsule as BC  # noqa: E
 from scripts.practice_utility import run_curriculum_comparison as CC  # noqa: E402
 from scripts.practice_utility import run_latency_ab as LA
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 OBSERVER = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
 CURRICULUM = "gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback"
@@ -42,10 +43,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--source-training-receipt",
         type=Path,
-        default=Path(
-            "/data/robotixx/lucid-sonic/manifests/"
-            "curriculum_comparison_ne128_20260820_143058.json"
-        ),
+        default=LUCID_ROOT / "manifests/curriculum_comparison_ne128_20260820_143058.json",
     )
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--continuation-iterations", type=int, default=16)
@@ -55,16 +53,16 @@ def parse_args(argv=None):
     parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
     parser.add_argument(
         "--encoder",
-        default="/data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt",
+        default=str(LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"),
     )
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/curriculum_consolidation"),
+        default=LUCID_ROOT / "artifacts/curriculum_consolidation",
     )
-    parser.add_argument("--log-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/outputs"))
+    parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
     parser.add_argument(
-        "--receipt-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/manifests")
+        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

@@ -19,6 +19,7 @@ from gear_sonic.research.practice_utility import run_log as RL
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_resume_equivalence as RE
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 
 def parse_args(argv=None):
@@ -29,9 +30,9 @@ def parse_args(argv=None):
     parser.add_argument("--total-iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=8500)
     parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
-    parser.add_argument("--log-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/outputs"))
+    parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
     parser.add_argument(
-        "--receipt-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/manifests")
+        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

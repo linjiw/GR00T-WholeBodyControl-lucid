@@ -11,11 +11,9 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT
 
-DEFAULT_DISCOVERY = Path(
-    "/data/robotixx/lucid-sonic/manifests/"
-    "latency_distribution_discovery_ne32_20260820_232545.json"
-)
+DEFAULT_DISCOVERY = LUCID_ROOT / "manifests/latency_distribution_discovery_ne32_20260820_232545.json"
 
 
 def parse_args(argv=None):
@@ -27,7 +25,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     return parser.parse_args(argv)
 

@@ -47,6 +47,7 @@ from gear_sonic.research.practice_utility import dose_plan as DP
 from gear_sonic.research.practice_utility.schema import ContextKey, sha256_of
 from scripts.practice_utility import create_probe_origins as CPO
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 CONTEXT_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeContextCallback"
 RESUME_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleResumeCallback"
@@ -141,22 +142,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/passive_dose_smoke"),
+        default=LUCID_ROOT / "artifacts/passive_dose_smoke",
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/outputs"),
+        default=LUCID_ROOT / "outputs",
     )
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     parser.add_argument(
         "--gpu-lock",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/.passive_dose_smoke.gpu.lock"),
+        default=LUCID_ROOT / ".passive_dose_smoke.gpu.lock",
     )
     parser.add_argument("--min-free-mib", type=int, default=28000)
     parser.add_argument("--max-gpu-util-pct", type=float, default=5.0)
@@ -903,7 +904,7 @@ def run_command(
 
 def _runtime_env() -> dict[str, str]:
     env = dict(os.environ)
-    env.setdefault("TMPDIR", "/data/robotixx/lucid-sonic/tmp")
+    env.setdefault("TMPDIR", str(LUCID_ROOT / "tmp"))
     env.setdefault("WANDB_MODE", "offline")
     return env
 

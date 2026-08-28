@@ -64,6 +64,7 @@ from gear_sonic.research.practice_utility.schema import (  # noqa: E402
     DoseReport,
     sha256_of,
 )
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 #: Training-side efficacy metric used only by the explicit exploratory path.
 FALLBACK_EFFICACY = "Mean rewards"
@@ -159,7 +160,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/outputs"),
+        default=LUCID_ROOT / "outputs",
         help="training logs; read only in exploratory fallback mode",
     )
     parser.add_argument("--output", required=True, type=Path)

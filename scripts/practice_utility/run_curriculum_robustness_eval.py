@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO))
 
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 MODES = ("lucid", "fixed", "off", "origin", "fixed_nolat", "fixed_latonly", "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50", "ta_yoked_25x", "ta_yoked_50x")
 PRESETS = {
@@ -57,10 +58,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--training-receipt",
         type=Path,
-        default=Path(
-            "/data/robotixx/lucid-sonic/manifests/"
-            "curriculum_comparison_ne128_20260820_143058.json"
-        ),
+        default=LUCID_ROOT / "manifests/curriculum_comparison_ne128_20260820_143058.json",
     )
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
@@ -84,18 +82,18 @@ def parse_args(argv=None):
     parser.add_argument(
         "--pool-manifest",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests/pool_debug512.json"),
+        default=LUCID_ROOT / "manifests/pool_debug512.json",
     )
     parser.add_argument(
         "--split-manifest",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests/split_debug512_content.json"),
+        default=LUCID_ROOT / "manifests/split_debug512_content.json",
     )
     parser.add_argument("--partition", default="dev")
     parser.add_argument(
         "--suite-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/pools/debug512/content_dev"),
+        default=LUCID_ROOT / "pools/debug512/content_dev",
     )
     parser.add_argument(
         "--smpl-motion-file",
@@ -104,11 +102,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/curriculum_robustness_eval"),
+        default=LUCID_ROOT / "artifacts/curriculum_robustness_eval",
     )
-    parser.add_argument("--log-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/outputs"))
+    parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
     parser.add_argument(
-        "--receipt-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/manifests")
+        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

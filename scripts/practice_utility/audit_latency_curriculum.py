@@ -11,11 +11,10 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT
 
 REPO = Path(__file__).resolve().parents[2]
-DEFAULT_RECEIPT = Path(
-    "/data/robotixx/lucid-sonic/manifests/" "curriculum_comparison_ne128_20260820_143058.json"
-)
+DEFAULT_RECEIPT = LUCID_ROOT / "manifests/curriculum_comparison_ne128_20260820_143058.json"
 
 
 def parse_args(argv=None):
@@ -24,7 +23,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     return parser.parse_args(argv)
 

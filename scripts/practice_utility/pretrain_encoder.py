@@ -21,11 +21,11 @@ that produced it.
 
 Example
 -------
-    source /data/robotixx/lucid-sonic/lucid_env.sh
+    source $LUCID_ROOT/lucid_env.sh
     python scripts/practice_utility/pretrain_encoder.py \\
-        --pool-manifest  /data/robotixx/lucid-sonic/manifests/pool_debug512.json \\
-        --split-manifest /data/robotixx/lucid-sonic/manifests/split_debug512_performer.json \\
-        --output /data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt
+        --pool-manifest  $LUCID_ROOT/manifests/pool_debug512.json \\
+        --split-manifest $LUCID_ROOT/manifests/split_debug512_performer.json \\
+        --output $LUCID_ROOT/artifacts/lucid_encoder_debug512.pt
 """
 
 from __future__ import annotations

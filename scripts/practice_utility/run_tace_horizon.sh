@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Stage 5: 128-iteration horizon cell, 4 arms x 3 seeds, after stage 4 finishes.
 set -uo pipefail
-source /data/robotixx/lucid-sonic/lucid_env.sh
-cd /home/robotixx/lucid/GR00T-WholeBodyControl
+LUCID_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${LUCID_ENV_SH:-$LUCID_REPO/../env/lucid_env.sh}"
+cd "$LUCID_REPO"
 export LUCID_GPU_WAIT_SECONDS=43200
 MIN_FREE=11000
 CKPT=logs_rl/TRL_G1_Track/manager/universal_token/all_modes/sonic_release_test-20260818_141446/model_step_000024.pt
-OUT=/data/robotixx/lucid-sonic/outputs
+OUT="$LUCID_ROOT/outputs"
 LOG=$OUT/tace_pilot_driver.log
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 until grep -q "stage 4 done" "$LOG"; do sleep 60; done

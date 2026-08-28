@@ -2,13 +2,14 @@
 # Capacity-gated TACE pilot: smoke -> 32-iter four-arm comparison -> frozen eval.
 # Waits for the shared GPU instead of failing; every stage writes its receipt.
 set -uo pipefail
-source /data/robotixx/lucid-sonic/lucid_env.sh
-cd /home/robotixx/lucid/GR00T-WholeBodyControl
+LUCID_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${LUCID_ENV_SH:-$LUCID_REPO/../env/lucid_env.sh}"
+cd "$LUCID_REPO"
 export LUCID_GPU_WAIT_SECONDS=${LUCID_GPU_WAIT_SECONDS:-43200}   # 12 h per arm max
 MIN_FREE=${MIN_FREE:-11000}
 CKPT=logs_rl/TRL_G1_Track/manager/universal_token/all_modes/sonic_release_test-20260818_141446/model_step_000024.pt
-OUT=/data/robotixx/lucid-sonic/outputs
-MAN=/data/robotixx/lucid-sonic/manifests
+OUT="$LUCID_ROOT/outputs"
+MAN="$LUCID_ROOT/manifests"
 LOG=$OUT/tace_pilot_driver.log
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "[$(stamp)] $*" | tee -a "$LOG"; }

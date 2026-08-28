@@ -21,8 +21,9 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from gear_sonic.research.practice_utility import probe_campaign as PC  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
-DEFAULT_MANIFEST = Path("/data/robotixx/lucid-sonic/manifests/probe_screen_v1_late.json")
+DEFAULT_MANIFEST = LUCID_ROOT / "manifests/probe_screen_v1_late.json"
 
 
 def parse_args(argv=None):

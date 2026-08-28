@@ -46,12 +46,13 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from gear_sonic.research.practice_utility import branch_capsule as BC  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeContextCallback"
 CAPSULE_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleCallback"
 RESUME_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleResumeCallback"
 OBSERVER_CALLBACK = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
-DEFAULT_ENCODER = Path("/data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt")
+DEFAULT_ENCODER = LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"
 
 
 def parse_args(argv=None):
@@ -90,7 +91,7 @@ def parse_args(argv=None):
     parser.add_argument("--motion-file", default="data/motion_lib_bones_seed/robot_filtered")
     parser.add_argument("--smpl-motion-file", default="data/motion_lib_bones_seed/smpl_filtered")
     parser.add_argument(
-        "--artifact-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/artifacts")
+        "--artifact-dir", type=Path, default=LUCID_ROOT / "artifacts"
     )
     parser.add_argument("--pool-manifest", type=Path, default=None)
     parser.add_argument(
@@ -296,7 +297,7 @@ def main(argv=None) -> int:
         )
 
     env = dict(os.environ)
-    env.setdefault("TMPDIR", "/data/robotixx/lucid-sonic/tmp")
+    env.setdefault("TMPDIR", str(LUCID_ROOT / "tmp"))
     env.setdefault("WANDB_MODE", "offline")
     return subprocess.call(command, cwd=str(REPO), env=env)
 

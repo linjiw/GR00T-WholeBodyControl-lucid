@@ -11,17 +11,17 @@ checkout.
 """
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
 from gear_sonic.research.practice_utility import latent_gap_probe as L
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT
 
-ARTIFACT = Path("/data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt")
-POOL = Path("/data/robotixx/lucid-sonic/manifests/pool_debug512.json")
-SPLIT = Path("/data/robotixx/lucid-sonic/manifests/split_debug512_performer.json")
+ARTIFACT = LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"
+POOL = LUCID_ROOT / "manifests/pool_debug512.json"
+SPLIT = LUCID_ROOT / "manifests/split_debug512_performer.json"
 
 pytestmark = pytest.mark.skipif(
     not (ARTIFACT.exists() and POOL.exists() and SPLIT.exists()),

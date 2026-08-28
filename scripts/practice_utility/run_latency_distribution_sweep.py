@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO))
 from scripts.practice_utility import run_curriculum_robustness_eval as CR
 from scripts.practice_utility import run_latency_ab as LA
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 MODES = ("lucid", "fixed", "off")
 EXPECTED_RESET_TERMS = CR.EXPECTED_DR_TERMS
@@ -124,17 +125,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--suite-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/pools/debug512/latency_surface"),
+        default=LUCID_ROOT / "pools/debug512/latency_surface",
     )
     parser.add_argument("--smpl-motion-file", default="data/motion_lib_bones_seed/smpl_filtered")
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/latency_distribution_sweep"),
+        default=LUCID_ROOT / "artifacts/latency_distribution_sweep",
     )
-    parser.add_argument("--log-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/outputs"))
+    parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
     parser.add_argument(
-        "--receipt-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/manifests")
+        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument(

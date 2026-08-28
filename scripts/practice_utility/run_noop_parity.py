@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO))
 from gear_sonic.research.practice_utility import run_log as RL  # noqa: E402
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 OBSERVER = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
 CURRICULUM = "gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback"
@@ -33,12 +34,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/outputs"),
+        default=LUCID_ROOT / "outputs",
     )
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

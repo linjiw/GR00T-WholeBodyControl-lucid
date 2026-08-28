@@ -16,11 +16,11 @@ hide which generalization was actually measured.
 
 Example
 -------
-    source /data/robotixx/lucid-sonic/lucid_env.sh
+    source $LUCID_ROOT/lucid_env.sh
     python scripts/practice_utility/build_motion_pool.py \\
-        --pool-dir /data/robotixx/lucid-sonic/pools/debug512/robot_filtered \\
+        --pool-dir $LUCID_ROOT/pools/debug512/robot_filtered \\
         --pool-id debug512 \\
-        --output-dir /data/robotixx/lucid-sonic/manifests
+        --output-dir $LUCID_ROOT/manifests
 """
 
 from __future__ import annotations

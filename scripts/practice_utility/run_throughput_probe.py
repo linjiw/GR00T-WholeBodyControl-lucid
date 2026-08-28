@@ -24,6 +24,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from gear_sonic.research.practice_utility import run_log as RL  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 OBSERVER = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
 
@@ -40,22 +41,22 @@ def parse_args(argv=None):
     parser.add_argument("--smpl-motion-file", default="data/motion_lib_bones_seed/smpl_filtered")
     parser.add_argument(
         "--encoder",
-        default="/data/robotixx/lucid-sonic/artifacts/lucid_encoder_debug512.pt",
+        default=str(LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"),
     )
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/throughput_idle"),
+        default=LUCID_ROOT / "artifacts/throughput_idle",
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/outputs"),
+        default=LUCID_ROOT / "outputs",
     )
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

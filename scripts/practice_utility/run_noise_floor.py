@@ -42,6 +42,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from gear_sonic.research.practice_utility import run_log as RL  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeContextCallback"
 
@@ -64,9 +65,9 @@ def parse_args(argv=None):
                              "context in --snapshot")
     parser.add_argument("--snapshot", type=Path, required=False)
     parser.add_argument("--out-dir", type=Path,
-                        default=Path("/data/robotixx/lucid-sonic/artifacts/noise_floor"))
+                        default=LUCID_ROOT / "artifacts/noise_floor")
     parser.add_argument("--log-dir", type=Path,
-                        default=Path("/data/robotixx/lucid-sonic/outputs"))
+                        default=LUCID_ROOT / "outputs")
     parser.add_argument("--base-seed", type=int, default=1000)
     parser.add_argument("--execute", action="store_true")
     return parser.parse_args(argv)
@@ -118,7 +119,7 @@ def build_command(args, seed, role, context, branch_dir) -> list[str]:
 
 def run(command, log_path) -> tuple[int, float]:
     env = dict(os.environ)
-    env.setdefault("TMPDIR", "/data/robotixx/lucid-sonic/tmp")
+    env.setdefault("TMPDIR", str(LUCID_ROOT / "tmp"))
     env.setdefault("WANDB_MODE", "offline")
     started = time.time()
     with open(log_path, "w") as handle:

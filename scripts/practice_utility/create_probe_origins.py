@@ -42,6 +42,7 @@ from gear_sonic.research.practice_utility import motion_pool as MP
 from gear_sonic.research.practice_utility import run_log as RL
 from scripts.practice_utility import run_latency_ab as LA
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 CONTEXT_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeContextCallback"
 CAPSULE_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleCallback"
@@ -50,8 +51,8 @@ TRAILING_WINDOW = 4
 REWARD_STABILITY_LIMIT = 2.0 * 0.0333
 LENGTH_STABILITY_LIMIT = 2.0 * 0.0314
 MIN_COMMON_CONTEXTS = 24
-DEFAULT_POOL_MANIFEST = Path("/data/robotixx/lucid-sonic/manifests/pool_debug512.json")
-DEFAULT_DEV_SUITE = Path("/data/robotixx/lucid-sonic/manifests/split_debug512_performer.json")
+DEFAULT_POOL_MANIFEST = LUCID_ROOT / "manifests/pool_debug512.json"
+DEFAULT_DEV_SUITE = LUCID_ROOT / "manifests/split_debug512_performer.json"
 
 
 def parse_args(argv=None):
@@ -75,11 +76,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/probe_origins"),
+        default=LUCID_ROOT / "artifacts/probe_origins",
     )
-    parser.add_argument("--log-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/outputs"))
+    parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
     parser.add_argument(
-        "--receipt-dir", type=Path, default=Path("/data/robotixx/lucid-sonic/manifests")
+        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

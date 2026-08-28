@@ -19,6 +19,7 @@ from gear_sonic.research.practice_utility import branch_capsule as BC  # noqa: E
 from gear_sonic.research.practice_utility import run_log as RL
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 CAPSULE_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleCallback"
 RESUME_CALLBACK = "gear_sonic.research.practice_utility.callbacks.PracticeCapsuleResumeCallback"
@@ -38,17 +39,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/artifacts/resume_equivalence"),
+        default=LUCID_ROOT / "artifacts/resume_equivalence",
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/outputs"),
+        default=LUCID_ROOT / "outputs",
     )
     parser.add_argument(
         "--receipt-dir",
         type=Path,
-        default=Path("/data/robotixx/lucid-sonic/manifests"),
+        default=LUCID_ROOT / "manifests",
     )
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")

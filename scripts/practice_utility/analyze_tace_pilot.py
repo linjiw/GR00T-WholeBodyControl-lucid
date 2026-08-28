@@ -18,11 +18,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-MANIFESTS = Path("/data/robotixx/lucid-sonic/manifests")
+
+MANIFESTS = LUCID_ROOT / "manifests"
 NONINFERIORITY_PTS = 2.0
 CLEAN_SUPERIORITY_PTS = 2.0
 LAMBDA_TOLERANCE = 0.1
