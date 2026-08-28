@@ -389,8 +389,19 @@ def uninstall(event_manager: Any) -> list[str]:
     return sorted(restored)
 
 
-def cohort_delay_stats(asset: Any, anchor_mask: torch.Tensor) -> dict[str, Any]:
-    """Mean installed actuator lag per cohort -- realized latency dose."""
+def cohort_delay_stats(
+    asset: Any,
+    anchor_mask: torch.Tensor,
+    stratum_masks: tuple[torch.Tensor, ...] = (),
+) -> dict[str, Any]:
+    """Mean installed actuator lag per cohort -- realized latency dose.
+
+    This is the measurement that separates "the curriculum wrote different
+    ranges" from "the simulator actually installed different physics". For a
+    stratified run it is also the only direct evidence that the intensity
+    *mixture* exists: the per-stratum means should come out ordered, roughly in
+    proportion to the stratum weights.
+    """
     actuators = getattr(asset, "actuators", None) or {}
     lags = []
     for actuator in actuators.values():
@@ -404,8 +415,13 @@ def cohort_delay_stats(asset: Any, anchor_mask: torch.Tensor) -> dict[str, Any]:
     mask = anchor_mask.detach().cpu().bool()
     if mask.numel() != stacked.shape[1]:
         return {"cohort_delay_mask_mismatch": [int(mask.numel()), int(stacked.shape[1])]}
+    groups: list[tuple[str, torch.Tensor]] = [(ANCHOR, mask), (FOCUS, ~mask)]
+    for index, stratum in enumerate(stratum_masks):
+        stratum = stratum.detach().cpu().bool()
+        if stratum.numel() == mask.numel():
+            groups.append((f"{FOCUS}_s{index}", stratum))
     out: dict[str, Any] = {}
-    for label, select in ((ANCHOR, mask), (FOCUS, ~mask)):
+    for label, select in groups:
         if select.any():
             subset = stacked[:, select]
             out[f"{label}_delay_mean_steps"] = float(subset.mean().item())

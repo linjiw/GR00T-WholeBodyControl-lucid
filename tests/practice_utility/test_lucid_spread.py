@@ -386,3 +386,59 @@ class TestRelativeReturnGuard:
             PIConfig(return_guard="relative", return_relative_drop=0.0)
         with pytest.raises(ValueError):
             PIConfig(return_guard="relative", return_window=1)
+
+
+class TestRealizedStratumDose:
+    """The simulator must show the mixture, not just the config."""
+
+    class _Buffer:
+        def __init__(self, lags):
+            self.time_lags = lags
+
+    class _Actuator:
+        def __init__(self, lags):
+            self.positions_delay_buffer = TestRealizedStratumDose._Buffer(lags)
+
+    class _Asset:
+        def __init__(self, lags):
+            self.actuators = {"legs": TestRealizedStratumDose._Actuator(lags)}
+
+    def test_per_stratum_means_are_reported_and_ordered(self):
+        plan = TACE.assign_cohorts(16, 0.25, seed=4, num_strata=4)
+        # Give each env a lag proportional to its stratum's weight, and the
+        # anchor cohort the full lag: what a working mixture would produce.
+        lags = torch.zeros(16, dtype=torch.long)
+        for index, stratum in enumerate(plan.focus_strata):
+            lags[list(stratum)] = index + 1
+        lags[list(plan.anchor_ids)] = 8
+        stats = TACE.cohort_delay_stats(
+            self._Asset(lags.unsqueeze(0)), plan.mask(), plan.stratum_masks()
+        )
+        means = [stats[f"focus_s{i}_delay_mean_steps"] for i in range(4)]
+        assert means == sorted(means)
+        assert stats["anchor_delay_mean_steps"] == 8.0
+        assert stats["focus_delay_mean_steps"] < stats["anchor_delay_mean_steps"]
+
+    def test_unstratified_call_reports_only_the_two_cohorts(self):
+        plan = TACE.assign_cohorts(16, 0.25, seed=4)
+        stats = TACE.cohort_delay_stats(
+            self._Asset(torch.zeros(16, dtype=torch.long).unsqueeze(0)), plan.mask()
+        )
+        assert not any(key.startswith("focus_s") for key in stats)
+
+    def test_curriculum_telemetry_carries_the_realized_dose(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        asset = self._Asset(torch.arange(16, dtype=torch.long).unsqueeze(0))
+        # The scene is reached by subscript, as IsaacLab's is.
+        env.scene.__class__.__getitem__ = lambda _self, key: (
+            asset if key == "robot" else (_ for _ in ()).throw(KeyError(key))
+        )
+        callback = LucidCurriculumCallback(
+            enabled=True, mode="lucid", branch_id="dose", observer_branch_id="obs",
+            initial_lambda=0.8, anchor_ratio=0.25, anchor_seed=4, spread_strata=4,
+        )
+        OBS._ACTIVE_OBSERVERS["obs"] = StubObserver([0.5] * 8, branch_id="obs")
+        callback.on_train_begin(None, None, None, env=env)
+        callback.on_step_end(None, State(1, mean_reward=10.0), None, env=env)
+        tace_block = callback.history[-1]["tace"]
+        assert any(k.startswith("focus_s0") for k in tace_block)

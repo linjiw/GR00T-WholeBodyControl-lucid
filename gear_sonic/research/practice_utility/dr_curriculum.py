@@ -434,7 +434,13 @@ class LucidCurriculumCallback(TrainerCallback):
         }
         robot = QT._scene_entity(self._env, "robot") if self._env is not None else None
         if robot is not None:
-            out.update(TACE.cohort_delay_stats(robot, self.assignment.mask()))
+            out.update(
+                TACE.cohort_delay_stats(
+                    robot,
+                    self.assignment.mask(),
+                    self.assignment.stratum_masks() if self.spread_strata > 1 else (),
+                )
+            )
         return out
 
     # ------------------------------------------------------------ persistence --
