@@ -31,10 +31,29 @@ Three guards, each earning its place:
             look healthy while the policy is quietly failing -- a fallen robot
             tracks its commands beautifully at the point of no return -- and
             this is the term that catches that.
+
+Two guards, and why there are two
+---------------------------------
+``return_guard = "absolute"`` is the manuscript's floor. It is only meaningful
+while the reward scale is stationary, and the 128-iteration horizon study showed
+it is not: training reward roughly halved between the 32- and 128-iteration
+regimes for *every* arm, so a floor calibrated at 32 iterations fired
+continuously later on and decayed lambda from 1.0 to 0.4-0.6 -- not because the
+policy was failing but because the yardstick had moved. Worse, a floor conflates
+two different things: a harder environment legitimately returns less, and a
+failing policy returns less, and an absolute threshold cannot tell them apart.
+
+``return_guard = "relative"`` compares the current return against the best of a
+trailing window of its own recent history. It asks "is this policy worse than it
+recently was", which is scale-free, survives reward drift, and does not punish an
+arm for training on a harder distribution. It is the guard every arm after the
+horizon study should use; ``absolute`` remains the default so that every existing
+receipt's controller reproduces exactly.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
@@ -54,6 +73,12 @@ class PIConfig:
     low_return_patience: int = 2
     lambda_min: float = 0.0
     lambda_max: float = 1.0
+    #: "absolute" trips below ``return_floor``; "relative" trips below
+    #: ``(1 - return_relative_drop)`` times the best return in the trailing
+    #: ``return_window`` epochs.
+    return_guard: str = "absolute"
+    return_relative_drop: float = 0.25
+    return_window: int = 8
 
     def __post_init__(self) -> None:
         if not 0.0 < self.quantile < 1.0:
@@ -68,6 +93,16 @@ class PIConfig:
             raise ValueError(f"return_decay must be in (0, 1], got {self.return_decay}")
         if self.low_return_patience < 1:
             raise ValueError("low_return_patience must be >= 1")
+        if self.return_guard not in ("absolute", "relative"):
+            raise ValueError(
+                f"return_guard must be 'absolute' or 'relative', got {self.return_guard!r}"
+            )
+        if not 0.0 < self.return_relative_drop < 1.0:
+            raise ValueError(
+                f"return_relative_drop must be in (0, 1), got {self.return_relative_drop}"
+            )
+        if self.return_window < 2:
+            raise ValueError(f"return_window must be >= 2, got {self.return_window}")
 
 
 @dataclass
@@ -85,6 +120,7 @@ class ControllerStep:
     guard_tripped: bool = False
     low_return_streak: int = 0
     num_gap_samples: int = 0
+    return_reference: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,6 +140,7 @@ class LucidDRController:
         self.integral = 0.0
         self.epoch = 0
         self.low_return_streak = 0
+        self.return_window: deque[float] = deque(maxlen=max(2, self.config.return_window))
         self.history: list[ControllerStep] = []
 
     def update(
@@ -131,6 +168,7 @@ class LucidDRController:
             gap_quantile = _quantile(gaps or [], config.quantile)
         num_samples = len(gaps) if gaps is not None else 0
 
+        reference = self.return_reference
         guard = self._guard(mean_return)
         if guard:
             # Reset the integral as well as decaying lambda: leaving accumulated
@@ -142,7 +180,7 @@ class LucidDRController:
                 integral=self.integral, control=0.0, lambda_before=before,
                 lambda_after=self.lambda_value, mean_return=mean_return,
                 guard_tripped=True, low_return_streak=self.low_return_streak,
-                num_gap_samples=num_samples,
+                num_gap_samples=num_samples, return_reference=reference,
             )
             self.history.append(step)
             return step
@@ -152,7 +190,7 @@ class LucidDRController:
                 epoch=self.epoch, gap_quantile=0.0, error=0.0, integral=self.integral,
                 control=0.0, lambda_before=before, lambda_after=before,
                 mean_return=mean_return, low_return_streak=self.low_return_streak,
-                num_gap_samples=0,
+                num_gap_samples=0, return_reference=reference,
             )
             self.history.append(step)
             return step
@@ -168,12 +206,19 @@ class LucidDRController:
             epoch=self.epoch, gap_quantile=gap_quantile, error=error, integral=self.integral,
             control=control, lambda_before=before, lambda_after=self.lambda_value,
             mean_return=mean_return, low_return_streak=self.low_return_streak,
-            num_gap_samples=num_samples,
+            num_gap_samples=num_samples, return_reference=reference,
         )
         self.history.append(step)
         return step
 
+    @property
+    def return_reference(self) -> float | None:
+        """Best return seen in the trailing window, or ``None`` before any."""
+        return max(self.return_window) if self.return_window else None
+
     def _guard(self, mean_return: float | None) -> bool:
+        if self.config.return_guard == "relative":
+            return self._relative_guard(mean_return)
         floor = self.config.return_floor
         if floor is None or mean_return is None:
             return False
@@ -186,12 +231,43 @@ class LucidDRController:
             return True
         return False
 
+    def _relative_guard(self, mean_return: float | None) -> bool:
+        """Trip on a fall relative to this run's own recent best.
+
+        The reference is read *before* the new sample joins the window, so a
+        single collapse cannot lower the bar it is being judged against. A
+        window that is not yet full holds lambda's guard open: with fewer than
+        two prior epochs there is no history to be worse than.
+        """
+        if mean_return is None:
+            return False
+        reference = self.return_reference
+        self.return_window.append(float(mean_return))
+        if reference is None or len(self.return_window) < 3 or reference <= 0.0:
+            self.low_return_streak = 0
+            return False
+        if mean_return < (1.0 - self.config.return_relative_drop) * reference:
+            self.low_return_streak += 1
+        else:
+            self.low_return_streak = 0
+        if self.low_return_streak >= self.config.low_return_patience:
+            self.low_return_streak = 0
+            # Drop the window as well: after a deliberate back-off the old peak
+            # is no longer the standard this policy should be held to, and
+            # keeping it would re-trip the guard on the very next epoch.
+            self.return_window.clear()
+            if mean_return is not None:
+                self.return_window.append(float(mean_return))
+            return True
+        return False
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "lambda_value": self.lambda_value,
             "integral": self.integral,
             "epoch": self.epoch,
             "low_return_streak": self.low_return_streak,
+            "return_window": list(self.return_window),
             "config": asdict(self.config),
         }
 
@@ -200,6 +276,8 @@ class LucidDRController:
         self.integral = float(state["integral"])
         self.epoch = int(state["epoch"])
         self.low_return_streak = int(state.get("low_return_streak", 0))
+        self.return_window.clear()
+        self.return_window.extend(float(v) for v in state.get("return_window", ()))
 
 
 def calibrate_target(

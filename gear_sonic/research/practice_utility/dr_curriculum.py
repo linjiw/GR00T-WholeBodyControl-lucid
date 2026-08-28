@@ -76,6 +76,9 @@ class LucidCurriculumCallback(TrainerCallback):
         quantile: float = 0.9,
         return_floor: float | None = None,
         return_decay: float = 0.5,
+        return_guard: str = "absolute",
+        return_relative_drop: float = 0.25,
+        return_window: int = 8,
         update_every: int = 1,
         warmup_iterations: int = 0,
         resume_state_path: str | None = None,
@@ -86,6 +89,7 @@ class LucidCurriculumCallback(TrainerCallback):
         consolidation_fraction: float = 0.0,
         yoked_schedule_path: str | None = None,
         term_lambda_overrides: dict[str, float] | None = None,
+        spread_strata: int = 1,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked"):
             raise ValueError(
@@ -99,11 +103,22 @@ class LucidCurriculumCallback(TrainerCallback):
             )
         if mode == "yoked" and not yoked_schedule_path:
             raise ValueError("mode='yoked' requires yoked_schedule_path")
+        if int(spread_strata) < 1:
+            raise ValueError(f"spread_strata must be >= 1, got {spread_strata}")
         # --- TACE: target-anchored exposure -------------------------------
         # A fixed cohort of environments always samples the full (lambda = 1)
         # envelope; the curriculum only moves the rest. alpha = 0 is the plain
         # curriculum, alpha = 1 is fixed DR under another name.
         self.anchor_ratio = float(anchor_ratio)
+        # --- LUCID-S: expand the support, do not move a point ---------------
+        # With K > 1 the focus cohort is split into K intensity strata, stratum
+        # k training at lambda * (k+1)/K. The controller still moves one number;
+        # what that number now sets is the *upper edge* of the training
+        # mixture rather than its single value. The measured motivation is the
+        # 32 -> 128 iteration collapse: every arm that trained at one intensity
+        # lost 23-27 points of clean success, and the arm with the widest
+        # realized intensity mixture (50% anchor) lost the least.
+        self.spread_strata = int(spread_strata)
         self.anchor_seed = anchor_seed
         self.anchor_reserved_focus_envs = tuple(int(i) for i in anchor_reserved_focus_envs)
         self.consolidation_fraction = float(consolidation_fraction)
@@ -158,6 +173,9 @@ class LucidCurriculumCallback(TrainerCallback):
                 delta_target=delta_target,
                 return_floor=return_floor,
                 return_decay=return_decay,
+                return_guard=return_guard,
+                return_relative_drop=return_relative_drop,
+                return_window=return_window,
             ),
             initial_lambda=starting_lambda,
         )
@@ -285,7 +303,7 @@ class LucidCurriculumCallback(TrainerCallback):
         self.baseline = DS.capture_baseline(manager)
         self.scalable = DS.scalable_terms(manager)
         self._env = env
-        if self.anchor_ratio > 0.0 and self.assignment is None:
+        if (self.anchor_ratio > 0.0 or self.spread_strata > 1) and self.assignment is None:
             num_envs = _num_envs_of(env, manager)
             if num_envs is None:
                 raise RuntimeError("TACE needs the environment count to assign cohorts")
@@ -294,7 +312,9 @@ class LucidCurriculumCallback(TrainerCallback):
             if observer is not None:
                 reserved = tuple(sorted({*reserved, int(observer.tracked_env)}))
             seed = self.anchor_seed if self.anchor_seed is not None else 0
-            self.assignment = TACE.assign_cohorts(num_envs, self.anchor_ratio, seed, reserved)
+            self.assignment = TACE.assign_cohorts(
+                num_envs, self.anchor_ratio, seed, reserved, num_strata=self.spread_strata
+            )
             self.dispatchers = TACE.install(manager, self.baseline, self.assignment)
 
     def _apply(self, lambda_value: float) -> None:
@@ -309,6 +329,41 @@ class LucidCurriculumCallback(TrainerCallback):
         for name, value in self.term_lambda_overrides.items():
             if name in self.baseline:
                 DS.apply_lambda(self._event_manager, {name: self.baseline[name]}, value)
+        self._apply_strata(lambda_value)
+
+    def _apply_strata(self, lambda_value: float) -> None:
+        """Give each focus stratum below the frontier its own share of lambda.
+
+        The top stratum is deliberately left at ``None``: it samples from the
+        event manager's own params, which ``apply_lambda`` has just written.
+        That is what makes ``spread_strata = 1`` identical to the curriculum
+        before strata existed -- the difference is additive, never a rewrite of
+        the frontier the controller believes it set.
+        """
+        if self.spread_strata <= 1 or not self.dispatchers or self.baseline is None:
+            return
+        from gear_sonic.research.practice_utility import events_reset_safe as ERS
+
+        weights = TACE.stratum_weights(self.spread_strata)
+        for name, dispatch in self.dispatchers.items():
+            base = self.baseline.get(name)
+            if base is None:
+                continue
+            channel_lambda = float(self.term_lambda_overrides.get(name, lambda_value))
+            for index, weight in enumerate(weights):
+                if index == len(weights) - 1:
+                    dispatch.set_stratum(index, None)
+                    continue
+                params = DS.scaled_term_params(base, channel_lambda * weight)
+                buckets = None
+                if any(key in params for key in DS.MATERIAL_RANGE_KEYS):
+                    buckets = ERS.draw_material_buckets(
+                        dispatch.inner,
+                        static_friction_range=DS._as_pair(params.get("static_friction_range")),
+                        dynamic_friction_range=DS._as_pair(params.get("dynamic_friction_range")),
+                        restitution_range=DS._as_pair(params.get("restitution_range")),
+                    )
+                dispatch.set_stratum(index, params, buckets)
 
     def _gaps(self) -> list[float]:
         observer = OBS.get_active_observer(self.observer_branch_id)
@@ -368,6 +423,12 @@ class LucidCurriculumCallback(TrainerCallback):
             "num_anchor": self.assignment.num_anchor,
             "num_focus": self.assignment.num_focus,
             "anchor_ratio": self.assignment.anchor_ratio,
+            "num_strata": self.assignment.num_strata,
+            "stratum_sizes": [len(ids) for ids in self.assignment.focus_strata],
+            "stratum_lambdas": [
+                self.controller.lambda_value * w
+                for w in TACE.stratum_weights(self.assignment.num_strata)
+            ],
             "consolidating": self._consolidating,
             "dispatch": {name: d.telemetry() for name, d in self.dispatchers.items()},
         }
@@ -384,6 +445,7 @@ class LucidCurriculumCallback(TrainerCallback):
             "schema_version": 1,
             "mode": self.mode,
             "branch_id": self.branch_id,
+            "spread_strata": self.spread_strata,
             "controller": self.controller.state_dict(),
             "scalable_terms": self.scalable,
             "term_lambda_overrides": self.term_lambda_overrides,

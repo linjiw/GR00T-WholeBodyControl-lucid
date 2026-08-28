@@ -80,14 +80,31 @@ class ScalingReport:
         }
 
 
+#: How far past the configured envelope an *evaluation* may extrapolate. The
+#: curriculum itself is still hard-capped at 1: training beyond the envelope
+#: the policy is later scored on would make the training distribution
+#: unfalsifiable. Evaluation has the opposite need -- a deployment claim is
+#: about conditions the policy was never trained on -- so the evaluator, and
+#: only the evaluator, may ask for more.
+MAX_EXTRAPOLATION = 4.0
+
+
 def scale_range(
-    baseline: Iterable[float], lambda_value: float, nominal: float | None = None
+    baseline: Iterable[float],
+    lambda_value: float,
+    nominal: float | None = None,
+    allow_extrapolation: bool = False,
 ) -> list[float]:
     """Shrink a ``[lo, hi]`` range toward its nominal by ``lambda``.
 
     ``lambda = 1`` returns the baseline unchanged -- exactly, not approximately,
     so a curriculum that reaches full intensity is indistinguishable from fixed
     randomization at the configured maximum.
+
+    With ``allow_extrapolation`` the same affine map continues past 1, widening
+    the range about its nominal. That is how a policy is scored on physics
+    *outside* anything it trained under, which is the only honest sim-side
+    proxy for a deployment the randomization envelope did not anticipate.
     """
     values = [float(v) for v in baseline]
     if len(values) != 2:
@@ -95,8 +112,9 @@ def scale_range(
     low, high = values
     if high < low:
         raise ValueError(f"range is inverted: [{low}, {high}]")
-    if not 0.0 <= lambda_value <= 1.0:
-        raise ValueError(f"lambda must be in [0, 1], got {lambda_value}")
+    ceiling = MAX_EXTRAPOLATION if allow_extrapolation else 1.0
+    if not 0.0 <= lambda_value <= ceiling:
+        raise ValueError(f"lambda must be in [0, {ceiling}], got {lambda_value}")
 
     centre = 0.5 * (low + high) if nominal is None else float(nominal)
     return [
@@ -105,17 +123,40 @@ def scale_range(
     ]
 
 
-def scale_params(baseline: Any, lambda_value: float, nominal: float | None) -> Any:
+def scale_params(
+    baseline: Any,
+    lambda_value: float,
+    nominal: float | None,
+    allow_extrapolation: bool = False,
+) -> Any:
     """Scale a range, or a dict of named ranges, leaving anything else alone."""
     if isinstance(baseline, dict):
-        return {k: scale_params(v, lambda_value, nominal) for k, v in baseline.items()}
+        return {
+            k: scale_params(v, lambda_value, nominal, allow_extrapolation)
+            for k, v in baseline.items()
+        }
     if (
         isinstance(baseline, (list, tuple))
         and len(baseline) == 2
         and all(isinstance(v, (int, float)) for v in baseline)
     ):
-        return scale_range(baseline, lambda_value, nominal)
+        return scale_range(baseline, lambda_value, nominal, allow_extrapolation)
     return baseline
+
+
+def scaled_term_params(baseline_term: dict[str, Any], lambda_value: float) -> dict[str, Any]:
+    """Every range of one term, scaled to ``lambda``, without touching the term.
+
+    :func:`apply_lambda` writes the scaled ranges back onto the live event
+    config, which is what a single-intensity curriculum wants. A stratified
+    curriculum needs the same arithmetic for several intensities at once, to
+    hand to the per-stratum samplers, so the pure computation lives here.
+    """
+    return {
+        key: scale_params(original, lambda_value, RANGE_NOMINALS[key])
+        for key, original in baseline_term.items()
+        if key in RANGE_NOMINALS
+    }
 
 
 def scalable_terms(event_manager: Any) -> list[str]:
@@ -133,6 +174,7 @@ def apply_lambda(
     lambda_value: float,
     include_startup: bool = False,
     exclude_terms: Iterable[str] = (),
+    allow_extrapolation: bool = False,
 ) -> ScalingReport:
     """Rescale every runtime-scalable range to ``lambda`` of its baseline.
 
@@ -161,7 +203,9 @@ def apply_lambda(
             if key not in RANGE_NOMINALS:
                 skipped_unknown.append(f"{name}.{key}")
                 continue
-            params[key] = scale_params(original, lambda_value, RANGE_NOMINALS[key])
+            params[key] = scale_params(
+                original, lambda_value, RANGE_NOMINALS[key], allow_extrapolation
+            )
             touched = True
         if touched:
             scaled.append(name)

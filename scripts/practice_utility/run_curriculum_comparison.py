@@ -54,7 +54,31 @@ ARM_TERM_OVERRIDES: dict[str, dict[str, float]] = {
     "fixed_latonly": {term: 0.0 for term in NON_LATENCY_TERMS},
 }
 ARMS.update({"fixed_nolat": ("fixed", 0.0, None), "fixed_latonly": ("fixed", 0.0, None)})
-MODES = tuple(ARMS)
+
+#: LUCID-S arms. ``spread_strata = K`` splits the focus cohort into K intensity
+#: strata so the training mixture spans ``(0, lambda]`` rather than the single
+#: point ``lambda``; ``return_guard = "relative"`` replaces the absolute return
+#: floor, which the 128-iteration horizon study showed is not scale-stable.
+#: The two are separate arms as well as a combined one, because a combined-only
+#: result cannot say which change did the work.
+ARMS.update(
+    {
+        "lucid_s4": ("lucid", 0.0, None),
+        "lucid_rg": ("lucid", 0.0, None),
+        "lucid_s4_rg": ("lucid", 0.0, None),
+        "ta_lucid_50_s4_rg": ("lucid", 0.50, None),
+    }
+)
+ARM_SPREAD_STRATA: dict[str, int] = {
+    "lucid_s4": 4,
+    "lucid_s4_rg": 4,
+    "ta_lucid_50_s4_rg": 4,
+}
+ARM_RETURN_GUARD: dict[str, str] = {
+    "lucid_rg": "relative",
+    "lucid_s4_rg": "relative",
+    "ta_lucid_50_s4_rg": "relative",
+}
 MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
@@ -65,6 +89,11 @@ QUALITY_METRICS = (
     "action_delay_mean_steps",
     "action_delay_nonzero_fraction",
 )
+#: Repo-relative motion paths. Callers that synthesise an ``args`` namespace
+#: (the horizon orchestrator) need not carry them, so they are read with a
+#: default rather than as required attributes.
+DEFAULT_MOTION_FILE = "data/motion_lib_bones_seed/robot_filtered"
+DEFAULT_SMPL_MOTION_FILE = "data/motion_lib_bones_seed/smpl_filtered"
 REWARD_FLOOR = 0.0333
 LENGTH_FLOOR = 0.0314
 
@@ -96,7 +125,33 @@ def parse_args(argv=None):
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--integral-max", type=float, default=1.0)
     parser.add_argument("--return-floor", type=float, default=8.0)
+    parser.add_argument(
+        "--return-relative-drop",
+        type=float,
+        default=0.25,
+        help="relative-guard arms: fractional fall below the trailing best that counts as harm",
+    )
+    parser.add_argument(
+        "--return-window",
+        type=int,
+        default=8,
+        help="relative-guard arms: how many epochs of its own history an arm is judged against",
+    )
     parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
+    parser.add_argument(
+        "--motion-file",
+        default=DEFAULT_MOTION_FILE,
+        help="motion_lib pool every arm trains on",
+    )
+    parser.add_argument(
+        "--smpl-motion-file",
+        default=DEFAULT_SMPL_MOTION_FILE,
+        help=(
+            "SMPL pack for the SMPL observation encoder. 'dummy' substitutes zeros, "
+            "which is also what a missing path does; hosts without the 32 GB pack "
+            "must pass it explicitly so the receipt records the difference."
+        ),
+    )
     parser.add_argument(
         "--encoder",
         default=str(LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"),
@@ -156,6 +211,22 @@ def build_command(
         f"++callbacks.lucid_curriculum.term_lambda_overrides.{term}={value}"
         for term, value in ARM_TERM_OVERRIDES.get(mode, {}).items()
     ]
+    strata = ARM_SPREAD_STRATA.get(mode, 1)
+    guard = ARM_RETURN_GUARD.get(mode, "absolute")
+    spread = [f"++callbacks.lucid_curriculum.spread_strata={strata}"] if strata > 1 else []
+    if strata > 1 and anchor_ratio == 0.0:
+        # Strata need the cohort machinery, which the callback only installs
+        # when it has a seed to draw the partition from.
+        spread.append(f"++callbacks.lucid_curriculum.anchor_seed={seed}")
+    relative_guard = (
+        [
+            f"++callbacks.lucid_curriculum.return_guard={guard}",
+            f"++callbacks.lucid_curriculum.return_relative_drop={args.return_relative_drop}",
+            f"++callbacks.lucid_curriculum.return_window={args.return_window}",
+        ]
+        if guard != "absolute"
+        else []
+    )
     return [
         sys.executable,
         str(REPO / "scripts" / "practice_utility" / "train_with_delay.py"),
@@ -171,8 +242,10 @@ def build_command(
         "manager_env/events=tracking/lucid_curriculum",
         f"++algo.config.num_learning_iterations={args.iterations}",
         "++algo.config.save_interval=100000",
-        "++manager_env.commands.motion.motion_lib_cfg.motion_file=data/motion_lib_bones_seed/robot_filtered",
-        "++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=data/motion_lib_bones_seed/smpl_filtered",
+        f"++manager_env.commands.motion.motion_lib_cfg.motion_file="
+        f"{getattr(args, 'motion_file', DEFAULT_MOTION_FILE)}",
+        f"++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file="
+        f"{getattr(args, 'smpl_motion_file', DEFAULT_SMPL_MOTION_FILE)}",
         f"++callbacks.practice_observer._target_={OBSERVER}",
         "++callbacks.practice_observer.enabled=true",
         f"++callbacks.practice_observer.encoder_path={args.encoder}",
@@ -184,6 +257,8 @@ def build_command(
         *tace,
         *yoked,
         *overrides,
+        *spread,
+        *relative_guard,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
@@ -365,6 +440,8 @@ def main(argv=None) -> int:
                     "yoked_source": ARMS[mode][2],
                     "yoked_cross_seed": mode in CROSS_SEED_ARMS,
                     "term_lambda_overrides": ARM_TERM_OVERRIDES.get(mode, {}),
+                    "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
+                    "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
                     "yoked_schedule_path": str(schedule_for(seed, mode)) if ARMS[mode][2] else None,
                 },
                 "tace_final": curriculum[-1].get("tace") if curriculum else None,
@@ -426,6 +503,8 @@ def main(argv=None) -> int:
                 for index, seed in enumerate(args.seeds)
             ],
             "event_preset": "tracking/lucid_curriculum",
+            "motion_file": args.motion_file,
+            "smpl_motion_file": args.smpl_motion_file,
             "arms": {mode: ARMS[mode] for mode in modes},
             "consolidation_fraction": args.consolidation_fraction,
             "max_delay_steps": args.max_delay,

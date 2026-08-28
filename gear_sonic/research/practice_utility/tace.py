@@ -50,13 +50,21 @@ FOCUS = "focus"
 
 @dataclass(frozen=True)
 class CohortAssignment:
-    """Fixed anchor/focus partition of the parallel environments."""
+    """Fixed anchor/focus partition of the parallel environments.
+
+    ``focus_strata`` sub-divides the focus cohort for the support-expanding
+    variant (LUCID-S): stratum ``k`` of ``K`` trains at ``lambda * (k+1)/K``, so
+    the training mixture spans ``(0, lambda]`` instead of sitting at the single
+    point ``lambda``. With ``K = 1`` the tuple holds one stratum containing
+    every focus environment and the behaviour is exactly plain TACE.
+    """
 
     num_envs: int
     anchor_ratio: float
     seed: int
     anchor_ids: tuple[int, ...]
     reserved_focus_ids: tuple[int, ...]
+    focus_strata: tuple[tuple[int, ...], ...] = ()
 
     @property
     def num_anchor(self) -> int:
@@ -65,6 +73,22 @@ class CohortAssignment:
     @property
     def num_focus(self) -> int:
         return self.num_envs - self.num_anchor
+
+    @property
+    def num_strata(self) -> int:
+        return max(1, len(self.focus_strata))
+
+    def stratum_masks(self) -> tuple[torch.Tensor, ...]:
+        """One boolean mask per focus stratum, ordered low to high intensity."""
+        if not self.focus_strata:
+            return ()
+        masks = []
+        for ids in self.focus_strata:
+            mask = torch.zeros(self.num_envs, dtype=torch.bool)
+            if ids:
+                mask[list(ids)] = True
+            masks.append(mask)
+        return tuple(masks)
 
     def mask(self, device: Any = None) -> torch.Tensor:
         mask = torch.zeros(self.num_envs, dtype=torch.bool)
@@ -79,9 +103,24 @@ class CohortAssignment:
             "seed": self.seed,
             "num_anchor": self.num_anchor,
             "num_focus": self.num_focus,
+            "num_strata": self.num_strata,
+            "stratum_sizes": [len(ids) for ids in self.focus_strata],
+            "stratum_weights": list(stratum_weights(self.num_strata)),
             "reserved_focus_ids": list(self.reserved_focus_ids),
             "anchor_ids": list(self.anchor_ids),
         }
+
+
+def stratum_weights(num_strata: int) -> tuple[float, ...]:
+    """Fractions of the controller's lambda, one per focus stratum.
+
+    The top stratum is always at ``1.0`` -- it *is* the curriculum frontier the
+    controller believes it has reached, so LUCID-S never trains below the
+    scalar curriculum, it only adds easier company underneath it.
+    """
+    if num_strata < 1:
+        raise ValueError(f"num_strata must be >= 1, got {num_strata}")
+    return tuple((k + 1) / num_strata for k in range(num_strata))
 
 
 def assign_cohorts(
@@ -89,13 +128,17 @@ def assign_cohorts(
     anchor_ratio: float,
     seed: int,
     reserved_focus_ids: tuple[int, ...] | list[int] = (),
+    num_strata: int = 1,
 ) -> CohortAssignment:
     """Draw a seeded permutation and tag exactly ``round(alpha * N)`` anchors.
 
     ``reserved_focus_ids`` are never anchors: the observer measures the gap on
     one tracked environment and the controller must only ever see focus-cohort
     evidence, otherwise the anchor's deliberately out-of-frontier samples pull
-    lambda down for doing exactly what they were meant to do.
+    lambda down for doing exactly what they were meant to do. For the same
+    reason they are placed in the **top** focus stratum: the controller must
+    read the frontier it is deciding whether to expand, not the easier company
+    training underneath it.
     """
     if num_envs <= 0:
         raise ValueError(f"num_envs must be positive, got {num_envs}")
@@ -109,12 +152,27 @@ def assign_cohorts(
     reserved_set = set(reserved)
     candidates = [i for i in permutation if i not in reserved_set]
     anchors = tuple(sorted(candidates[:num_anchor]))
+    if num_strata < 1:
+        raise ValueError(f"num_strata must be >= 1, got {num_strata}")
+    anchor_set = set(anchors)
+    focus_pool = [i for i in permutation if i not in anchor_set]
+    if num_strata == 1:
+        strata: tuple[tuple[int, ...], ...] = (tuple(sorted(focus_pool)),)
+    else:
+        groups: list[list[int]] = [[] for _ in range(num_strata)]
+        # Round-robin over the seeded permutation: near-equal sizes, no bias
+        # toward any environment index, and deterministic given the seed.
+        for position, env_id in enumerate(i for i in focus_pool if i not in reserved_set):
+            groups[position % num_strata].append(env_id)
+        groups[-1].extend(reserved)
+        strata = tuple(tuple(sorted(group)) for group in groups)
     return CohortAssignment(
         num_envs=num_envs,
         anchor_ratio=float(anchor_ratio),
         seed=int(seed),
         anchor_ids=anchors,
         reserved_focus_ids=reserved,
+        focus_strata=strata,
     )
 
 
@@ -132,15 +190,55 @@ class CohortDispatch:
         term_name: str,
         anchor_params: dict[str, Any],
         anchor_mask: torch.Tensor,
+        stratum_masks: tuple[torch.Tensor, ...] = (),
     ) -> None:
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "term_name", term_name)
         object.__setattr__(self, "anchor_params", DS._deep_copy(anchor_params))
         object.__setattr__(self, "_anchor_mask", anchor_mask.detach().cpu().bool())
         object.__setattr__(self, "_anchor_buckets", _clone_buckets(inner))
+        # Sub-strata of the focus cohort, low intensity first. The *top*
+        # stratum is deliberately not given its own parameters: it is served
+        # the params the event manager already holds, which the curriculum has
+        # scaled to lambda. So K = 1 is byte-for-byte the un-stratified path.
+        masks = tuple(m.detach().cpu().bool() for m in stratum_masks)
+        object.__setattr__(self, "_stratum_masks", masks if len(masks) > 1 else ())
+        object.__setattr__(self, "_stratum_params", [None] * len(masks))
+        object.__setattr__(self, "_stratum_buckets", [None] * len(masks))
         object.__setattr__(self, "calls", {ANCHOR: 0, FOCUS: 0})
         object.__setattr__(self, "env_counts", {ANCHOR: 0, FOCUS: 0})
         object.__setattr__(self, "all_envs_mode", False)
+
+    # ------------------------------------------------------------- strata --
+
+    @property
+    def num_strata(self) -> int:
+        return len(object.__getattribute__(self, "_stratum_masks")) or 1
+
+    def set_stratum(
+        self,
+        index: int,
+        params: dict[str, Any] | None,
+        buckets: torch.Tensor | None = None,
+    ) -> None:
+        """Install the sampling parameters for one sub-stratum.
+
+        Called by the curriculum after every lambda change. The top stratum
+        (``index == num_strata - 1``) must be left at ``None``: it uses the
+        event manager's own params, which is what keeps an un-stratified run
+        identical to the code before strata existed.
+        """
+        masks = object.__getattribute__(self, "_stratum_masks")
+        if not masks:
+            return
+        if not 0 <= index < len(masks):
+            raise IndexError(f"stratum {index} out of range for {len(masks)} strata")
+        object.__getattribute__(self, "_stratum_params")[index] = (
+            DS._deep_copy(params) if params is not None else None
+        )
+        object.__getattribute__(self, "_stratum_buckets")[index] = (
+            buckets.clone() if isinstance(buckets, torch.Tensor) else None
+        )
 
     # --------------------------------------------------------------- proxy --
 
@@ -174,7 +272,7 @@ class CohortDispatch:
         if focus_ids.numel() > 0:
             self.calls[FOCUS] += 1
             self.env_counts[FOCUS] += int(focus_ids.numel())
-            results.append(self.inner(env, focus_ids, **params))
+            results.extend(self._call_focus(env, focus_ids, params))
         if anchor_ids.numel() > 0:
             self.calls[ANCHOR] += 1
             self.env_counts[ANCHOR] += int(anchor_ids.numel())
@@ -182,6 +280,48 @@ class CohortDispatch:
             merged.update(self.anchor_params)
             results.append(self._call_anchor(env, anchor_ids, merged))
         return _merge_results(results)
+
+    def _call_focus(self, env: Any, env_ids: torch.Tensor, params: dict[str, Any]) -> list[Any]:
+        """Sample the focus environments, split by intensity stratum."""
+        masks = object.__getattribute__(self, "_stratum_masks")
+        if not masks:
+            return [self.inner(env, env_ids, **params)]
+        stratum_params = object.__getattribute__(self, "_stratum_params")
+        stratum_buckets = object.__getattribute__(self, "_stratum_buckets")
+        results = []
+        for index, mask in enumerate(masks):
+            selected = env_ids[mask[env_ids.cpu()].to(env_ids.device)]
+            if selected.numel() == 0:
+                continue
+            key = f"{FOCUS}_s{index}"
+            self.calls[key] = self.calls.get(key, 0) + 1
+            self.env_counts[key] = self.env_counts.get(key, 0) + int(selected.numel())
+            override = stratum_params[index]
+            if override is None:
+                results.append(self.inner(env, selected, **params))
+                continue
+            merged = dict(params)
+            merged.update(override)
+            results.append(self._call_with_buckets(env, selected, merged, stratum_buckets[index]))
+        return results
+
+    def _call_with_buckets(
+        self,
+        env: Any,
+        env_ids: torch.Tensor,
+        params: dict[str, Any],
+        buckets: torch.Tensor | None,
+    ) -> Any:
+        """Run the wrapped sampler with a substituted material bucket tensor."""
+        inner = self.inner
+        if buckets is None:
+            return inner(env, env_ids, **params)
+        live = getattr(inner, "material_buckets", None)
+        inner.material_buckets = buckets
+        try:
+            return inner(env, env_ids, **params)
+        finally:
+            inner.material_buckets = live
 
     def _call_anchor(self, env: Any, env_ids: torch.Tensor, params: dict[str, Any]) -> Any:
         inner = self.inner
@@ -196,12 +336,18 @@ class CohortDispatch:
             inner.material_buckets = live
 
     def telemetry(self) -> dict[str, Any]:
-        return {
+        out = {
             "term": self.term_name,
             "calls": dict(self.calls),
             "env_counts": dict(self.env_counts),
             "anchor_params": DS._deep_copy(self.anchor_params),
         }
+        if object.__getattribute__(self, "_stratum_masks"):
+            out["num_strata"] = self.num_strata
+            out["stratum_params"] = [
+                DS._deep_copy(p) for p in object.__getattribute__(self, "_stratum_params")
+            ]
+        return out
 
 
 def install(
@@ -214,6 +360,7 @@ def install(
     Idempotent: a term already dispatched is left alone.
     """
     mask = assignment.mask()
+    stratum_masks = assignment.stratum_masks()
     installed: dict[str, CohortDispatch] = {}
     for name, cfg in DS._iter_terms(event_manager):
         if name not in baseline:
@@ -226,7 +373,7 @@ def install(
         if isinstance(func, CohortDispatch):
             installed[name] = func
             continue
-        dispatch = CohortDispatch(func, name, baseline[name], mask)
+        dispatch = CohortDispatch(func, name, baseline[name], mask, stratum_masks)
         cfg.func = dispatch
         installed[name] = dispatch
     return installed

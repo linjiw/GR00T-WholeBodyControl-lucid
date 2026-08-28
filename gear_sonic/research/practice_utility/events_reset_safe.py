@@ -200,6 +200,49 @@ def resample_material_buckets(
     return True
 
 
+def draw_material_buckets(
+    term: Any,
+    static_friction_range: tuple[float, float] | None = None,
+    dynamic_friction_range: tuple[float, float] | None = None,
+    restitution_range: tuple[float, float] | None = None,
+    make_consistent: bool = False,
+) -> torch.Tensor | None:
+    """Draw a bucket tensor for the given ranges *without* installing it.
+
+    :func:`resample_material_buckets` rewrites the term's own buckets, which is
+    right when every environment shares one intensity. A stratified curriculum
+    needs several bucket tensors alive at once -- one per intensity stratum,
+    each swapped in for the duration of its own sampler call -- so the draw and
+    the install are separated here.
+    """
+    buckets = getattr(term, "material_buckets", None)
+    if buckets is None:
+        return None
+    current = buckets.clone()
+    ranges = [
+        (
+            static_friction_range
+            if static_friction_range is not None
+            else (float(current[:, 0].min()), float(current[:, 0].max()))
+        ),
+        (
+            dynamic_friction_range
+            if dynamic_friction_range is not None
+            else (float(current[:, 1].min()), float(current[:, 1].max()))
+        ),
+        (
+            restitution_range
+            if restitution_range is not None
+            else (float(current[:, 2].min()), float(current[:, 2].max()))
+        ),
+    ]
+    bounds = torch.tensor(ranges, dtype=current.dtype, device=current.device)
+    drawn = sample_uniform(bounds[:, 0], bounds[:, 1], (current.shape[0], 3))
+    if make_consistent:
+        drawn[:, 1] = torch.min(drawn[:, 0], drawn[:, 1])
+    return drawn.to(current.dtype)
+
+
 def sample_uniform(low: torch.Tensor, high: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
     """Uniform samples in ``[low, high]``, broadcasting over the trailing dims."""
     low = torch.as_tensor(low, dtype=torch.float32)

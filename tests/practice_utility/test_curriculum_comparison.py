@@ -19,6 +19,13 @@ def args():
         return_floor=8.0,
         exp="manager/universal_token/all_modes/sonic_release",
         encoder="/tmp/encoder.pt",
+        motion_file="data/motion_lib_bones_seed/robot_filtered",
+        smpl_motion_file="data/motion_lib_bones_seed/smpl_filtered",
+        consolidation_fraction=0.0,
+        spread_strata=1,
+        return_guard="absolute",
+        return_relative_drop=0.25,
+        return_window=8,
     )
 
 

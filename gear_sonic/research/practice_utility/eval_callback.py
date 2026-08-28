@@ -46,8 +46,13 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         self.non_latency_dr_scale = (
             None if non_latency_dr_scale is None else float(non_latency_dr_scale)
         )
-        if self.non_latency_dr_scale is not None and not 0.0 <= self.non_latency_dr_scale <= 1.0:
-            raise ValueError("non_latency_dr_scale must be in [0, 1]")
+        # Above 1 the evaluation extrapolates past the training envelope: the
+        # robustness profile's whole point is that the last cell is physics the
+        # policy was never trained on.
+        if self.non_latency_dr_scale is not None and not (
+            0.0 <= self.non_latency_dr_scale <= DS.MAX_EXTRAPOLATION
+        ):
+            raise ValueError(f"non_latency_dr_scale must be in [0, {DS.MAX_EXTRAPOLATION}]")
         self._dr_scale_report: dict[str, Any] | None = None
 
     def _pre_evaluate_policy(self, reset_env: bool = True) -> None:
@@ -60,6 +65,7 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
                 baseline,
                 self.non_latency_dr_scale,
                 exclude_terms=("randomize_action_delay", "randomize_action_delay_interval"),
+                allow_extrapolation=True,
             )
             self._dr_scale_report = report.to_dict()
         robot = _scene_entity(self.env, "robot")

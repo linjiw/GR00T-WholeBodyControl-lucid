@@ -19,7 +19,12 @@ from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
 from gear_sonic.research.practice_utility.paths import LUCID_ROOT, relocate  # noqa: E402
 
-MODES = ("lucid", "fixed", "off", "origin", "fixed_nolat", "fixed_latonly", "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50", "ta_yoked_25x", "ta_yoked_50x")
+MODES = (
+    "lucid", "fixed", "off", "origin", "fixed_nolat", "fixed_latonly",
+    "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50",
+    "ta_yoked_25x", "ta_yoked_50x",
+    "lucid_s4", "lucid_rg", "lucid_s4_rg", "ta_lucid_50_s4_rg",
+)
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
@@ -29,8 +34,18 @@ PRESETS = {
     "dr_025": "tracking/lucid_curriculum",
     "dr_050": "tracking/lucid_curriculum",
     "dr_075": "tracking/lucid_curriculum",
+    # Past the training envelope. A deployment claim is about conditions the
+    # randomization did not anticipate, so the profile must not stop at 1.
+    "dr_125": "tracking/lucid_curriculum",
+    "dr_150": "tracking/lucid_curriculum",
 }
-PRESET_DR_SCALE = {"dr_025": 0.25, "dr_050": 0.5, "dr_075": 0.75}
+PRESET_DR_SCALE = {
+    "dr_025": 0.25,
+    "dr_050": 0.5,
+    "dr_075": 0.75,
+    "dr_125": 1.25,
+    "dr_150": 1.5,
+}
 CALLBACK = "gear_sonic.research.practice_utility.eval_callback.PracticeRobustnessEvalCallback"
 SUMMARY_METRICS = (
     "success_rate",
