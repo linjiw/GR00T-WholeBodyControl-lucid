@@ -48,13 +48,12 @@ evaluate() {  # $1 label, $2 training receipt, $3 stdout log, $4 eval num_envs
   say "eval $1 exit=$? receipt=$(receipt_of "$3")"
 }
 
-# --- stage 9: latency cap ---------------------------------------------------
-train "stage 9 (latency cap 0.5)" "$OUT/stage9_latcap_stdout.log" \
-  --num-envs 128 --latency-cap 0.5 \
-  --modes lucid_latcap_s4_rg ta_lucid_50_latcap_s4_rg
-S9=$(receipt_of "$OUT/stage9_latcap_stdout.log")
-evaluate "D/stage9" "$S9" "$OUT/eval_stage9_stdout.log" 128
-
+# Stage 10 runs FIRST. It decides how every other result in the programme is
+# read: the untrained origin scores 90.2% clean and 60.8% dr_full, above every
+# 128-iteration trained arm ever measured, so at this batch size all DR
+# fine-tuning has been net-destructive even on the robustness it targets. If
+# that reverses at 256 environments, the mechanism reading is a small-batch
+# artifact and stage 9 is answering a question that does not arise.
 # --- stage 10: batch-size control -------------------------------------------
 # Trained at 256 envs; evaluated at 128 like every other arm, so the evaluation
 # is identical across the batch-size contrast and only training differs.
@@ -62,5 +61,12 @@ train "stage 10 (batch-size control, 256 envs)" "$OUT/stage10_batch_stdout.log" 
   --num-envs 256 --modes fixed off ta_lucid_50_s4_rg
 S10=$(receipt_of "$OUT/stage10_batch_stdout.log")
 evaluate "E/stage10" "$S10" "$OUT/eval_stage10_stdout.log" 128
+
+# --- stage 9: latency cap ---------------------------------------------------
+train "stage 9 (latency cap 0.5)" "$OUT/stage9_latcap_stdout.log" \
+  --num-envs 128 --latency-cap 0.5 \
+  --modes lucid_latcap_s4_rg ta_lucid_50_latcap_s4_rg
+S9=$(receipt_of "$OUT/stage9_latcap_stdout.log")
+evaluate "D/stage9" "$S9" "$OUT/eval_stage9_stdout.log" 128
 
 say "=== stages 9 and 10 done ==="
