@@ -133,7 +133,32 @@ LENGTH_FLOOR = 0.0314
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="branch origin; omit together with --from-scratch to train a fresh policy",
+    )
+    parser.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help=(
+            "train from a fresh initialisation instead of continuing a checkpoint. "
+            "Fine-tuning the released policy is destructive at this scale -- plain "
+            "no-DR continuation costs 23 profile-AUC points against the untrained "
+            "origin -- so an arm comparison that starts there is measuring damage, "
+            "not learning."
+        ),
+    )
+    parser.add_argument(
+        "--horizons",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "extra iteration counts at which to export a capsule, for a convergence "
+            "curve measured along one trajectory rather than across separate runs"
+        ),
+    )
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=32)
     parser.add_argument("--warmup-iterations", type=int, default=10)
@@ -209,6 +234,13 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.iterations <= args.warmup_iterations:
         parser.error("iterations must exceed warmup iterations")
+    if args.from_scratch and args.checkpoint:
+        parser.error("--from-scratch and --checkpoint are mutually exclusive")
+    if not args.from_scratch and not args.checkpoint:
+        parser.error("pass --checkpoint, or --from-scratch to train a fresh policy")
+    for horizon in args.horizons or ():
+        if not 0 < horizon <= args.iterations:
+            parser.error(f"horizon {horizon} must be in (0, {args.iterations}]")
     return args
 
 
@@ -271,6 +303,11 @@ def build_command(
         if guard != "absolute"
         else []
     )
+    origin = [] if getattr(args, "from_scratch", False) else [f"checkpoint={args.checkpoint}"]
+    horizons = [
+        f"++callbacks.practice_capsule.horizons.h{h:04d}={h}"
+        for h in sorted(set(getattr(args, "horizons", None) or ()))
+    ]
     return [
         sys.executable,
         str(REPO / "scripts" / "practice_utility" / "train_with_delay.py"),
@@ -278,7 +315,7 @@ def build_command(
         str(args.max_delay),
         "--",
         f"+exp={args.exp}",
-        f"checkpoint={args.checkpoint}",
+        *origin,
         f"num_envs={args.num_envs}",
         "headless=true",
         "use_wandb=false",
@@ -323,6 +360,7 @@ def build_command(
         "++callbacks.practice_capsule.role=control",
         f"++callbacks.practice_capsule.branch_id={branch_id}",
         f"++callbacks.practice_capsule.horizons.final={args.iterations}",
+        *horizons,
     ]
 
 
@@ -540,7 +578,9 @@ def main(argv=None) -> int:
         "git_status_short": TP.git_status(),
         "launcher_sha256": source_sha256(),
         "config": {
-            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "checkpoint": (
+                None if args.from_scratch else str(Path(args.checkpoint).resolve())
+            ),
             "num_envs": args.num_envs,
             "iterations": args.iterations,
             "warmup_iterations": args.warmup_iterations,
@@ -551,6 +591,8 @@ def main(argv=None) -> int:
                 for index, seed in enumerate(args.seeds)
             ],
             "event_preset": "tracking/lucid_curriculum",
+            "from_scratch": bool(args.from_scratch),
+            "capsule_horizons": sorted(set(args.horizons or ())) + [args.iterations],
             "motion_file": args.motion_file,
             "smpl_motion_file": args.smpl_motion_file,
             "arms": {mode: ARMS[mode] for mode in modes},
