@@ -31,6 +31,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from gear_sonic.research.practice_utility import motion_paired as MP  # noqa: E402
 from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
 
 MANIFESTS = LUCID_ROOT / "manifests"
@@ -177,7 +178,99 @@ def parse_args(argv=None):
     parser.add_argument("--stage8-eval", type=Path, required=True)
     parser.add_argument("--origin-eval", type=Path, default=None)
     parser.add_argument("--receipt-dir", type=Path, default=MANIFESTS)
+    parser.add_argument(
+        "--bootstrap-samples",
+        type=int,
+        default=10000,
+        help="hierarchical paired bootstrap draws; 0 disables the precision section",
+    )
     return parser.parse_args(argv)
+
+
+def paired_section(
+    receipts: list[dict[str, Any]], samples: int
+) -> dict[str, Any]:
+    """Confidence intervals on the preregistered differences. No new hypotheses.
+
+    Every run scores the same frozen 102-motion panel and records which motions
+    failed, so two arms at the same seed are paired motion by motion. This
+    reports intervals for differences the preregistration was already going to
+    state as three-seed means; it does not introduce an estimand, a threshold,
+    or a decision.
+    """
+    if samples <= 0:
+        return {"enabled": False}
+    outcomes: dict[tuple[str, str], list[MP.MotionOutcome]] = {}
+    for receipt in receipts:
+        for key, runs in MP.outcomes_from_receipt(receipt).items():
+            outcomes.setdefault(key, []).extend(runs)
+    if not outcomes:
+        return {"enabled": True, "available": False, "reason": "no per-motion metrics on disk"}
+
+    modes = sorted({mode for mode, _ in outcomes})
+    by_mode_preset = lambda mode: {  # noqa: E731
+        preset: outcomes.get((mode, preset), []) for preset in PROFILE_S
+    }
+    auc = {}
+    for mode in modes:
+        scores = MP.auc_scores(by_mode_preset(mode), PROFILE_S)
+        if scores:
+            auc[mode] = scores
+
+    def compare(treatment: str, reference: str, preset: str | None) -> dict[str, Any] | None:
+        try:
+            if preset is None:
+                if treatment not in auc or reference not in auc:
+                    return None
+                result = MP.paired_scores(auc[treatment], auc[reference], samples=samples)
+            else:
+                left = outcomes.get((treatment, preset), [])
+                right = outcomes.get((reference, preset), [])
+                if not left or not right:
+                    return None
+                result = MP.paired_difference(left, right, samples=samples)
+        except ValueError as error:
+            return {"error": str(error)}
+        return result.to_dict()
+
+    #: The comparisons the preregistration already names, and nothing else.
+    wanted = [
+        ("H_S1", "lucid_s4", "lucid", None),
+        ("H_S3_auc", "ta_lucid_50_s4_rg", "fixed", None),
+        ("H_S3_dr_full", "ta_lucid_50_s4_rg", "fixed", "dr_full"),
+        ("H_S3_id_clean", "ta_lucid_50_s4_rg", "fixed", "id_clean"),
+        ("H_S4_treatment_vs_origin", "ta_lucid_50_s4_rg", "origin", "id_clean"),
+        ("H_S4_fixed_vs_origin", "fixed", "origin", "id_clean"),
+        ("H_S5", "ta_lucid_50_s4_rg", "fixed", "dr_125"),
+    ]
+    named = {
+        label: block
+        for label, treatment, reference, preset in wanted
+        if (block := compare(treatment, reference, preset)) is not None
+    }
+    ranking = {
+        mode: block
+        for mode in modes
+        if mode != "fixed" and (block := compare(mode, "fixed", None)) is not None
+    }
+    return {
+        "enabled": True,
+        "available": True,
+        "method": (
+            "hierarchical paired bootstrap: seeds resampled with replacement, then motions "
+            "within each drawn seed. Paired at the motion level on the frozen 102-motion panel."
+        ),
+        "auc_grid": PROFILE_S,
+        "auc_weights": dict(
+            zip(
+                sorted(PROFILE_S, key=PROFILE_S.get),
+                MP.auc_weights(sorted(PROFILE_S.values())),
+                strict=True,
+            )
+        ),
+        "preregistered_differences": named,
+        "profile_auc_vs_fixed": ranking,
+    }
 
 
 def main(argv=None) -> int:
@@ -298,6 +391,9 @@ def main(argv=None) -> int:
         ),
     }
 
+    precision = paired_section(
+        [r for r in (s7_eval, s8_eval, origin_eval) if r], args.bootstrap_samples
+    )
     receipt = {
         "kind": "lucid_support_expansion_analysis",
         "schema_version": 1,
@@ -318,6 +414,7 @@ def main(argv=None) -> int:
         "arms": table,
         "controllers": controllers,
         "hypotheses": findings,
+        "precision": precision,
         "not_yet_verified": [
             "any claim about a physical robot; every number here is simulated",
             "generalisation beyond the 102-motion content-dev panel and three seeds",
@@ -344,6 +441,15 @@ def main(argv=None) -> int:
     print()
     for name, block in findings.items():
         print(f"{name}: {block['verdict']}")
+    if precision.get("available"):
+        print("\npaired per-motion differences (95% CI, success-rate points):")
+        for label, block in precision["preregistered_differences"].items():
+            if "error" in block:
+                print(f"  {label:<28} {block['error']}")
+                continue
+            low, high = block["ci95_pts"]
+            flag = "*" if block["excludes_zero"] else " "
+            print(f"  {label:<28}{block['delta_pts']:+7.2f}  [{low:+6.2f}, {high:+6.2f}] {flag}")
     print(f"receipt {out}")
     return 0
 

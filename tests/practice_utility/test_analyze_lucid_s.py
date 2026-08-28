@@ -181,7 +181,7 @@ class TestEndToEnd:
             "--stage7-eval", str(paths["s7e"]),
             "--stage8-eval", str(paths["s8e"]),
             "--origin-eval", str(paths["oe"]),
-            "--receipt-dir", str(tmp_path),
+            "--receipt-dir", str(tmp_path), "--bootstrap-samples", "0",
         ]) == 0
         receipt = sorted(tmp_path.glob("lucid_s_analysis_*.json"))[-1]
         return json.loads(receipt.read_text())
@@ -207,7 +207,7 @@ class TestEndToEnd:
             "--stage8-training", str(paths["s8t"]),
             "--stage7-eval", str(paths["s7e"]),
             "--stage8-eval", str(paths["s8e"]),
-            "--receipt-dir", str(tmp_path),
+            "--receipt-dir", str(tmp_path), "--bootstrap-samples", "0",
         ]) == 0
         out = json.loads(sorted(tmp_path.glob("lucid_s_analysis_*.json"))[-1].read_text())
         assert out["hypotheses"]["H_S4"]["verdict"] == "not evaluable"
@@ -216,3 +216,45 @@ class TestEndToEnd:
         out = self._run(tmp_path, self._write(tmp_path, treatment_wins=True))
         assert out["preregistration"]["logical_sha256"] == "deadbeef"
         assert out["kind"] == "lucid_support_expansion_analysis"
+
+
+class TestPairedSection:
+    def test_disabled_when_samples_are_zero(self):
+        assert A.paired_section([], 0) == {"enabled": False}
+
+    def test_unavailable_rather_than_wrong_when_no_metrics_exist(self):
+        out = A.paired_section([{"runs": {}}], 100)
+        assert out["enabled"] is True and out["available"] is False
+
+    def test_reports_intervals_for_the_preregistered_differences(self, tmp_path):
+        import json as _json
+        from gear_sonic.research.practice_utility import motion_paired as MP
+
+        def metrics(name, failed):
+            path = tmp_path / f"{name}.json"
+            path.write_text(_json.dumps({
+                "eval/success/success_rate": (102 - len(failed)) / 102,
+                "eval/failed_metrics_dict": {
+                    "failed_idxes": list(failed),
+                    "failed_keys": [f"m{i}" for i in failed],
+                },
+            }))
+            return str(path)
+
+        runs = {}
+        for mode, n in (("ta_lucid_50_s4_rg", 10), ("fixed", 40), ("lucid", 35),
+                        ("lucid_s4", 20), ("origin", 5)):
+            for preset in ("id_clean", "dr_050", "dr_full", "dr_125"):
+                for seed in (8600, 8601, 8602):
+                    runs[f"{mode}_{preset}_{seed}"] = {
+                        "mode": mode, "preset": preset, "checkpoint_seed": seed,
+                        "metrics_path": metrics(f"{mode}{preset}{seed}", range(n)),
+                    }
+        out = A.paired_section([{"runs": runs}], 500)
+        assert out["available"] is True
+        assert out["auc_weights"]["id_clean"] == pytest.approx(0.2)
+        diffs = out["preregistered_differences"]
+        assert diffs["H_S1"]["delta_pts"] == pytest.approx(100.0 * 15 / 102)
+        assert diffs["H_S3_auc"]["delta_pts"] == pytest.approx(100.0 * 30 / 102)
+        assert diffs["H_S4_fixed_vs_origin"]["delta_pts"] == pytest.approx(-100.0 * 35 / 102)
+        assert diffs["H_S3_auc"]["excludes_zero"] is True
