@@ -271,3 +271,56 @@ class TestAucScores:
         )
         assert out.delta_pts == pytest.approx(100.0 * 20 / 102)
         assert out.excludes_zero is True
+
+
+class TestFailureListLocation:
+    """`failed_idxes` is top level, not inside `eval/failed_metrics_dict`.
+
+    The nested dict holds per-metric arrays for the failed motions and carries
+    its own `motion_keys`, which reads exactly like a panel listing. Taking the
+    failures from there yields an empty list for a run that really failed 10 of
+    102 motions -- a silently wrong answer, not an error.
+    """
+
+    def test_top_level_keys_are_used(self, tmp_path):
+        path = tmp_path / "m.json"
+        path.write_text(json.dumps({
+            "eval/success/success_rate": 92 / 102,
+            "failed_idxes": list(range(10)),
+            "failed_keys": [f"m{i}" for i in range(10)],
+            "eval/failed_metrics_dict": {"motion_keys": ["decoy"], "mpjpe_g": [1.0]},
+        }))
+        out = MP.read_outcome(path, 8600, "origin", "id_clean")
+        assert out.motion_count == 102
+        assert out.failed_indices == frozenset(range(10))
+
+    def test_nested_keys_are_the_fallback(self, tmp_path):
+        path = tmp_path / "m.json"
+        path.write_text(json.dumps({
+            "eval/success/success_rate": 100 / 102,
+            "eval/failed_metrics_dict": {
+                "failed_idxes": [3, 7],
+                "failed_keys": ["a", "b"],
+            },
+        }))
+        out = MP.read_outcome(path, 8600, "origin", "id_clean")
+        assert out.failed_indices == frozenset({3, 7})
+
+    def test_a_rate_implying_failures_with_none_listed_raises(self, tmp_path):
+        # The exact shape of the bug: rate says 10 failed, list says none.
+        path = tmp_path / "m.json"
+        path.write_text(json.dumps({
+            "eval/success/success_rate": 92 / 102,
+            "eval/failed_metrics_dict": {"motion_keys": ["decoy"]},
+        }))
+        with pytest.raises(ValueError, match="wrong key"):
+            MP.read_outcome(path, 8600, "origin", "id_clean")
+
+    def test_a_perfect_run_still_reports_the_no_failures_reason(self, tmp_path):
+        path = tmp_path / "m.json"
+        path.write_text(json.dumps({
+            "eval/success/success_rate": 1.0,
+            "failed_idxes": [], "failed_keys": [],
+        }))
+        with pytest.raises(ValueError, match="no failures"):
+            MP.read_outcome(path, 8600, "origin", "id_clean")

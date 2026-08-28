@@ -56,11 +56,24 @@ class MotionOutcome:
 
 
 def read_outcome(metrics_path: str | Path, seed: int, mode: str, preset: str) -> MotionOutcome:
-    """Load one ``metrics_eval.json`` into a per-motion success vector."""
+    """Load one ``metrics_eval.json`` into a per-motion success vector.
+
+    ``failed_idxes`` / ``failed_keys`` sit at the top level of the payload, not
+    inside ``eval/failed_metrics_dict`` -- that key holds per-metric arrays for
+    the failed motions and carries its own ``motion_keys``, which is easy to
+    mistake for the panel. Both locations are read, top level first, and the
+    recovered panel size is checked against the reported success rate, so a
+    misread lands as an exception rather than as a plausible wrong number.
+    """
     payload = json.loads(Path(metrics_path).read_text())
-    failed = payload.get("eval/failed_metrics_dict") or {}
-    indices = [int(i) for i in failed.get("failed_idxes", [])]
-    keys = list(failed.get("failed_keys", []))
+    nested = payload.get("eval/failed_metrics_dict") or {}
+    raw_indices = payload.get("failed_idxes")
+    raw_keys = payload.get("failed_keys")
+    if raw_indices is None:
+        raw_indices = nested.get("failed_idxes", [])
+        raw_keys = nested.get("failed_keys", [])
+    indices = [int(i) for i in raw_indices or []]
+    keys = list(raw_keys or [])
     rate = float(payload["eval/success/success_rate"])
     count = _motion_count(rate, len(indices))
     if len(keys) != len(indices):
@@ -80,10 +93,16 @@ def _motion_count(success_rate: float, num_failed: int) -> int:
 
     ``success_rate = (n - failed) / n``, so ``n = failed / (1 - rate)``. Done in
     integers and checked, because a panel size that does not reproduce the
-    reported rate means the two numbers came from different runs.
+    reported rate means the failure list and the rate came from different
+    places -- which is exactly the mistake this check was written after.
     """
     if num_failed == 0:
-        raise ValueError("cannot infer the panel size from a run with no failures")
+        if success_rate >= 1.0:
+            raise ValueError("cannot infer the panel size from a run with no failures")
+        raise ValueError(
+            f"a success rate of {success_rate} implies failures, but none were listed; "
+            "the failure list was probably read from the wrong key"
+        )
     if not 0.0 <= success_rate < 1.0:
         raise ValueError(f"success rate {success_rate} is not in [0, 1)")
     count = round(num_failed / (1.0 - success_rate))
