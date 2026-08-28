@@ -203,6 +203,22 @@ def parse_args(argv=None):
     )
     parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
     parser.add_argument(
+        "--terminations",
+        default=None,
+        help=(
+            "termination preset, e.g. tracking/base or tracking/eval. The stock training "
+            "preset (tracking/base_adaptive_strict_ori_foot_xyz) is STRICTER than the eval "
+            "preset -- 0.15 m position and 0.2 rad orientation, plus a 0.2 m foot term -- "
+            "which is right for a competent policy and fatal from scratch, where 93%% of "
+            "episodes die on tracking error in ~0.25 s and essentially none reach time-out."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-project",
+        default=None,
+        help="stream metrics to this Weights & Biases project; omit to stay offline",
+    )
+    parser.add_argument(
         "--motion-file",
         default=DEFAULT_MOTION_FILE,
         help="motion_lib pool every arm trains on",
@@ -318,9 +334,18 @@ def build_command(
         *origin,
         f"num_envs={args.num_envs}",
         "headless=true",
-        "use_wandb=false",
+        *(
+            ["use_wandb=true", f"project_name={args.wandb_project}"]
+            if getattr(args, "wandb_project", None)
+            else ["use_wandb=false"]
+        ),
         f"seed={seed}",
         "manager_env/events=tracking/lucid_curriculum",
+        *(
+            [f"manager_env/terminations={args.terminations}"]
+            if getattr(args, "terminations", None)
+            else []
+        ),
         f"++algo.config.num_learning_iterations={args.iterations}",
         "++algo.config.save_interval=100000",
         f"++manager_env.commands.motion.motion_lib_cfg.motion_file="
@@ -591,6 +616,10 @@ def main(argv=None) -> int:
                 for index, seed in enumerate(args.seeds)
             ],
             "event_preset": "tracking/lucid_curriculum",
+            "termination_preset": (
+                args.terminations or "tracking/base_adaptive_strict_ori_foot_xyz (exp default)"
+            ),
+            "wandb_project": args.wandb_project,
             "from_scratch": bool(args.from_scratch),
             "capsule_horizons": sorted(set(args.horizons or ())) + [args.iterations],
             "motion_file": args.motion_file,
