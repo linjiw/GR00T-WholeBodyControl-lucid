@@ -511,3 +511,79 @@ class TestPerChannelCaps:
     def test_a_cap_outside_the_unit_interval_is_rejected(self):
         with pytest.raises(ValueError):
             self._callback(term_lambda_caps={"push_robot": 1.5})
+
+
+class TestAnchorTargetEnvelope:
+    """The anchor must sample *this arm's* target, not the config's."""
+
+    def _callback(self, **kwargs):
+        return LucidCurriculumCallback(
+            enabled=True, mode="lucid", branch_id="anchor_target",
+            observer_branch_id="obs", initial_lambda=0.5, anchor_ratio=0.5,
+            anchor_seed=3, **kwargs,
+        )
+
+    def test_an_unrestricted_arm_anchors_on_the_baseline(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback()
+        callback.on_train_begin(None, None, None, env=env)
+        anchor = callback.dispatchers["randomize_rigid_body_mass"].anchor_params
+        assert anchor["mass_distribution_params"] == [0.8, 1.2]
+
+    def test_a_pinned_channel_is_pinned_for_the_anchor_too(self):
+        # Otherwise "everything except this channel" would be a claim about
+        # only half the environments.
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_overrides={"randomize_rigid_body_mass": 0.0})
+        callback.on_train_begin(None, None, None, env=env)
+        anchor = callback.dispatchers["randomize_rigid_body_mass"].anchor_params
+        assert anchor["mass_distribution_params"] == [1.0, 1.0]
+
+    def test_a_capped_channel_is_capped_for_the_anchor_too(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_caps={"randomize_rigid_body_mass": 0.5})
+        callback.on_train_begin(None, None, None, env=env)
+        anchor = callback.dispatchers["randomize_rigid_body_mass"].anchor_params
+        assert anchor["mass_distribution_params"] == pytest.approx(
+            DS.scale_range([0.8, 1.2], 0.5, 1.0)
+        )
+
+    def test_an_unrestricted_channel_keeps_its_full_range_alongside_a_capped_one(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_caps={"randomize_rigid_body_mass": 0.5})
+        callback.on_train_begin(None, None, None, env=env)
+        anchor = callback.dispatchers["push_robot"].anchor_params
+        assert anchor["velocity_range"]["x"] == [-0.5, 0.5]
+
+    def test_the_anchor_really_samples_the_restricted_range(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_overrides={"randomize_rigid_body_mass": 0.0})
+        callback.on_train_begin(None, None, None, env=env)
+        dispatch = callback.dispatchers["randomize_rigid_body_mass"]
+        recorder = dispatch.inner
+        recorder.calls.clear()
+        dispatch(None, torch.arange(16), mass_distribution_params=[1.0, 1.0])
+        assert all(
+            call[1]["mass_distribution_params"] == [1.0, 1.0] for call in recorder.calls
+        )
+
+    def test_material_anchor_buckets_follow_the_ceiling(self):
+        material = MaterialTerm(n=8)
+        mgr = manager(num_envs=16)
+        mgr._terms["physics_material"] = Term(
+            "reset",
+            {"static_friction_range": [0.3, 1.6], "dynamic_friction_range": [0.3, 1.2],
+             "restitution_range": [0.0, 0.5], "num_buckets": 8},
+            material,
+        )
+        mgr.active_terms = list(mgr._terms)
+        mgr._term_cfgs = list(mgr._terms.values())
+        env = FakeEnv(mgr, num_envs=16)
+        callback = self._callback(term_lambda_caps={"physics_material": 0.0})
+        callback.on_train_begin(None, None, None, env=env)
+        anchor_buckets = object.__getattribute__(
+            callback.dispatchers["physics_material"], "_anchor_buckets"
+        )
+        # lambda = 0 collapses friction to its midpoint and restitution to 0.
+        assert torch.allclose(anchor_buckets[:, 0], torch.full((8,), 0.95))
+        assert torch.allclose(anchor_buckets[:, 2], torch.zeros(8))

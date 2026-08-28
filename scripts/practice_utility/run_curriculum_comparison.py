@@ -52,8 +52,23 @@ NON_LATENCY_TERMS = (
 ARM_TERM_OVERRIDES: dict[str, dict[str, float]] = {
     "fixed_nolat": {"randomize_action_delay": 0.0},
     "fixed_latonly": {term: 0.0 for term in NON_LATENCY_TERMS},
+    # Latency-only *curriculum* arms. The untrained origin is already robust to
+    # the five non-latency channels (60.5% at the full envelope, 56.2% at 1.25x
+    # it) and has zero margin at a pinned 60 ms; training the full envelope
+    # destroys it, and channel attribution says latency carries 89% of that
+    # damage. So the only axis with headroom is the one that must be approached
+    # gently -- which is what these arms are: a gap-gated, stratified,
+    # relatively-guarded curriculum on latency alone.
+    "lucid_latonly_s4_rg": {term: 0.0 for term in NON_LATENCY_TERMS},
+    "ta_lucid_50_latonly_s4_rg": {term: 0.0 for term in NON_LATENCY_TERMS},
 }
 ARMS.update({"fixed_nolat": ("fixed", 0.0, None), "fixed_latonly": ("fixed", 0.0, None)})
+ARMS.update(
+    {
+        "lucid_latonly_s4_rg": ("lucid", 0.0, None),
+        "ta_lucid_50_latonly_s4_rg": ("lucid", 0.50, None),
+    }
+)
 
 #: LUCID-S arms. ``spread_strata = K`` splits the focus cohort into K intensity
 #: strata so the training mixture spans ``(0, lambda]`` rather than the single
@@ -94,6 +109,9 @@ ARM_RETURN_GUARD: dict[str, str] = {
     "ta_lucid_50_latcap_s4_rg": "relative",
 }
 ARM_SPREAD_STRATA.update({arm: 4 for arm in CAP_ARMS})
+LATONLY_ARMS = ("lucid_latonly_s4_rg", "ta_lucid_50_latonly_s4_rg")
+ARM_SPREAD_STRATA.update({arm: 4 for arm in LATONLY_ARMS})
+ARM_RETURN_GUARD.update({arm: "relative" for arm in LATONLY_ARMS})
 MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (

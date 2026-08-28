@@ -354,8 +354,18 @@ def install(
     event_manager: Any,
     baseline: dict[str, dict[str, Any]],
     assignment: CohortAssignment,
+    anchor_params: dict[str, dict[str, Any]] | None = None,
+    anchor_buckets: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, CohortDispatch]:
     """Wrap every runtime-scalable term in ``baseline`` with a dispatcher.
+
+    The anchor cohort trains on **the arm's own target envelope**, which is not
+    always the captured baseline. An arm that pins or caps a channel has a
+    narrower target than the config declares, and an anchor drawing from the
+    config would hand half the population the very exposure the arm exists to
+    withhold -- silently, since nothing else about the run would look wrong.
+    ``anchor_params`` and ``anchor_buckets`` name that target per term; a term
+    absent from them keeps the baseline, which is the un-restricted case.
 
     Idempotent: a term already dispatched is left alone.
     """
@@ -373,7 +383,11 @@ def install(
         if isinstance(func, CohortDispatch):
             installed[name] = func
             continue
-        dispatch = CohortDispatch(func, name, baseline[name], mask, stratum_masks)
+        target = (anchor_params or {}).get(name, baseline[name])
+        dispatch = CohortDispatch(func, name, target, mask, stratum_masks)
+        override_buckets = (anchor_buckets or {}).get(name)
+        if override_buckets is not None:
+            object.__setattr__(dispatch, "_anchor_buckets", override_buckets.clone())
         cfg.func = dispatch
         installed[name] = dispatch
     return installed

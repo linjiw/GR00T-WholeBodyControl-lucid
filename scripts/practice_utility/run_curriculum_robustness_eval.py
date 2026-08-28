@@ -25,6 +25,7 @@ MODES = (
     "ta_yoked_25x", "ta_yoked_50x",
     "lucid_s4", "lucid_rg", "lucid_s4_rg", "ta_lucid_50_s4_rg",
     "lucid_latcap_s4_rg", "ta_lucid_50_latcap_s4_rg",
+    "lucid_latonly_s4_rg", "ta_lucid_50_latonly_s4_rg",
 )
 #: Deployment-latency ladder: nominal physics on every other channel, with
 #: actuation latency pinned at a fixed level. The stock ``latency_60ms`` cell

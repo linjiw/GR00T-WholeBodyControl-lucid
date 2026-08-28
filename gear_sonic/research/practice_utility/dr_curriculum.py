@@ -339,7 +339,51 @@ class LucidCurriculumCallback(TrainerCallback):
             self.assignment = TACE.assign_cohorts(
                 num_envs, self.anchor_ratio, seed, reserved, num_strata=self.spread_strata
             )
-            self.dispatchers = TACE.install(manager, self.baseline, self.assignment)
+            anchor_params, anchor_buckets = self._anchor_target(manager)
+            self.dispatchers = TACE.install(
+                manager, self.baseline, self.assignment, anchor_params, anchor_buckets
+            )
+
+    def _anchor_target(
+        self, manager: Any
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """The envelope the anchor cohort should sample: *this arm's* target.
+
+        For an unrestricted channel that is the captured baseline. For a channel
+        this arm pins or caps, it is the baseline scaled to that channel's own
+        ceiling -- otherwise the anchor would train half the population on
+        exposure the arm was defined to withhold, and the pin or cap would be a
+        claim about only half the run.
+        """
+        from gear_sonic.research.practice_utility import events_reset_safe as ERS
+
+        params: dict[str, dict[str, Any]] = {}
+        buckets: dict[str, Any] = {}
+        if self.baseline is None:
+            return params, buckets
+        ceilings = {**self.term_lambda_overrides, **self.term_lambda_caps}
+        if not ceilings:
+            return params, buckets
+        terms = dict(DS._iter_terms(manager))
+        for name, ceiling in ceilings.items():
+            base = self.baseline.get(name)
+            if base is None:
+                continue
+            scaled = DS.scaled_term_params(base, ceiling)
+            params[name] = scaled
+            cfg = terms.get(name)
+            func = getattr(cfg, "func", None) if cfg is not None else None
+            if func is None or not any(key in scaled for key in DS.MATERIAL_RANGE_KEYS):
+                continue
+            drawn = ERS.draw_material_buckets(
+                func,
+                static_friction_range=DS._as_pair(scaled.get("static_friction_range")),
+                dynamic_friction_range=DS._as_pair(scaled.get("dynamic_friction_range")),
+                restitution_range=DS._as_pair(scaled.get("restitution_range")),
+            )
+            if drawn is not None:
+                buckets[name] = drawn
+        return params, buckets
 
     def _channel_lambda(self, name: str, lambda_value: float) -> float:
         """The intensity one channel actually runs at, after overrides and caps."""
