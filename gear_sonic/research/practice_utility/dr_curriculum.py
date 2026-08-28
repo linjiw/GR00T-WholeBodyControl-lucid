@@ -89,6 +89,7 @@ class LucidCurriculumCallback(TrainerCallback):
         consolidation_fraction: float = 0.0,
         yoked_schedule_path: str | None = None,
         term_lambda_overrides: dict[str, float] | None = None,
+        term_lambda_caps: dict[str, float] | None = None,
         spread_strata: int = 1,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked"):
@@ -134,6 +135,23 @@ class LucidCurriculumCallback(TrainerCallback):
         for name, value in self.term_lambda_overrides.items():
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f'term_lambda_overrides[{name!r}] must be in [0, 1], got {value}')
+        # A *cap* is the per-channel ceiling the scalar curriculum cannot
+        # express: the channel follows lambda up to its own limit and no
+        # further. An override pins a channel at a constant regardless of
+        # lambda; a cap lets it still be scheduled. "Everything except
+        # actuation latency" is a cap, not an override, and it is the shape
+        # LUCID-MC needs if one channel turns out to carry the harm.
+        self.term_lambda_caps = {
+            str(k): float(v) for k, v in (dict(term_lambda_caps) if term_lambda_caps else {}).items()
+        }
+        for name, value in self.term_lambda_caps.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"term_lambda_caps[{name!r}] must be in [0, 1], got {value}")
+            if name in self.term_lambda_overrides:
+                raise ValueError(
+                    f"term {name!r} has both an override and a cap; pick one -- an override "
+                    "pins the channel and a cap schedules it, and applying both hides which won"
+                )
         self._yoked_schedule: list[float] = []
         if mode == "yoked":
             self._yoked_schedule = _load_yoked_schedule(yoked_schedule_path)
@@ -282,6 +300,12 @@ class LucidCurriculumCallback(TrainerCallback):
         record["scalable_terms"] = self.scalable
         if self.term_lambda_overrides:
             record["term_lambda_overrides"] = self.term_lambda_overrides
+        if self.term_lambda_caps:
+            record["term_lambda_caps"] = self.term_lambda_caps
+            record["realized_channel_lambdas"] = {
+                name: self._channel_lambda(name, self.controller.lambda_value)
+                for name in sorted(self.term_lambda_caps)
+            }
         if self._resumed_from is not None:
             record["resumed_from"] = self._resumed_from
         if self.assignment is not None:
@@ -317,18 +341,30 @@ class LucidCurriculumCallback(TrainerCallback):
             )
             self.dispatchers = TACE.install(manager, self.baseline, self.assignment)
 
+    def _channel_lambda(self, name: str, lambda_value: float) -> float:
+        """The intensity one channel actually runs at, after overrides and caps."""
+        if name in self.term_lambda_overrides:
+            return self.term_lambda_overrides[name]
+        cap = self.term_lambda_caps.get(name)
+        return lambda_value if cap is None else min(lambda_value, cap)
+
     def _apply(self, lambda_value: float) -> None:
         if self._event_manager is None or self.baseline is None:
             return
+        per_term = tuple(self.term_lambda_overrides) + tuple(self.term_lambda_caps)
         DS.apply_lambda(
             self._event_manager,
             self.baseline,
             lambda_value,
-            exclude_terms=tuple(self.term_lambda_overrides),
+            exclude_terms=per_term,
         )
-        for name, value in self.term_lambda_overrides.items():
+        for name in per_term:
             if name in self.baseline:
-                DS.apply_lambda(self._event_manager, {name: self.baseline[name]}, value)
+                DS.apply_lambda(
+                    self._event_manager,
+                    {name: self.baseline[name]},
+                    self._channel_lambda(name, lambda_value),
+                )
         self._apply_strata(lambda_value)
 
     def _apply_strata(self, lambda_value: float) -> None:
@@ -349,7 +385,7 @@ class LucidCurriculumCallback(TrainerCallback):
             base = self.baseline.get(name)
             if base is None:
                 continue
-            channel_lambda = float(self.term_lambda_overrides.get(name, lambda_value))
+            channel_lambda = self._channel_lambda(name, lambda_value)
             for index, weight in enumerate(weights):
                 if index == len(weights) - 1:
                     dispatch.set_stratum(index, None)
@@ -455,6 +491,7 @@ class LucidCurriculumCallback(TrainerCallback):
             "controller": self.controller.state_dict(),
             "scalable_terms": self.scalable,
             "term_lambda_overrides": self.term_lambda_overrides,
+            "term_lambda_caps": self.term_lambda_caps,
             "tace": self.assignment.to_dict() if self.assignment is not None else None,
             "consolidating": self._consolidating,
         }

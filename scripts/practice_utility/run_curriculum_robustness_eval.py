@@ -24,6 +24,7 @@ MODES = (
     "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50",
     "ta_yoked_25x", "ta_yoked_50x",
     "lucid_s4", "lucid_rg", "lucid_s4_rg", "ta_lucid_50_s4_rg",
+    "lucid_latcap_s4_rg", "ta_lucid_50_latcap_s4_rg",
 )
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",

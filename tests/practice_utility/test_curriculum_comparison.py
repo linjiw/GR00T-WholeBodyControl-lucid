@@ -23,6 +23,7 @@ def args():
         smpl_motion_file="data/motion_lib_bones_seed/smpl_filtered",
         consolidation_fraction=0.0,
         spread_strata=1,
+        latency_cap=0.5,
         return_guard="absolute",
         return_relative_drop=0.25,
         return_window=8,

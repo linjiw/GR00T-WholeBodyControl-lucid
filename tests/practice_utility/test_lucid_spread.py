@@ -442,3 +442,72 @@ class TestRealizedStratumDose:
         callback.on_step_end(None, State(1, mean_reward=10.0), None, env=env)
         tace_block = callback.history[-1]["tace"]
         assert any(k.startswith("focus_s0") for k in tace_block)
+
+
+class TestPerChannelCaps:
+    """A cap schedules a channel to its own ceiling; an override pins it."""
+
+    def _callback(self, **kwargs):
+        return LucidCurriculumCallback(
+            enabled=True, mode="lucid", branch_id="cap", observer_branch_id="obs",
+            initial_lambda=0.0, **kwargs,
+        )
+
+    def test_a_capped_channel_follows_lambda_until_its_ceiling(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_caps={"randomize_rigid_body_mass": 0.5})
+        callback.on_train_begin(None, None, None, env=env)
+        term = env.event_manager._terms["randomize_rigid_body_mass"]
+        other = env.event_manager._terms["push_robot"]
+
+        callback._apply(0.3)
+        assert term.params["mass_distribution_params"] == DS.scale_range([0.8, 1.2], 0.3, 1.0)
+        callback._apply(0.9)
+        assert term.params["mass_distribution_params"] == DS.scale_range([0.8, 1.2], 0.5, 1.0)
+        # The uncapped channel is untouched by another channel's ceiling.
+        assert other.params["velocity_range"]["x"] == DS.scale_range([-0.5, 0.5], 0.9, 0.0)
+
+    def test_an_override_ignores_lambda_entirely(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_overrides={"randomize_rigid_body_mass": 0.0})
+        callback.on_train_begin(None, None, None, env=env)
+        term = env.event_manager._terms["randomize_rigid_body_mass"]
+        for value in (0.2, 0.9):
+            callback._apply(value)
+            assert term.params["mass_distribution_params"] == [1.0, 1.0]
+
+    def test_caps_compose_with_strata(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(
+            spread_strata=4, anchor_seed=1, term_lambda_caps={"randomize_rigid_body_mass": 0.5}
+        )
+        callback.on_train_begin(None, None, None, env=env)
+        callback._apply(1.0)
+        recorded = callback.dispatchers["randomize_rigid_body_mass"].telemetry()["stratum_params"]
+        # Capped at 0.5, then scaled by each stratum weight.
+        for index, weight in enumerate((0.25, 0.5, 0.75)):
+            assert recorded[index]["mass_distribution_params"] == pytest.approx(
+                DS.scale_range([0.8, 1.2], 0.5 * weight, 1.0)
+            )
+
+    def test_the_realized_channel_intensity_is_logged(self):
+        env = FakeEnv(manager(num_envs=16), num_envs=16)
+        callback = self._callback(term_lambda_caps={"randomize_rigid_body_mass": 0.4})
+        OBS._ACTIVE_OBSERVERS["obs"] = StubObserver([0.5] * 8, branch_id="obs")
+        callback.on_train_begin(None, None, None, env=env)
+        callback.controller.lambda_value = 0.9
+        callback.on_step_end(None, State(1, mean_reward=10.0), None, env=env)
+        record = callback.history[-1]
+        assert record["term_lambda_caps"] == {"randomize_rigid_body_mass": 0.4}
+        assert record["realized_channel_lambdas"]["randomize_rigid_body_mass"] <= 0.4
+
+    def test_a_channel_cannot_be_both_pinned_and_capped(self):
+        with pytest.raises(ValueError, match="pick one"):
+            self._callback(
+                term_lambda_overrides={"push_robot": 0.0},
+                term_lambda_caps={"push_robot": 0.5},
+            )
+
+    def test_a_cap_outside_the_unit_interval_is_rejected(self):
+        with pytest.raises(ValueError):
+            self._callback(term_lambda_caps={"push_robot": 1.5})

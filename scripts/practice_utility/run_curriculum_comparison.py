@@ -74,11 +74,26 @@ ARM_SPREAD_STRATA: dict[str, int] = {
     "lucid_s4_rg": 4,
     "ta_lucid_50_s4_rg": 4,
 }
+#: Per-channel *ceilings*. Unlike ARM_TERM_OVERRIDES, which pins a channel at a
+#: constant, a cap lets the curriculum still schedule the channel up to its own
+#: limit -- the one thing a scalar lambda cannot express. These arms exist for
+#: the case where channel attribution names a single destructive channel; the
+#: cap value is set at launch by --latency-cap and recorded in the receipt.
+CAP_ARMS = ("lucid_latcap_s4_rg", "ta_lucid_50_latcap_s4_rg")
+ARMS.update(
+    {
+        "lucid_latcap_s4_rg": ("lucid", 0.0, None),
+        "ta_lucid_50_latcap_s4_rg": ("lucid", 0.50, None),
+    }
+)
 ARM_RETURN_GUARD: dict[str, str] = {
     "lucid_rg": "relative",
     "lucid_s4_rg": "relative",
     "ta_lucid_50_s4_rg": "relative",
+    "lucid_latcap_s4_rg": "relative",
+    "ta_lucid_50_latcap_s4_rg": "relative",
 }
+ARM_SPREAD_STRATA.update({arm: 4 for arm in CAP_ARMS})
 MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
@@ -125,6 +140,12 @@ def parse_args(argv=None):
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--integral-max", type=float, default=1.0)
     parser.add_argument("--return-floor", type=float, default=8.0)
+    parser.add_argument(
+        "--latency-cap",
+        type=float,
+        default=0.5,
+        help="cap arms: ceiling on the actuation-latency channel's share of lambda",
+    )
     parser.add_argument(
         "--return-relative-drop",
         type=float,
@@ -211,6 +232,11 @@ def build_command(
         f"++callbacks.lucid_curriculum.term_lambda_overrides.{term}={value}"
         for term, value in ARM_TERM_OVERRIDES.get(mode, {}).items()
     ]
+    caps = (
+        [f"++callbacks.lucid_curriculum.term_lambda_caps.randomize_action_delay={args.latency_cap}"]
+        if mode in CAP_ARMS
+        else []
+    )
     strata = ARM_SPREAD_STRATA.get(mode, 1)
     guard = ARM_RETURN_GUARD.get(mode, "absolute")
     spread = [f"++callbacks.lucid_curriculum.spread_strata={strata}"] if strata > 1 else []
@@ -257,6 +283,7 @@ def build_command(
         *tace,
         *yoked,
         *overrides,
+        *caps,
         *spread,
         *relative_guard,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
@@ -442,6 +469,9 @@ def main(argv=None) -> int:
                     "term_lambda_overrides": ARM_TERM_OVERRIDES.get(mode, {}),
                     "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
+                    "term_lambda_caps": (
+                        {"randomize_action_delay": args.latency_cap} if mode in CAP_ARMS else {}
+                    ),
                     "yoked_schedule_path": str(schedule_for(seed, mode)) if ARMS[mode][2] else None,
                 },
                 "tace_final": curriculum[-1].get("tace") if curriculum else None,
