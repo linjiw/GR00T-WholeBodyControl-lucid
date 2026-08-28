@@ -340,3 +340,36 @@ class TestYoked:
         for step in range(5):
             cb.on_step_end(None, State(step), None, env=env)
         assert cb.controller.lambda_value == 0.2
+
+
+class TestTermOverrides:
+    def _manager(self):
+        return Manager(
+            {
+                "randomize_rigid_body_mass": Term("reset", {"mass_distribution_params": [0.8, 1.2]}, Recorder()),
+                "randomize_action_delay": Term("reset", {"delay_range": [0.0, 8.0]}, Recorder()),
+            }
+        )
+
+    def test_override_pins_one_term_while_the_rest_follow_lambda(self):
+        env = FakeEnv(self._manager())
+        cb = curriculum(mode="fixed", fixed_lambda=1.0, term_lambda_overrides={"randomize_action_delay": 0.0})
+        cb.on_train_begin(None, State(0), None, env=env)
+        terms = env.event_manager._terms
+        assert terms["randomize_rigid_body_mass"].params["mass_distribution_params"] == [0.8, 1.2]
+        assert terms["randomize_action_delay"].params["delay_range"] == pytest.approx([0.0, 0.0])
+        cb.on_step_end(None, State(1), None, env=env)
+        assert terms["randomize_action_delay"].params["delay_range"] == pytest.approx([0.0, 0.0])
+        assert cb.history[-1]["term_lambda_overrides"] == {"randomize_action_delay": 0.0}
+
+    def test_latency_only(self):
+        env = FakeEnv(self._manager())
+        cb = curriculum(mode="fixed", fixed_lambda=1.0, term_lambda_overrides={"randomize_rigid_body_mass": 0.0})
+        cb.on_train_begin(None, State(0), None, env=env)
+        terms = env.event_manager._terms
+        assert terms["randomize_rigid_body_mass"].params["mass_distribution_params"] == pytest.approx([1.0, 1.0])
+        assert terms["randomize_action_delay"].params["delay_range"] == [0.0, 8.0]
+
+    def test_rejects_out_of_range(self):
+        with pytest.raises(ValueError, match="term_lambda_overrides"):
+            curriculum(term_lambda_overrides={"x": 1.5})

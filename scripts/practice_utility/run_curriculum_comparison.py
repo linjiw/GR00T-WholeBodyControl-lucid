@@ -40,6 +40,20 @@ ARMS: dict[str, tuple[str, float, str | None]] = {
     "ta_yoked_50x": ("yoked", 0.50, "ta_lucid_50"),
 }
 CROSS_SEED_ARMS = {"ta_yoked_25x", "ta_yoked_50x"}
+#: Channel-attribution arms: fixed intensity with per-term overrides.
+NON_LATENCY_TERMS = (
+    "add_joint_default_pos",
+    "base_com",
+    "physics_material",
+    "push_robot",
+    "randomize_rigid_body_mass",
+)
+ARM_TERM_OVERRIDES: dict[str, dict[str, float]] = {
+    "fixed_nolat": {"randomize_action_delay": 0.0},
+    "fixed_latonly": {term: 0.0 for term in NON_LATENCY_TERMS},
+}
+ARMS.update({"fixed_nolat": ("fixed", 0.0, None), "fixed_latonly": ("fixed", 0.0, None)})
+MODES = tuple(ARMS)
 MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
@@ -137,6 +151,10 @@ def build_command(
         if curriculum_mode == "yoked"
         else []
     )
+    overrides = [
+        f"++callbacks.lucid_curriculum.term_lambda_overrides.{term}={value}"
+        for term, value in ARM_TERM_OVERRIDES.get(mode, {}).items()
+    ]
     return [
         sys.executable,
         str(REPO / "scripts" / "practice_utility" / "train_with_delay.py"),
@@ -164,6 +182,7 @@ def build_command(
         f"++callbacks.lucid_curriculum.mode={curriculum_mode}",
         *tace,
         *yoked,
+        *overrides,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
@@ -344,6 +363,7 @@ def main(argv=None) -> int:
                     "anchor_ratio": ARMS[mode][1],
                     "yoked_source": ARMS[mode][2],
                     "yoked_cross_seed": mode in CROSS_SEED_ARMS,
+                    "term_lambda_overrides": ARM_TERM_OVERRIDES.get(mode, {}),
                     "yoked_schedule_path": str(schedule_for(seed, mode)) if ARMS[mode][2] else None,
                 },
                 "tace_final": curriculum[-1].get("tace") if curriculum else None,

@@ -85,6 +85,7 @@ class LucidCurriculumCallback(TrainerCallback):
         anchor_reserved_focus_envs: tuple[int, ...] | list[int] = (0,),
         consolidation_fraction: float = 0.0,
         yoked_schedule_path: str | None = None,
+        term_lambda_overrides: dict[str, float] | None = None,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked"):
             raise ValueError(
@@ -110,6 +111,14 @@ class LucidCurriculumCallback(TrainerCallback):
         self.dispatchers: dict[str, TACE.CohortDispatch] = {}
         self._consolidating = False
         self.yoked_schedule_path = yoked_schedule_path
+        # Per-term fixed intensities applied after the global lambda: a channel
+        # attribution tool (e.g. everything at 1 except latency at 0).
+        self.term_lambda_overrides = {
+            str(k): float(v) for k, v in (dict(term_lambda_overrides) if term_lambda_overrides else {}).items()
+        }
+        for name, value in self.term_lambda_overrides.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f'term_lambda_overrides[{name!r}] must be in [0, 1], got {value}')
         self._yoked_schedule: list[float] = []
         if mode == "yoked":
             self._yoked_schedule = _load_yoked_schedule(yoked_schedule_path)
@@ -253,6 +262,8 @@ class LucidCurriculumCallback(TrainerCallback):
             }
 
         record["scalable_terms"] = self.scalable
+        if self.term_lambda_overrides:
+            record["term_lambda_overrides"] = self.term_lambda_overrides
         if self._resumed_from is not None:
             record["resumed_from"] = self._resumed_from
         if self.assignment is not None:
@@ -289,7 +300,15 @@ class LucidCurriculumCallback(TrainerCallback):
     def _apply(self, lambda_value: float) -> None:
         if self._event_manager is None or self.baseline is None:
             return
-        DS.apply_lambda(self._event_manager, self.baseline, lambda_value)
+        DS.apply_lambda(
+            self._event_manager,
+            self.baseline,
+            lambda_value,
+            exclude_terms=tuple(self.term_lambda_overrides),
+        )
+        for name, value in self.term_lambda_overrides.items():
+            if name in self.baseline:
+                DS.apply_lambda(self._event_manager, {name: self.baseline[name]}, value)
 
     def _gaps(self) -> list[float]:
         observer = OBS.get_active_observer(self.observer_branch_id)
@@ -367,6 +386,7 @@ class LucidCurriculumCallback(TrainerCallback):
             "branch_id": self.branch_id,
             "controller": self.controller.state_dict(),
             "scalable_terms": self.scalable,
+            "term_lambda_overrides": self.term_lambda_overrides,
             "tace": self.assignment.to_dict() if self.assignment is not None else None,
             "consolidating": self._consolidating,
         }
