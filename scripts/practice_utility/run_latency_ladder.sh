@@ -20,8 +20,10 @@ LOG="$OUT/lucid_s_driver.log"
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 receipt_of() { grep -o "receipt [^ ]*json" "$1" | tail -1 | cut -d' ' -f2; }
 
-say "stage 11 (latency ladder) armed; waiting for stages 9 and 10"
-while ! grep -q "stages 9 and 10 done" "$LOG" 2>/dev/null; do sleep 120; done
+# Chained behind the budget curve rather than behind stages 9/10, so the two
+# never contend for the one card.
+say "stage 11 (latency ladder) armed; waiting for the budget curve"
+while ! grep -q "budget curve done" "$LOG" 2>/dev/null; do sleep 120; done
 
 ladder() {  # $1 label, $2 training receipt, $3 stdout log, $4.. modes
   local label="$1" receipt="$2" log="$3"; shift 3
