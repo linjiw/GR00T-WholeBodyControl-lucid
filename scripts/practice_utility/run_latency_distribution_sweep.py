@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO))
 from scripts.practice_utility import run_curriculum_robustness_eval as CR
 from scripts.practice_utility import run_latency_ab as LA
 from scripts.practice_utility import run_throughput_probe as TP
-from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT, relocate  # noqa: E402
 
 MODES = ("lucid", "fixed", "off")
 EXPECTED_RESET_TERMS = CR.EXPECTED_DR_TERMS
@@ -211,7 +211,7 @@ def materialize_panel(args: argparse.Namespace, role: str) -> dict[str, Any]:
     motion_dir = args.suite_root / role / "robot_filtered"
     motion_dir.mkdir(parents=True, exist_ok=True)
     for key in selected:
-        source = Path(records[key]["path"]).resolve()
+        source = relocate(records[key]["path"]).resolve()
         link = motion_dir / f"{key}.pkl"
         if link.is_symlink():
             if link.resolve() != source:

@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from gear_sonic.research.practice_utility import latent_gap_probe as L
-from gear_sonic.research.practice_utility.paths import LUCID_ROOT
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT, relocate
 
 ARTIFACT = LUCID_ROOT / "artifacts/lucid_encoder_debug512.pt"
 POOL = LUCID_ROOT / "manifests/pool_debug512.json"
@@ -64,7 +64,7 @@ def held_out_clips():
     for record in pool["motions"]:
         if split["assignment"][record["motion_key"]] != "test":
             continue
-        clip = joblib.load(record["path"])[record["motion_key"]]
+        clip = joblib.load(relocate(record["path"]))[record["motion_key"]]
         dof = resample(
             np.asarray(clip["dof"], dtype=np.float32), float(clip.get("fps", 30)), CONTROL_HZ
         ).astype(np.float32)

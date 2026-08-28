@@ -32,9 +32,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -42,6 +42,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gear_sonic.research.practice_utility import latent_gap_probe as L  # noqa: E402
+from gear_sonic.research.practice_utility.paths import relocate
 
 
 def parse_args(argv=None):
@@ -96,7 +97,7 @@ def build_corpus(args, motions, allowed) -> tuple[torch.Tensor, dict]:
     for record in motions:
         if record["motion_key"] not in allowed:
             continue
-        clip = joblib.load(record["path"])[record["motion_key"]]
+        clip = joblib.load(relocate(record["path"]))[record["motion_key"]]
         dof = np.asarray(clip["dof"], dtype=np.float32)
         dof = resample(dof, float(clip.get("fps", 30)), args.control_hz).astype(np.float32)
         dofs = dofs or dof.shape[1]

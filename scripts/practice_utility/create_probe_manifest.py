@@ -46,6 +46,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from gear_sonic.research.practice_utility.paths import relocate
 from gear_sonic.research.practice_utility import motion_pool as MP
 from gear_sonic.research.practice_utility import probe_manifest as PM
 from gear_sonic.research.practice_utility import proxy_features as PF
@@ -732,7 +733,7 @@ def build_candidates(
         regime, extras = "unknown", {}
         if with_features:
             if motion_key not in cache:
-                cache[motion_key] = joblib.load(record["path"])[motion_key]
+                cache[motion_key] = joblib.load(relocate(record["path"]))[motion_key]
             clip = cache[motion_key]
             frames = int(clip["dof"].shape[0])
             source_fps = float(clip.get("fps", record.get("fps", 30.0)))

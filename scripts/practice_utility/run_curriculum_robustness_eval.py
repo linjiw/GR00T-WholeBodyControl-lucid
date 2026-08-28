@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO))
 
 from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
 from scripts.practice_utility import run_throughput_probe as TP
-from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
+from gear_sonic.research.practice_utility.paths import LUCID_ROOT, relocate  # noqa: E402
 
 MODES = ("lucid", "fixed", "off", "origin", "fixed_nolat", "fixed_latonly", "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50", "ta_yoked_25x", "ta_yoked_50x")
 PRESETS = {
@@ -145,7 +145,7 @@ def materialize_suite(
     motion_dir = suite_root / "robot_filtered"
     motion_dir.mkdir(parents=True, exist_ok=True)
     for key in sorted(selected):
-        source = Path(motion_by_key[key]["path"]).resolve()
+        source = relocate(motion_by_key[key]["path"]).resolve()
         if not source.is_file():
             raise FileNotFoundError(source)
         link = motion_dir / f"{key}.pkl"

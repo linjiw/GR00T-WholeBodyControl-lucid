@@ -34,6 +34,29 @@ OUTPUTS = LUCID_ROOT / "outputs"
 POOLS = LUCID_ROOT / "pools"
 TMP = LUCID_ROOT / "tmp"
 
+
+def relocate(recorded: str | Path) -> Path:
+    """Re-root a path recorded on another host onto this host's data root.
+
+    Frozen manifests store absolute paths under the data root of the host that
+    wrote them. The path itself is not part of any content hash -- clip hashes
+    cover the trajectory bytes -- so re-rooting is safe and changes no identity.
+
+    Returns the recorded path unchanged when it exists, or when it does not sit
+    under a known data root; only a path that is both missing and re-rootable is
+    rewritten, and only if the rewrite actually resolves. That keeps a genuinely
+    missing file reported as missing at its original location.
+    """
+    path = Path(recorded)
+    if path.exists() or LUCID_ROOT == DEFAULT_LUCID_ROOT:
+        return path
+    try:
+        moved = LUCID_ROOT / path.relative_to(DEFAULT_LUCID_ROOT)
+    except ValueError:
+        return path
+    return moved if moved.exists() else path
+
+
 __all__ = [
     "ARTIFACTS",
     "DEFAULT_LUCID_ROOT",
@@ -43,4 +66,5 @@ __all__ = [
     "POOLS",
     "TMP",
     "lucid_root",
+    "relocate",
 ]
