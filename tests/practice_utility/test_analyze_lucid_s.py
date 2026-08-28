@@ -292,3 +292,55 @@ class TestExtraEval:
         assert {k: v["verdict"] for k, v in merged["hypotheses"].items()} == \
             {k: v["verdict"] for k, v in plain["hypotheses"].items()}
         assert merged["inputs"]["extra_eval"] == [str(extra)]
+
+
+class TestScalingAndMerging:
+    """Two defects that produced plausible wrong numbers rather than errors."""
+
+    def test_auc_comparison_is_not_scaled_twice(self):
+        # profile_auc returns POINTS. Scaling again reads 1.37 pts as 137.25.
+        auc_t = {"8600": 60.0, "8601": 62.0}
+        auc_r = {"8600": 58.0, "8601": 61.0}
+        out = A.paired(auc_t, auc_r, scale=1.0)
+        assert out["mean_pts"] == pytest.approx(1.5)
+        # Rates are fractions and DO need the x100.
+        rate_t, rate_r = {"8600": 0.60}, {"8600": 0.58}
+        assert A.paired(rate_t, rate_r)["mean_pts"] == pytest.approx(2.0)
+
+    def test_h_s1_uses_the_unscaled_comparison(self, tmp_path):
+        base = TestEndToEnd()
+        paths = base._write(tmp_path, treatment_wins=True)
+        assert A.main([
+            "--preregistration", str(paths["prereg"]),
+            "--stage7-training", str(paths["s7t"]), "--stage8-training", str(paths["s8t"]),
+            "--stage7-eval", str(paths["s7e"]), "--stage8-eval", str(paths["s8e"]),
+            "--origin-eval", str(paths["oe"]),
+            "--receipt-dir", str(tmp_path), "--bootstrap-samples", "0",
+        ]) == 0
+        out = json.loads(sorted(tmp_path.glob("lucid_s_analysis_*.json"))[-1].read_text())
+        delta = out["hypotheses"]["H_S1"]["evidence"]["mean_pts"]
+        # A success-rate difference can never exceed 100 points.
+        assert abs(delta) <= 100.0
+
+    def test_merging_two_receipts_unions_seeds_instead_of_clobbering(self):
+        # A crashed run and the run finishing its remaining seeds: same arm,
+        # same preset, different seeds. dict.update would drop the first.
+        crashed = eval_receipt({"id_clean": {"fixed": {8600: 0.50, 8601: 0.60}}})
+        retry = eval_receipt({"id_clean": {"fixed": {8602: 0.70}}})
+        merged = A.merge_summaries(crashed, retry)
+        seeds = merged["id_clean"]["fixed"]["metrics"]["success_rate"]["per_checkpoint_seed"]
+        assert set(seeds) == {"8600", "8601", "8602"}
+        assert merged["id_clean"]["fixed"]["metrics"]["success_rate"]["mean"] == pytest.approx(0.60)
+
+    def test_merging_disjoint_arms_is_unchanged(self):
+        a = eval_receipt({"id_clean": {"fixed": {8600: 0.5}}})
+        b = eval_receipt({"id_clean": {"lucid": {8600: 0.7}}})
+        merged = A.merge_summaries(a, b)
+        assert set(merged["id_clean"]) == {"fixed", "lucid"}
+
+    def test_a_seed_in_both_receipts_takes_the_later_value(self):
+        a = eval_receipt({"id_clean": {"fixed": {8600: 0.50}}})
+        b = eval_receipt({"id_clean": {"fixed": {8600: 0.90}}})
+        merged = A.merge_summaries(a, b)
+        seeds = merged["id_clean"]["fixed"]["metrics"]["success_rate"]["per_checkpoint_seed"]
+        assert seeds["8600"] == pytest.approx(0.90)

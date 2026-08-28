@@ -56,10 +56,19 @@ def mean_pts(values: dict[str, float]) -> float | None:
     return 100.0 * statistics.fmean(values.values()) if values else None
 
 
-def paired(treatment: dict[str, float], reference: dict[str, float]) -> dict[str, Any]:
-    """Per-seed differences in success-rate points, and how many favour us."""
+def paired(
+    treatment: dict[str, float], reference: dict[str, float], scale: float = 100.0
+) -> dict[str, Any]:
+    """Per-seed differences in success-rate points, and how many favour us.
+
+    ``scale`` converts the inputs to points. Success rates arrive as fractions
+    and need ``scale = 100``; profile AUC arrives from :func:`profile_auc`
+    *already in points* and needs ``scale = 1``. Scaling twice reads a 1.37 pt
+    difference as 137.25, which is exactly the defect this parameter exists to
+    make impossible to reintroduce silently.
+    """
     common = sorted(set(treatment) & set(reference))
-    deltas = {s: 100.0 * (treatment[s] - reference[s]) for s in common}
+    deltas = {s: scale * (treatment[s] - reference[s]) for s in common}
     values = list(deltas.values())
     return {
         "per_seed_pts": deltas,
@@ -151,13 +160,32 @@ def controller_summary(training: dict[str, Any], mode: str) -> dict[str, Any]:
 
 
 def merge_summaries(*receipts: dict[str, Any]) -> dict[str, Any]:
-    """One preset -> mode -> metrics view across several evaluation receipts."""
+    """One preset -> mode -> metrics view across several evaluation receipts.
+
+    Two receipts can hold the same ``(preset, mode)`` with *different* checkpoint
+    seeds -- a crashed run and the run that finished its remaining seeds is
+    exactly that shape. A plain ``dict.update`` would drop the earlier seeds and
+    silently report a subset as if it were the whole arm, so per-seed values are
+    unioned and the mean recomputed from the union. A seed present in both
+    receipts keeps the later value.
+    """
     merged: dict[str, Any] = {}
     for receipt in receipts:
         if not receipt:
             continue
         for preset, modes in (receipt.get("mode_summary") or {}).items():
-            merged.setdefault(preset, {}).update(modes)
+            for mode, block in modes.items():
+                existing = merged.setdefault(preset, {}).get(mode)
+                if existing is None:
+                    merged[preset][mode] = json.loads(json.dumps(block))
+                    continue
+                for metric, values in (block.get("metrics") or {}).items():
+                    target = existing.setdefault("metrics", {}).setdefault(metric, {})
+                    per_seed = target.setdefault("per_checkpoint_seed", {})
+                    per_seed.update(values.get("per_checkpoint_seed") or {})
+                    present = [v for v in per_seed.values() if v is not None]
+                    if present:
+                        target["mean"] = statistics.fmean(present)
     return merged
 
 
@@ -325,7 +353,8 @@ def main(argv=None) -> int:
     findings: dict[str, Any] = {}
 
     a_s4, a_lucid = auc("lucid_s4"), auc("lucid")
-    d = paired(a_s4, a_lucid) if a_s4 and a_lucid else None
+    # profile_auc already returns points, so this comparison must not rescale.
+    d = paired(a_s4, a_lucid, scale=1.0) if a_s4 and a_lucid else None
     findings["H_S1"] = {
         "claim": prereg["hypotheses"]["H_S1"],
         "evidence": d,

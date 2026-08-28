@@ -234,7 +234,11 @@ def wait_for_gpu(min_free_mib: int, max_wait_seconds: float, poll_seconds: float
 def run_arm(command: list[str], log_path: Path, min_free_mib: int) -> dict[str, Any]:
     import os
 
-    max_wait = float(os.environ.get("LUCID_GPU_WAIT_SECONDS", "0"))
+    # Default to queueing, not dying. A gate that raises the instant the card is
+    # busy turns any concurrent job into a lost campaign: stage 8's evaluation
+    # died 54 cells into 75 because this defaulted to 0 and no driver set it.
+    # Training metrics are valid under contention; only wall-clock is not.
+    max_wait = float(os.environ.get("LUCID_GPU_WAIT_SECONDS", "1800"))
     initial_gpu = wait_for_gpu(min_free_mib, max_wait)
     samples: list[dict[str, float]] = []
     stop = threading.Event()

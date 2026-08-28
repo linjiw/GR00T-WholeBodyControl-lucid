@@ -574,10 +574,16 @@ def main(argv=None) -> int:
             print(json.dumps({"branch_id": branch_id, "summary": summary}, indent=2), flush=True)
     finally:
         receipt_path.write_text(json.dumps(make_receipt(), indent=2) + "\n")
+        # Announce the path from the finally block too. The receipt is written
+        # on every arm and again here, but this print used to sit *after* the
+        # try/finally, so a crash produced a complete receipt that no driver
+        # could find -- every driver locates it by grepping stdout for exactly
+        # this line. 54 cells of a preregistered evaluation were nearly
+        # re-run because of that gap.
+        print(f"receipt {receipt_path}", flush=True)
 
     receipt = make_receipt()
     print(json.dumps(receipt["mode_summary"], indent=2))
-    print(f"receipt {receipt_path}")
     return 0 if receipt["verified"] else 1
 
 
