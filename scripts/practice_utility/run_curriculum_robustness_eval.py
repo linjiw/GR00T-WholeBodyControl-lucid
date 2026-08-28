@@ -39,6 +39,19 @@ PRESET_FIXED_LATENCY_STEPS = {
     "lat_40ms": 8,
     "lat_60ms": 12,
 }
+#: Physics-only ladder: the five non-latency channels scaled, actuation latency
+#: pinned to ZERO. The `dr_*` cells all carry the full 0-40 ms latency envelope
+#: while `id_clean` carries none, so a `dr_*` ladder moves two factors at once.
+#: That was survivable when every arm had been fine-tuned from a policy trained
+#: with latency; a from-scratch no-DR arm has never seen latency at all, and a
+#: ladder that floors the control cannot rank anything.
+PRESET_PHYSICS_ONLY = {
+    "phys_000": 0.0,
+    "phys_050": 0.5,
+    "phys_100": 1.0,
+    "phys_125": 1.25,
+    "phys_150": 1.5,
+}
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
@@ -53,6 +66,7 @@ PRESETS = {
     "dr_125": "tracking/lucid_curriculum",
     "dr_150": "tracking/lucid_curriculum",
     **{name: "tracking/lucid_eval_clean" for name in PRESET_FIXED_LATENCY_STEPS},
+    **{name: "tracking/lucid_curriculum" for name in PRESET_PHYSICS_ONLY},
 }
 PRESET_DR_SCALE = {
     "dr_025": 0.25,
@@ -120,6 +134,16 @@ def parse_args(argv=None):
         default=LUCID_ROOT / "manifests/split_debug512_content.json",
     )
     parser.add_argument("--partition", default="dev")
+    parser.add_argument(
+        "--panel-receipt",
+        type=Path,
+        default=None,
+        help=(
+            "evaluate on a lucid_replicate_panel instead of a split partition. Needed for a "
+            "single-motion policy: the frozen 102-motion dev panel is not a meaningful test "
+            "of one, and a literal one-motion panel is scored on environment 0 alone."
+        ),
+    )
     parser.add_argument(
         "--suite-root",
         type=Path,
@@ -204,6 +228,40 @@ def materialize_suite(
     }
 
 
+def panel_suite(panel_receipt: Path) -> dict[str, Any]:
+    """Use a replicate panel as the evaluation suite, verifying it first."""
+    panel = json.loads(Path(panel_receipt).read_text())
+    if panel.get("kind") != "lucid_replicate_panel":
+        raise ValueError(f"{panel_receipt} is not a lucid_replicate_panel receipt")
+    motion_dir = Path(panel["motion_file"])
+    present = sorted(p.stem for p in motion_dir.glob("*.pkl"))
+    if len(present) != panel["replicates"]:
+        raise ValueError(
+            f"panel declares {panel['replicates']} replicates but {len(present)} are on disk"
+        )
+    targets = {p.resolve() for p in motion_dir.glob("*.pkl")}
+    if len(targets) != 1:
+        raise ValueError(f"panel aliases resolve to {len(targets)} distinct clips, expected 1")
+    return {
+        "motion_file": str(motion_dir.resolve()),
+        "motion_count": len(present),
+        "motion_keys_sha256": hashlib.sha256(
+            ("\n".join(present) + "\n").encode()
+        ).hexdigest(),
+        "pool_sha256": panel.get("pool_sha256"),
+        "split_sha256": panel.get("split_sha256"),
+        "split_linkage": "replicate-panel",
+        "partition": panel.get("partition"),
+        "replicate_panel": {
+            "receipt": str(panel_receipt),
+            "motion_key": panel["motion_key"],
+            "source_clip_sha256": panel["source_clip_sha256"],
+            "replicates": panel["replicates"],
+            "alias_keys_sha256": panel["alias_keys_sha256"],
+        },
+    }
+
+
 def checkpoint_index(training_receipt: dict[str, Any]) -> dict[tuple[int, str], Path]:
     index = {}
     for arm in training_receipt["arms"].values():
@@ -277,7 +335,12 @@ def build_command(
         f"++callbacks.practice_eval.preset_id={preset}",
         f"++callbacks.practice_eval.branch_id={branch_id}",
         *(
-            [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
+            [
+                f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_PHYSICS_ONLY[preset]}",
+                "++callbacks.practice_eval.fixed_latency_steps=0",
+            ]
+            if preset in PRESET_PHYSICS_ONLY
+            else [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
             if preset in PRESET_DR_SCALE
             else [
                 "++callbacks.practice_eval.fixed_latency_steps="
@@ -389,6 +452,9 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
             and delay.get("action_delay_max_steps") == 8
             and delay.get("action_delay_nonzero_fraction", 0) > 0
         )
+    if preset in PRESET_PHYSICS_ONLY:
+        # Latency is pinned to zero, so every live lag must read zero.
+        return delay.get("action_delay_max_steps") == 0
     if preset in PRESET_FIXED_LATENCY_STEPS:
         # A ladder cell is only a measurement of that latency if every live lag
         # really sat at it. A zero-step rung is legitimately all-zero.
@@ -403,7 +469,7 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
 def main(argv=None) -> int:
     args = parse_args(argv)
     training_receipt = load_json(args.training_receipt)
-    suite = materialize_suite(
+    suite = panel_suite(args.panel_receipt) if args.panel_receipt else materialize_suite(
         args.pool_manifest, args.split_manifest, args.partition, args.suite_root
     )
     checkpoints = checkpoint_index(training_receipt)

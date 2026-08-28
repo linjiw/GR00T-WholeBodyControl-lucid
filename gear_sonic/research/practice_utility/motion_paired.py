@@ -55,7 +55,13 @@ class MotionOutcome:
         return [0 if i in self.failed_indices else 1 for i in range(self.motion_count)]
 
 
-def read_outcome(metrics_path: str | Path, seed: int, mode: str, preset: str) -> MotionOutcome:
+def read_outcome(
+    metrics_path: str | Path,
+    seed: int,
+    mode: str,
+    preset: str,
+    motion_count: int | None = None,
+) -> MotionOutcome:
     """Load one ``metrics_eval.json`` into a per-motion success vector.
 
     ``failed_idxes`` / ``failed_keys`` sit at the top level of the payload, not
@@ -75,7 +81,21 @@ def read_outcome(metrics_path: str | Path, seed: int, mode: str, preset: str) ->
     indices = [int(i) for i in raw_indices or []]
     keys = list(raw_keys or [])
     rate = float(payload["eval/success/success_rate"])
-    count = _motion_count(rate, len(indices))
+    # A run that failed nothing cannot have its panel size inferred from the
+    # rate, and used to raise -- which outcomes_from_receipt swallowed, so a
+    # PERFECT arm silently vanished instead of winning. That is a
+    # direction-biased dropout: it removes exactly the best arms. When the
+    # caller knows the panel size (the evaluation receipt records it), use it.
+    if motion_count is not None:
+        count = int(motion_count)
+        expected = (count - len(indices)) / count
+        if abs(expected - rate) > 1e-6:
+            raise ValueError(
+                f"recorded motion_count {count} and {len(indices)} failures imply a rate of "
+                f"{expected}, but the run reports {rate}"
+            )
+    else:
+        count = _motion_count(rate, len(indices))
     if len(keys) != len(indices):
         keys = [""] * len(indices)
     return MotionOutcome(
@@ -316,6 +336,7 @@ def outcomes_from_receipt(
     """
     wanted = set(presets) if presets else None
     out: dict[tuple[str, str], list[MotionOutcome]] = {}
+    dropped: list[dict[str, Any]] = []
     for run in receipt.get("runs", {}).values():
         preset = run.get("preset")
         if wanted is not None and preset not in wanted:
@@ -323,9 +344,24 @@ def outcomes_from_receipt(
         path = run.get("metrics_path")
         if not path or not Path(path).is_file():
             continue
+        recorded = (run.get("summary") or {}).get("motion_count")
         try:
-            outcome = read_outcome(path, int(run["checkpoint_seed"]), run["mode"], preset)
-        except (ValueError, KeyError):
+            outcome = read_outcome(
+                path, int(run["checkpoint_seed"]), run["mode"], preset, motion_count=recorded
+            )
+        except (ValueError, KeyError) as error:
+            # Never drop silently: a swallowed exception here is indistinguishable
+            # from an arm that was not evaluated, and it was biased toward
+            # dropping the best arms.
+            dropped.append(
+                {"mode": run.get("mode"), "preset": preset,
+                 "seed": run.get("checkpoint_seed"), "reason": f"{type(error).__name__}: {error}"}
+            )
             continue
         out.setdefault((run["mode"], preset), []).append(outcome)
+    if dropped:
+        raise ValueError(
+            "refusing to return a partial view; these runs could not be read: "
+            + json.dumps(dropped)
+        )
     return out

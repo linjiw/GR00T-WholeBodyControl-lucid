@@ -324,3 +324,43 @@ class TestFailureListLocation:
         }))
         with pytest.raises(ValueError, match="no failures"):
             MP.read_outcome(path, 8600, "origin", "id_clean")
+
+
+class TestPerfectArmIsNotDropped:
+    """A 100%-success arm used to vanish instead of winning."""
+
+    def _receipt(self, tmp_path, name, failed, n=102):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps({
+            "eval/success/success_rate": (n - len(failed)) / n,
+            "failed_idxes": list(failed),
+            "failed_keys": [f"m{i}" for i in failed],
+        }))
+        return {"mode": name, "preset": "id_clean", "checkpoint_seed": 8600,
+                "metrics_path": str(path), "summary": {"motion_count": n}}
+
+    def test_a_flawless_run_is_read_not_swallowed(self, tmp_path):
+        receipt = {"runs": {"perfect": self._receipt(tmp_path, "perfect", [])}}
+        out = MP.outcomes_from_receipt(receipt)
+        run = out[("perfect", "id_clean")][0]
+        assert run.motion_count == 102
+        assert run.success_rate == 1.0
+        assert sum(run.successes()) == 102
+
+    def test_recorded_count_must_agree_with_the_reported_rate(self, tmp_path):
+        run = self._receipt(tmp_path, "bad", [1, 2, 3])
+        run["summary"]["motion_count"] = 50   # inconsistent with the 102-based rate
+        with pytest.raises(ValueError, match="could not be read"):
+            MP.outcomes_from_receipt({"runs": {"bad": run}})
+
+    def test_an_unreadable_run_raises_instead_of_silently_shrinking_the_view(self, tmp_path):
+        good = self._receipt(tmp_path, "good", [1, 2])
+        bad = dict(good, mode="bad", metrics_path=str(tmp_path / "missing.json"))
+        # A missing FILE is still skipped quietly (it was never evaluated)...
+        assert set(MP.outcomes_from_receipt({"runs": {"g": good, "b": bad}})) == {("good", "id_clean")}
+        # ...but a file that exists and cannot be parsed must raise.
+        broken = tmp_path / "broken.json"
+        broken.write_text(json.dumps({"eval/success/success_rate": 0.5}))
+        bad2 = dict(good, mode="bad2", metrics_path=str(broken), summary={})
+        with pytest.raises(ValueError, match="could not be read"):
+            MP.outcomes_from_receipt({"runs": {"g": good, "b": bad2}})
