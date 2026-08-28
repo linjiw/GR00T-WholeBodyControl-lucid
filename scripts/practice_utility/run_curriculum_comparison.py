@@ -127,6 +127,19 @@ QUALITY_METRICS = (
 #: default rather than as required attributes.
 DEFAULT_MOTION_FILE = "data/motion_lib_bones_seed/robot_filtered"
 DEFAULT_SMPL_MOTION_FILE = "data/motion_lib_bones_seed/smpl_filtered"
+#: The four thresholds the strict exp preset overrides, restored to the values
+#: their own term files declare. Not tuning: every number here is upstream's own.
+#: Needed because from scratch the strict values gate on *tracking accuracy*, not
+#: on falling. Measured over 235 from-scratch iterations under tracking/base:
+#: ee_body_pos ended 90.3% of episodes while anchor_pos (pelvis height) ended
+#: 6.2% and anchor_ori_full 5.9% -- the robot was upright and being killed for a
+#: wrist or an ankle being off in Z.
+TERMINATION_DEFAULT_OVERRIDES = [
+    "++manager_env.terminations.anchor_pos.params.threshold=0.5",
+    "++manager_env.terminations.ee_body_pos.params.threshold=0.5",
+    "++manager_env.terminations.foot_pos_xyz.params.threshold=0.5",
+    "++manager_env.terminations.anchor_ori_full.params.threshold=1.0",
+]
 REWARD_FLOOR = 0.0333
 LENGTH_FLOOR = 0.0314
 
@@ -211,6 +224,17 @@ def parse_args(argv=None):
             "preset -- 0.15 m position and 0.2 rad orientation, plus a 0.2 m foot term -- "
             "which is right for a competent policy and fatal from scratch, where 93%% of "
             "episodes die on tracking error in ~0.25 s and essentially none reach time-out."
+        ),
+    )
+    parser.add_argument(
+        "--termination-thresholds",
+        choices=("strict", "default"),
+        default="strict",
+        help=(
+            "'strict' keeps the exp preset's overrides (0.15 m anchor/ee, 0.2 m foot, "
+            "0.2 rad orientation). 'default' reverts those four to the values their own "
+            "terms/*.yaml files declare (0.5/0.5/0.5/1.0), keeping the same composition "
+            "including the adaptive low-pelvis allowance two clips need."
         ),
     )
     parser.add_argument(
@@ -344,6 +368,11 @@ def build_command(
         *(
             [f"manager_env/terminations={args.terminations}"]
             if getattr(args, "terminations", None)
+            else []
+        ),
+        *(
+            TERMINATION_DEFAULT_OVERRIDES
+            if getattr(args, "termination_thresholds", "strict") == "default"
             else []
         ),
         f"++algo.config.num_learning_iterations={args.iterations}",
@@ -618,6 +647,14 @@ def main(argv=None) -> int:
             "event_preset": "tracking/lucid_curriculum",
             "termination_preset": (
                 args.terminations or "tracking/base_adaptive_strict_ori_foot_xyz (exp default)"
+            ),
+            "termination_thresholds": args.termination_thresholds,
+            "randomization_note": (
+                "lambda scales EVENT-MANAGER terms only. The motion command term applies "
+                "reset randomization on every training reset regardless of lambda -- root "
+                "velocity +-0.5 m/s in x and y, +-0.78 rad/s yaw, pelvis +-0.05 m, joints "
+                "+-0.1 rad -- because dr_scaling never touches the command manager. An arm "
+                "at lambda=0 is 'no event-manager DR', NOT 'no randomization'."
             ),
             "wandb_project": args.wandb_project,
             "from_scratch": bool(args.from_scratch),

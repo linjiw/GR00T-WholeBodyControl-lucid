@@ -41,18 +41,18 @@ OUT="$LUCID_ROOT/outputs"
 LOG="$OUT/scratch_probe.log"
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
-say "long from-scratch probe: 1280 envs, train016, no DR, relaxed terminations, 8000 iterations"
+say "long from-scratch probe: 1024 envs, train016, no event-manager DR, upstream-default termination thresholds, 20000 iterations"
 say "wandb: project lucid-scratch (WANDB_MODE=online)"
 python scripts/practice_utility/run_curriculum_comparison.py \
   --from-scratch \
-  --num-envs 1280 \
-  --iterations 8000 \
+  --num-envs 1024 \
+  --iterations 20000 \
   --warmup-iterations 10 \
   --seeds 8600 \
   --modes off \
-  --terminations tracking/base \
+  --termination-thresholds default \
   --wandb-project lucid-scratch \
-  --horizons 100 250 500 1000 2000 4000 6000 \
+  --horizons 100 250 500 1000 2000 4000 8000 12000 16000 \
   --motion-file "$LUCID_ROOT/pools/subsets/train016/robot_filtered" \
   --smpl-motion-file dummy \
   --min-free-mib 9000 \
