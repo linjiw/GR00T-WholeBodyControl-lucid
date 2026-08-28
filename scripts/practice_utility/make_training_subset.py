@@ -51,8 +51,18 @@ def parse_args(argv=None):
     parser.add_argument(
         "--size",
         type=int,
-        required=True,
+        default=0,
         help="how many motions to keep; 0 or >= partition size keeps the whole partition",
+    )
+    parser.add_argument(
+        "--keys",
+        nargs="+",
+        default=None,
+        help=(
+            "explicit motion keys instead of a random draw. Used to build "
+            "single-motion testbeds, where the clip must be named rather than "
+            "sampled so the choice is auditable."
+        ),
     )
     parser.add_argument("--seed", type=int, default=20260828)
     parser.add_argument("--name", required=True, help="subset id, e.g. train064")
@@ -80,9 +90,17 @@ def main(argv=None) -> int:
     available = sorted(k for k, v in split["assignment"].items() if v == args.partition)
     if not available:
         raise SystemExit(f"partition {args.partition!r} is empty")
-    size = len(available) if args.size <= 0 else min(args.size, len(available))
-    rng = random.Random(args.seed)
-    selected = sorted(rng.sample(available, size))
+    if args.keys:
+        unknown = [k for k in args.keys if k not in set(available)]
+        if unknown:
+            raise SystemExit(
+                f"keys not in the {args.partition!r} partition (refusing to leak): {unknown}"
+            )
+        selected = sorted(set(args.keys))
+    else:
+        size = len(available) if args.size <= 0 else min(args.size, len(available))
+        rng = random.Random(args.seed)
+        selected = sorted(rng.sample(available, size))
 
     motion_by_key = {row["motion_key"]: row for row in pool["motions"]}
     missing = [k for k in selected if k not in motion_by_key]
@@ -119,6 +137,7 @@ def main(argv=None) -> int:
             "split_manifest": str(args.split_manifest),
             "partition": args.partition,
             "requested_size": args.size,
+            "explicit_keys": args.keys,
             "seed": args.seed,
         },
         "pool_sha256": pool["pool_sha256"],
