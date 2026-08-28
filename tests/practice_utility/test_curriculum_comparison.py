@@ -112,3 +112,13 @@ def test_extra_overrides_are_appended_to_every_branch(tmp_path):
                          "--extra-overrides", "++algo.config.entropy_coef=0", "++algo.config.num_learning_epochs=1"])
     cmd = R.build_command(args, "off", 8600, "b", tmp_path)
     assert cmd[-2:] == ["++algo.config.entropy_coef=0", "++algo.config.num_learning_epochs=1"]
+
+
+def test_latgate_arms_pin_benign_channels_at_full_strength(tmp_path):
+    args = R.parse_args(["--checkpoint", "/x.pt", "--iterations", "8", "--warmup-iterations", "2"])
+    cmd = R.build_command(args, "ta_latgate_50", 8600, "b", tmp_path)
+    assert "++callbacks.lucid_curriculum.mode=lucid" in cmd
+    assert "++callbacks.lucid_curriculum.anchor_ratio=0.5" in cmd
+    for term in R.NON_LATENCY_TERMS:
+        assert f"++callbacks.lucid_curriculum.term_lambda_overrides.{term}=1.0" in cmd
+    assert not any("randomize_action_delay" in c and "term_lambda" in c for c in cmd)

@@ -51,8 +51,19 @@ NON_LATENCY_TERMS = (
 ARM_TERM_OVERRIDES: dict[str, dict[str, float]] = {
     "fixed_nolat": {"randomize_action_delay": 0.0},
     "fixed_latonly": {term: 0.0 for term in NON_LATENCY_TERMS},
+    # Gap-gated latency only: the five benign channels stay at full strength and
+    # lambda moves actuation delay alone (minimal two-group LUCID-MC).
+    "lucid_latgate": {term: 1.0 for term in NON_LATENCY_TERMS},
+    "ta_latgate_50": {term: 1.0 for term in NON_LATENCY_TERMS},
 }
-ARMS.update({"fixed_nolat": ("fixed", 0.0, None), "fixed_latonly": ("fixed", 0.0, None)})
+ARMS.update(
+    {
+        "fixed_nolat": ("fixed", 0.0, None),
+        "fixed_latonly": ("fixed", 0.0, None),
+        "lucid_latgate": ("lucid", 0.0, None),
+        "ta_latgate_50": ("lucid", 0.50, None),
+    }
+)
 MODES = tuple(ARMS)
 MODES = tuple(ARMS)
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
