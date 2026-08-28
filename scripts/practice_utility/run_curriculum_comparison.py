@@ -159,7 +159,7 @@ def build_command(
         [
             f"++callbacks.lucid_curriculum.anchor_ratio={anchor_ratio}",
             f"++callbacks.lucid_curriculum.anchor_seed={seed}",
-            f"++callbacks.lucid_curriculum.consolidation_fraction={args.consolidation_fraction}",
+            f"++callbacks.lucid_curriculum.consolidation_fraction={getattr(args, 'consolidation_fraction', 0.0)}",
         ]
         if anchor_ratio > 0.0
         else []
@@ -220,7 +220,7 @@ def build_command(
         "++callbacks.practice_capsule.role=control",
         f"++callbacks.practice_capsule.branch_id={branch_id}",
         f"++callbacks.practice_capsule.horizons.final={args.iterations}",
-        *args.extra_overrides,
+        *list(getattr(args, "extra_overrides", []) or []),
     ]
 
 
