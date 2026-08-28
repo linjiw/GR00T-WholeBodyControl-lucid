@@ -77,6 +77,13 @@ def parse_args(argv=None):
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=["lucid", "fixed", "off"])
     parser.add_argument(
+        "--extra-overrides",
+        nargs="*",
+        default=[],
+        help="additional Hydra overrides appended to every branch (e.g. ++algo.config.entropy_coef=0)",
+    )
+    parser.add_argument("--tag", default="", help="suffix for the experiment id")
+    parser.add_argument(
         "--yoked-source-receipt",
         type=Path,
         default=None,
@@ -202,6 +209,7 @@ def build_command(
         "++callbacks.practice_capsule.role=control",
         f"++callbacks.practice_capsule.branch_id={branch_id}",
         f"++callbacks.practice_capsule.horizons.final={args.iterations}",
+        *args.extra_overrides,
     ]
 
 
@@ -284,7 +292,7 @@ def source_sha256() -> str:
 def main(argv=None) -> int:
     args = parse_args(argv)
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    experiment_id = f"curriculum_comparison_ne{args.num_envs}_{stamp}"
+    experiment_id = f"curriculum_comparison_ne{args.num_envs}_{stamp}" + (f"_{args.tag}" if args.tag else "")
     modes = list(dict.fromkeys(args.modes))
     source_receipt = json.loads(args.yoked_source_receipt.read_text()) if args.yoked_source_receipt else None
     for mode in modes:
@@ -427,6 +435,8 @@ def main(argv=None) -> int:
             "event_preset": "tracking/lucid_curriculum",
             "arms": {mode: ARMS[mode] for mode in modes},
             "consolidation_fraction": args.consolidation_fraction,
+            "extra_overrides": list(args.extra_overrides),
+            "tag": args.tag,
             "max_delay_steps": args.max_delay,
             "max_delay_ms": args.max_delay * 5,
             "controller": {

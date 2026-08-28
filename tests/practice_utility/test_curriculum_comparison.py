@@ -105,3 +105,10 @@ def test_cross_seed_yoked_uses_next_seed_schedule_from_source_receipt(tmp_path):
         "8601": "/art/seed_8602/c.jsonl",
         "8602": "/art/seed_8600/c.jsonl",
     }
+
+
+def test_extra_overrides_are_appended_to_every_branch(tmp_path):
+    args = R.parse_args(["--checkpoint", "/x.pt", "--iterations", "8", "--warmup-iterations", "2",
+                         "--extra-overrides", "++algo.config.entropy_coef=0", "++algo.config.num_learning_epochs=1"])
+    cmd = R.build_command(args, "off", 8600, "b", tmp_path)
+    assert cmd[-2:] == ["++algo.config.entropy_coef=0", "++algo.config.num_learning_epochs=1"]
