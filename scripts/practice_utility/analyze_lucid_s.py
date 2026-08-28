@@ -177,6 +177,18 @@ def parse_args(argv=None):
     parser.add_argument("--stage7-eval", type=Path, required=True)
     parser.add_argument("--stage8-eval", type=Path, required=True)
     parser.add_argument("--origin-eval", type=Path, default=None)
+    parser.add_argument(
+        "--extra-eval",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "additional evaluation receipts to fold into the same table and paired "
+            "section (the batch-size control, the latency cap, the budget curve, the "
+            "latency ladder). Repeatable. The preregistered verdicts are unaffected: "
+            "they name specific arms and presets and are scored from those alone."
+        ),
+    )
     parser.add_argument("--receipt-dir", type=Path, default=MANIFESTS)
     parser.add_argument(
         "--bootstrap-samples",
@@ -282,7 +294,8 @@ def main(argv=None) -> int:
     s7_train, s8_train = load(args.stage7_training), load(args.stage8_training)
     s7_eval, s8_eval = load(args.stage7_eval), load(args.stage8_eval)
     origin_eval = load(args.origin_eval) if args.origin_eval else None
-    summary = merge_summaries(s7_eval, s8_eval, origin_eval)
+    extra = [load(path) for path in args.extra_eval]
+    summary = merge_summaries(s7_eval, s8_eval, origin_eval, *extra)
 
     modes = sorted({m for modes in summary.values() for m in modes})
     table = {
@@ -392,7 +405,7 @@ def main(argv=None) -> int:
     }
 
     precision = paired_section(
-        [r for r in (s7_eval, s8_eval, origin_eval) if r], args.bootstrap_samples
+        [r for r in (s7_eval, s8_eval, origin_eval, *extra) if r], args.bootstrap_samples
     )
     receipt = {
         "kind": "lucid_support_expansion_analysis",
@@ -409,6 +422,7 @@ def main(argv=None) -> int:
             "stage7_eval": str(args.stage7_eval),
             "stage8_eval": str(args.stage8_eval),
             "origin_eval": str(args.origin_eval) if args.origin_eval else None,
+            "extra_eval": [str(path) for path in args.extra_eval],
         },
         "tie_threshold_pts": tie_pts,
         "arms": table,
@@ -425,18 +439,24 @@ def main(argv=None) -> int:
     out = args.receipt_dir / f"lucid_s_analysis_{stamp}.json"
     out.write_text(json.dumps(receipt, indent=2, default=str))
 
-    print(f"{'arm':<22}{'clean':>8}{'dr_050':>8}{'dr_full':>8}{'dr_125':>8}{'lat60':>8}{'AUC':>8}")
+    preferred = [
+        "id_clean", "dr_050", "dr_full", "dr_125", "dr_150", "latency_60ms",
+        "lat_10ms", "lat_20ms", "lat_30ms", "lat_40ms", "lat_60ms",
+    ]
+    columns = [p for p in preferred if p in summary] + [
+        p for p in sorted(summary) if p not in preferred
+    ]
+    header = "".join(f"{p.replace('id_clean', 'clean')[:9]:>10}" for p in columns)
+    print(f"{'arm':<24}{header}{'AUC':>10}")
     for mode in modes:
         row = table[mode]["success_by_preset"]
-        auc_block = table[mode]["profile_auc"]
-        def cell(key):
-            value = row.get(key)
-            return f"{value:8.2f}" if value is not None else f"{'-':>8}"
-        auc_value = auc_block.get("mean")
+        auc_value = table[mode]["profile_auc"].get("mean")
+        cells = "".join(
+            f"{row[p]:10.2f}" if row.get(p) is not None else f"{'-':>10}" for p in columns
+        )
         print(
-            f"{mode:<22}{cell('id_clean')}{cell('dr_050')}{cell('dr_full')}"
-            f"{cell('dr_125')}{cell('latency_60ms')}"
-            + (f"{auc_value:8.2f}" if auc_value is not None else f"{'-':>8}")
+            f"{mode:<24}{cells}"
+            + (f"{auc_value:10.2f}" if auc_value is not None else f"{'-':>10}")
         )
     print()
     for name, block in findings.items():

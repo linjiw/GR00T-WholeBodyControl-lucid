@@ -258,3 +258,37 @@ class TestPairedSection:
         assert diffs["H_S3_auc"]["delta_pts"] == pytest.approx(100.0 * 30 / 102)
         assert diffs["H_S4_fixed_vs_origin"]["delta_pts"] == pytest.approx(-100.0 * 35 / 102)
         assert diffs["H_S3_auc"]["excludes_zero"] is True
+
+
+class TestExtraEval:
+    def test_extra_receipts_join_the_table_without_touching_the_verdicts(self, tmp_path):
+        base = TestEndToEnd()
+        paths = base._write(tmp_path, treatment_wins=True)
+        extra = tmp_path / "extra.json"
+        extra.write_text(json.dumps(eval_receipt({
+            "lat_20ms": {"ta_lucid_50_latcap_s4_rg": {8600: 0.42, 8601: 0.44, 8602: 0.40}},
+            "lat_40ms": {"ta_lucid_50_latcap_s4_rg": {8600: 0.11, 8601: 0.09, 8602: 0.13}},
+        })))
+        argv = [
+            "--preregistration", str(paths["prereg"]),
+            "--stage7-training", str(paths["s7t"]),
+            "--stage8-training", str(paths["s8t"]),
+            "--stage7-eval", str(paths["s7e"]),
+            "--stage8-eval", str(paths["s8e"]),
+            "--origin-eval", str(paths["oe"]),
+            "--receipt-dir", str(tmp_path), "--bootstrap-samples", "0",
+        ]
+        without = A.main(list(argv))
+        plain = json.loads(sorted(tmp_path.glob("lucid_s_analysis_*.json"))[-1].read_text())
+        assert without == 0
+        assert A.main(argv + ["--extra-eval", str(extra)]) == 0
+        merged = json.loads(sorted(tmp_path.glob("lucid_s_analysis_*.json"))[-1].read_text())
+
+        # The ladder arm and its cells appear...
+        assert "ta_lucid_50_latcap_s4_rg" in merged["arms"]
+        assert merged["arms"]["ta_lucid_50_latcap_s4_rg"]["success_by_preset"]["lat_20ms"] == \
+            pytest.approx(42.0)
+        # ...and every preregistered verdict is byte-identical.
+        assert {k: v["verdict"] for k, v in merged["hypotheses"].items()} == \
+            {k: v["verdict"] for k, v in plain["hypotheses"].items()}
+        assert merged["inputs"]["extra_eval"] == [str(extra)]
