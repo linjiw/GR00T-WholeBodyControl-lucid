@@ -26,6 +26,18 @@ MODES = (
     "lucid_s4", "lucid_rg", "lucid_s4_rg", "ta_lucid_50_s4_rg",
     "lucid_latcap_s4_rg", "ta_lucid_50_latcap_s4_rg",
 )
+#: Deployment-latency ladder: nominal physics on every other channel, with
+#: actuation latency pinned at a fixed level. The stock ``latency_60ms`` cell
+#: stacks 60 ms on top of the full envelope and reads 0.00% for every arm ever
+#: measured, the untrained origin included, so it cannot rank policies. These
+#: cells isolate the one axis a real deployment actually varies.
+PRESET_FIXED_LATENCY_STEPS = {
+    "lat_10ms": 2,
+    "lat_20ms": 4,
+    "lat_30ms": 6,
+    "lat_40ms": 8,
+    "lat_60ms": 12,
+}
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
@@ -39,6 +51,7 @@ PRESETS = {
     # randomization did not anticipate, so the profile must not stop at 1.
     "dr_125": "tracking/lucid_curriculum",
     "dr_150": "tracking/lucid_curriculum",
+    **{name: "tracking/lucid_eval_clean" for name in PRESET_FIXED_LATENCY_STEPS},
 }
 PRESET_DR_SCALE = {
     "dr_025": 0.25,
@@ -265,6 +278,11 @@ def build_command(
         *(
             [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
             if preset in PRESET_DR_SCALE
+            else [
+                "++callbacks.practice_eval.fixed_latency_steps="
+                f"{PRESET_FIXED_LATENCY_STEPS[preset]}"
+            ]
+            if preset in PRESET_FIXED_LATENCY_STEPS
             else []
         ),
     ]
@@ -369,6 +387,14 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
             delay.get("action_delay_min_steps", -1) >= 0
             and delay.get("action_delay_max_steps") == 8
             and delay.get("action_delay_nonzero_fraction", 0) > 0
+        )
+    if preset in PRESET_FIXED_LATENCY_STEPS:
+        # A ladder cell is only a measurement of that latency if every live lag
+        # really sat at it. A zero-step rung is legitimately all-zero.
+        steps = PRESET_FIXED_LATENCY_STEPS[preset]
+        return (
+            delay.get("action_delay_min_steps") == steps
+            and delay.get("action_delay_max_steps") == steps
         )
     return delay.get("action_delay_min_steps") == 12 and delay.get("action_delay_max_steps") == 12
 

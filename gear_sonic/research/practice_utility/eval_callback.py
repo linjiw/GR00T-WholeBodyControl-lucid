@@ -32,6 +32,7 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         branch_id: str = "unbound",
         step_dt: float = 0.02,
         non_latency_dr_scale: float | None = None,
+        fixed_latency_steps: int | None = None,
     ) -> None:
         super().__init__(
             eval_frequency=eval_frequency,
@@ -53,6 +54,20 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
             0.0 <= self.non_latency_dr_scale <= DS.MAX_EXTRAPOLATION
         ):
             raise ValueError(f"non_latency_dr_scale must be in [0, {DS.MAX_EXTRAPOLATION}]")
+        # Pin actuation latency to exactly this many physics steps, on top of
+        # whatever the preset says. The stock ``latency_60ms`` preset stacks a
+        # fixed 60 ms on top of the *full* six-channel envelope, and every arm
+        # ever measured on it -- including the untrained origin -- scores 0.00%.
+        # A saturated cell cannot discriminate between policies, so the
+        # deployment-latency endpoint needs a ladder against clean physics,
+        # which is also the question a deployment actually asks: the real robot
+        # has some actuation delay; does the policy survive it?
+        self.fixed_latency_steps = (
+            None if fixed_latency_steps is None else int(fixed_latency_steps)
+        )
+        if self.fixed_latency_steps is not None and self.fixed_latency_steps < 0:
+            raise ValueError("fixed_latency_steps must be >= 0")
+        self._latency_report: dict[str, Any] | None = None
         self._dr_scale_report: dict[str, Any] | None = None
 
     def _pre_evaluate_policy(self, reset_env: bool = True) -> None:
@@ -68,6 +83,10 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
                 allow_extrapolation=True,
             )
             self._dr_scale_report = report.to_dict()
+        if self.fixed_latency_steps is not None:
+            self._latency_report = _pin_action_delay(
+                event_manager, float(self.fixed_latency_steps)
+            )
         robot = _scene_entity(self.env, "robot")
         if robot is not None:
             ERS.reset_action_delay_process(robot)
@@ -84,6 +103,8 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         metrics["eval/protocol/branch_id"] = self.branch_id
         metrics["eval/protocol/non_latency_dr_scale"] = self.non_latency_dr_scale
         metrics["eval/protocol/dr_scale_report"] = self._dr_scale_report
+        metrics["eval/protocol/fixed_latency_steps"] = self.fixed_latency_steps
+        metrics["eval/protocol/fixed_latency_report"] = self._latency_report
         event_manager = _event_manager(self.env)
         metrics["eval/protocol/active_dr_terms"] = DS.scalable_terms(event_manager)
         metrics["eval/protocol/dr_ranges"] = DS.capture_baseline(event_manager)
@@ -102,6 +123,22 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         for key, value in delay.items():
             metrics[f"eval/delay/{key}"] = value
         return metrics
+
+
+def _pin_action_delay(event_manager: Any, steps: float) -> dict[str, Any]:
+    """Force every actuation-delay term to the closed range ``[steps, steps]``.
+
+    Reported rather than assumed: the returned record names the terms that were
+    actually pinned, so a receipt cannot claim a latency level that no live term
+    ever received.
+    """
+    pinned: list[str] = []
+    for name, cfg in DS._iter_terms(event_manager):
+        params = getattr(cfg, "params", None)
+        if isinstance(params, dict) and "delay_range" in params:
+            params["delay_range"] = [steps, steps]
+            pinned.append(name)
+    return {"requested_steps": steps, "pinned_terms": sorted(pinned)}
 
 
 def _event_manager(env: Any) -> Any:

@@ -70,3 +70,56 @@ def test_extrapolation_widens_about_the_nominal():
     low, high = DS.scale_range([0.8, 1.2], 1.5, 1.0, allow_extrapolation=True)
     assert low == pytest.approx(0.7)
     assert high == pytest.approx(1.3)
+
+
+class Term:
+    def __init__(self, params):
+        self.params = params
+        self.mode = "reset"
+
+
+class Manager:
+    def __init__(self, terms):
+        self.active_terms = list(terms)
+        self._term_cfgs = list(terms.values())
+
+
+def test_pinning_latency_rewrites_every_delay_term_and_reports_which():
+    manager = Manager({
+        "randomize_action_delay": Term({"delay_range": [0.0, 8.0]}),
+        "randomize_action_delay_interval": Term({"delay_range": [0.0, 8.0]}),
+        "push_robot": Term({"velocity_range": {"x": [-1.0, 1.0]}}),
+    })
+    from gear_sonic.research.practice_utility.eval_callback import _pin_action_delay
+
+    report = _pin_action_delay(manager, 6.0)
+    assert report["pinned_terms"] == [
+        "randomize_action_delay",
+        "randomize_action_delay_interval",
+    ]
+    assert manager._term_cfgs[0].params["delay_range"] == [6.0, 6.0]
+    assert manager._term_cfgs[1].params["delay_range"] == [6.0, 6.0]
+    # A term with no delay range is untouched.
+    assert manager._term_cfgs[2].params == {"velocity_range": {"x": [-1.0, 1.0]}}
+
+
+def test_fixed_latency_steps_is_validated():
+    PracticeRobustnessEvalCallback(fixed_latency_steps=0)
+    PracticeRobustnessEvalCallback(fixed_latency_steps=12)
+    with pytest.raises(ValueError):
+        PracticeRobustnessEvalCallback(fixed_latency_steps=-1)
+
+
+def test_the_ladder_rungs_cover_the_training_envelope_and_beyond():
+    from scripts.practice_utility import run_curriculum_robustness_eval as E
+
+    # 5 ms per physics step; training samples 0-40 ms, so the ladder must reach
+    # inside it and past it, or it cannot show where the cliff is.
+    ms = {name: steps * 5 for name, steps in E.PRESET_FIXED_LATENCY_STEPS.items()}
+    assert min(ms.values()) < 40 and max(ms.values()) > 40
+    for name, value in ms.items():
+        assert name == f"lat_{value}ms"
+    # Every rung runs on nominal physics, so latency is the only axis moving.
+    for name in E.PRESET_FIXED_LATENCY_STEPS:
+        assert E.PRESETS[name] == "tracking/lucid_eval_clean"
+        assert name not in E.PRESET_DR_SCALE
