@@ -88,6 +88,12 @@ def parse_args(argv=None):
     parser.add_argument("--seeds", type=int, nargs="+", default=[8600, 8601, 8602])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=["lucid", "fixed", "off"])
     parser.add_argument(
+        "--motion-file",
+        default="data/motion_lib_bones_seed/robot_filtered",
+        help="training motion directory (default: the 512-motion debug pool)",
+    )
+    parser.add_argument("--smpl-motion-file", default="data/motion_lib_bones_seed/smpl_filtered")
+    parser.add_argument(
         "--extra-overrides",
         nargs="*",
         default=[],
@@ -188,8 +194,8 @@ def build_command(
         "manager_env/events=tracking/lucid_curriculum",
         f"++algo.config.num_learning_iterations={args.iterations}",
         "++algo.config.save_interval=100000",
-        "++manager_env.commands.motion.motion_lib_cfg.motion_file=data/motion_lib_bones_seed/robot_filtered",
-        "++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file=data/motion_lib_bones_seed/smpl_filtered",
+        f"++manager_env.commands.motion.motion_lib_cfg.motion_file={getattr(args, 'motion_file', 'data/motion_lib_bones_seed/robot_filtered')}",
+        f"++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file={getattr(args, 'smpl_motion_file', 'data/motion_lib_bones_seed/smpl_filtered')}",
         f"++callbacks.practice_observer._target_={OBSERVER}",
         "++callbacks.practice_observer.enabled=true",
         f"++callbacks.practice_observer.encoder_path={args.encoder}",
@@ -447,6 +453,8 @@ def main(argv=None) -> int:
             "arms": {mode: ARMS[mode] for mode in modes},
             "consolidation_fraction": args.consolidation_fraction,
             "extra_overrides": list(args.extra_overrides),
+            "motion_file": args.motion_file,
+            "smpl_motion_file": args.smpl_motion_file,
             "tag": args.tag,
             "max_delay_steps": args.max_delay,
             "max_delay_ms": args.max_delay * 5,
