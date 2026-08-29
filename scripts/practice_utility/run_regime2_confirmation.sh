@@ -10,8 +10,8 @@ OUT=/data/robotixx/lucid-sonic/outputs
 LOG=$OUT/tace_pilot_driver.log
 OV="++algo.config.adaptive_lr_min=1e-6 ++algo.config.adaptive_lr_max=2e-5 ++algo.config.num_learning_epochs=1"
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
-cell() { # tag iterations seeds modes...
-  local tag=$1 it=$2 seeds=$3; shift 3
+cell() { # tag iterations seeds eval_seed_base modes...
+  local tag=$1 it=$2 seeds=$3 evbase=$4; shift 4
   say "stage 13 [$tag]: $* x seeds $seeds x $it it, lossless regime"
   python scripts/practice_utility/run_curriculum_comparison.py \
     --checkpoint "$CKPT" --num-envs 512 --iterations "$it" --warmup-iterations 10 \
@@ -21,10 +21,10 @@ cell() { # tag iterations seeds modes...
   say "stage 13 [$tag] training exit=$? receipt=$receipt"
   [ -z "$receipt" ] && { say "STAGE 13 [$tag] FAILED"; return 1; }
   python scripts/practice_utility/run_curriculum_robustness_eval.py \
-    --training-receipt "$receipt" --num-envs 128 --seeds $seeds --eval-seed-base $4 \
+    --training-receipt "$receipt" --num-envs 128 --seeds $seeds --eval-seed-base $evbase \
     --presets id_clean dr_050 dr_full latency_60ms --min-free-mib "$MIN_FREE" --execute > "$OUT/${tag}_eval_stdout.log" 2>&1
   say "stage 13 [$tag] eval exit=$?; receipt: $(grep -o 'receipt .*json' "$OUT/${tag}_eval_stdout.log" | tail -1)"
 }
-cell seeds_128 128 "8603 8604" off fixed 8703
-cell fixed_256 256 "8600 8601 8602" fixed 8700
+cell seeds_128 128 "8603 8604" 8703 off fixed
+cell fixed_256 256 "8600 8601 8602" 8700 fixed
 say "=== stage 13 done ==="
