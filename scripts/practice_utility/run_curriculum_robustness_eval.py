@@ -47,7 +47,9 @@ PRESET_FIXED_LATENCY_STEPS = {
 #: ladder that floors the control cannot rank anything.
 PRESET_PHYSICS_ONLY = {
     "phys_000": 0.0,
+    "phys_025": 0.25,
     "phys_050": 0.5,
+    "phys_075": 0.75,
     "phys_100": 1.0,
     "phys_125": 1.25,
     "phys_150": 1.5,
