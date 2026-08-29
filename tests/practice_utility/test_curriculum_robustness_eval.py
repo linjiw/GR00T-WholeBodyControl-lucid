@@ -97,3 +97,19 @@ def test_bounded_subset_is_deterministic_and_bounded():
     assert E.bounded_subset(keys, 10, "other") != a
     assert E.bounded_subset(keys, None, "salt") == keys
     assert E.bounded_subset(keys, 99, "salt") == keys
+
+
+def test_u60_common_presets_override_the_delay_process(tmp_path):
+    from scripts.practice_utility import run_curriculum_robustness_eval as E
+    args = E.parse_args(["--training-receipt", "/x.json"])
+    cmd = E.build_command(args, tmp_path / "c.pt", "fixed", "lat_u60_common", 8700, "b", tmp_path, "/m")
+    assert "++manager_env.events.randomize_action_delay.params.delay_range=[0,12]" in cmd
+    assert "++manager_env.events.randomize_action_delay.params.coupling=common" in cmd
+    assert "++callbacks.practice_eval.non_latency_dr_scale=0.0" in cmd
+    cmd2 = E.build_command(args, tmp_path / "c.pt", "fixed", "dr_full_lat_u60_common", 8700, "b", tmp_path, "/m")
+    assert not any("non_latency_dr_scale" in c for c in cmd2)
+    good = {"delay": {"action_delay_actuator_groups": 5, "action_delay_min_steps": 0, "action_delay_max_steps": 12,
+                      "action_delay_nonzero_fraction": 0.9, "action_delay_cross_group_equal_fraction": 1.0}}
+    assert E.delay_matches("lat_u60_common", good)
+    bad = {"delay": {**good["delay"], "action_delay_cross_group_equal_fraction": 0.2}}
+    assert not E.delay_matches("lat_u60_common", bad)

@@ -30,6 +30,19 @@ PRESETS = {
     "dr_075": "tracking/lucid_curriculum",
 }
 PRESET_DR_SCALE = {"dr_025": 0.25, "dr_050": 0.5, "dr_075": 0.75}
+# Deployment-latency presets: one shared per-episode command-transport lag drawn
+# uniformly from 0-60 ms (0-12 physics steps), with nominal physics or the full
+# non-latency envelope. This is the process the 2026-08-21 sweep selected.
+_U60 = [
+    "++manager_env.events.randomize_action_delay.params.delay_range=[0,12]",
+    "++manager_env.events.randomize_action_delay.params.distribution=uniform",
+    "++manager_env.events.randomize_action_delay.params.coupling=common",
+]
+PRESET_EXTRA_OVERRIDES = {
+    "lat_u60_common": [*_U60, "++callbacks.practice_eval.non_latency_dr_scale=0.0"],
+    "dr_full_lat_u60_common": list(_U60),
+}
+PRESETS.update({name: "tracking/lucid_curriculum" for name in PRESET_EXTRA_OVERRIDES})
 CALLBACK = "gear_sonic.research.practice_utility.eval_callback.PracticeRobustnessEvalCallback"
 SUMMARY_METRICS = (
     "success_rate",
@@ -291,6 +304,7 @@ def build_command(
             if preset in PRESET_DR_SCALE
             else []
         ),
+        *PRESET_EXTRA_OVERRIDES.get(preset, []),
     ]
 
 
@@ -388,6 +402,13 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
         return False
     if preset == "id_clean":
         return delay.get("action_delay_max_steps") == 0
+    if preset in PRESET_EXTRA_OVERRIDES:
+        return (
+            delay.get("action_delay_min_steps", -1) >= 0
+            and 0 < delay.get("action_delay_max_steps", 0) <= 12
+            and delay.get("action_delay_nonzero_fraction", 0) > 0
+            and delay.get("action_delay_cross_group_equal_fraction", 0) == 1.0
+        )
     if preset == "dr_full" or preset in PRESET_DR_SCALE:
         return (
             delay.get("action_delay_min_steps", -1) >= 0
