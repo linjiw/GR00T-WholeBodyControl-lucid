@@ -93,6 +93,14 @@ def parse_args(argv=None):
     )
     parser.add_argument("--partition", default="dev")
     parser.add_argument(
+        "--exclude-pool-manifest",
+        type=Path,
+        default=None,
+        help="drop motions present in this pool (e.g. the fine-tuning pool) from the panel",
+    )
+    parser.add_argument("--max-motions", type=int, default=None)
+    parser.add_argument("--subset-salt", default="heldout_v1")
+    parser.add_argument(
         "--suite-root",
         type=Path,
         default=Path("/data/robotixx/lucid-sonic/pools/debug512/content_dev"),
@@ -127,18 +135,43 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def bounded_subset(keys: set[str], max_motions: int | None, salt: str) -> set[str]:
+    """Deterministic, outcome-blind subset: order keys by a salted hash, keep the first N."""
+    if max_motions is None or max_motions >= len(keys):
+        return set(keys)
+    ranked = sorted(keys, key=lambda k: hashlib.sha256(f"{salt}:{k}".encode()).hexdigest())
+    return set(ranked[:max_motions])
+
+
 def materialize_suite(
     pool_manifest: Path,
     split_manifest: Path,
     partition: str,
     suite_root: Path,
+    exclude_pool_manifest: Path | None = None,
+    max_motions: int | None = None,
+    subset_salt: str = "heldout_v1",
 ) -> dict[str, Any]:
-    """Create a stable symlink-only motion panel and verify every target."""
+    """Create a stable symlink-only motion panel and verify every target.
+
+    ``exclude_pool_manifest`` drops every motion present in another pool (e.g. the
+    512 motions a policy was fine-tuned on), and ``max_motions`` bounds the panel
+    with a salted-hash ordering fixed before any outcome is read.
+    """
     pool = load_json(pool_manifest)
     split = load_json(split_manifest)
     if split["pool_sha256"] != pool["pool_sha256"]:
         raise ValueError("pool and split manifests do not match")
     selected = {key for key, assigned in split["assignment"].items() if assigned == partition}
+    excluded: set[str] = set()
+    excluded_pool_sha = None
+    if exclude_pool_manifest is not None:
+        other = load_json(exclude_pool_manifest)
+        excluded = {row["motion_key"] for row in other["motions"]} & selected
+        excluded_pool_sha = other["pool_sha256"]
+        selected = selected - excluded
+    before_bound = len(selected)
+    selected = bounded_subset(selected, max_motions, subset_salt)
     motion_by_key = {row["motion_key"]: row for row in pool["motions"]}
     missing = sorted(selected - motion_by_key.keys())
     if missing:
@@ -173,6 +206,11 @@ def materialize_suite(
         "split_sha256": split["split_sha256"],
         "split_linkage": split["linkage"],
         "partition": partition,
+        "excluded_pool_sha256": excluded_pool_sha,
+        "excluded_count": len(excluded),
+        "candidates_before_bound": before_bound,
+        "max_motions": max_motions,
+        "subset_salt": subset_salt if max_motions is not None else None,
     }
 
 
@@ -363,7 +401,13 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     training_receipt = load_json(args.training_receipt)
     suite = materialize_suite(
-        args.pool_manifest, args.split_manifest, args.partition, args.suite_root
+        args.pool_manifest,
+        args.split_manifest,
+        args.partition,
+        args.suite_root,
+        exclude_pool_manifest=args.exclude_pool_manifest,
+        max_motions=args.max_motions,
+        subset_salt=args.subset_salt,
     )
     checkpoints = checkpoint_index(training_receipt)
     receipt_modes = list(dict.fromkeys(arm["mode"] for arm in training_receipt["arms"].values()))

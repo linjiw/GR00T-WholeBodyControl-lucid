@@ -86,3 +86,14 @@ def test_delay_contract_distinguishes_presets():
             }
         },
     )
+
+
+def test_bounded_subset_is_deterministic_and_bounded():
+    from scripts.practice_utility import run_curriculum_robustness_eval as E
+    keys = {f"m{i}" for i in range(50)}
+    a = E.bounded_subset(keys, 10, "salt")
+    b = E.bounded_subset(keys, 10, "salt")
+    assert a == b and len(a) == 10 and a <= keys
+    assert E.bounded_subset(keys, 10, "other") != a
+    assert E.bounded_subset(keys, None, "salt") == keys
+    assert E.bounded_subset(keys, 99, "salt") == keys
