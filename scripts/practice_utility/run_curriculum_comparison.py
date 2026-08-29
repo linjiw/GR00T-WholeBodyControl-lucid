@@ -55,6 +55,8 @@ ARM_TERM_OVERRIDES: dict[str, dict[str, float]] = {
     # lambda moves actuation delay alone (minimal two-group LUCID-MC).
     "lucid_latgate": {term: 1.0 for term in NON_LATENCY_TERMS},
     "ta_latgate_50": {term: 1.0 for term in NON_LATENCY_TERMS},
+    # Dose frontier: full envelope except a halved latency range (0-20 ms).
+    "fixed_lat50": {"randomize_action_delay": 0.5},
 }
 ARMS.update(
     {
@@ -62,6 +64,7 @@ ARMS.update(
         "fixed_latonly": ("fixed", 0.0, None),
         "lucid_latgate": ("lucid", 0.0, None),
         "ta_latgate_50": ("lucid", 0.50, None),
+        "fixed_lat50": ("fixed", 0.0, None),
     }
 )
 MODES = tuple(ARMS)
