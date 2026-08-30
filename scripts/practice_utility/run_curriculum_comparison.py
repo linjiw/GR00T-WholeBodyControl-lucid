@@ -429,12 +429,27 @@ def _logging_directory(log_path: Path) -> str | None:
     programme exists to catch.
     """
     try:
-        text = log_path.read_text(errors="ignore")
+        lines = log_path.read_text(errors="ignore").splitlines()
     except OSError:
         return None
-    import re
-    match = re.search(r"Logging Directory:\s*\n?\s*│?\s*(logs_rl/[^\s│]+)", text)
-    return match.group(1) if match else None
+    # The trainer prints a Rich table, and a long path wraps across box rows:
+    #   │ Logging Directory:                          │
+    #   │ logs_rl/.../sonic_release_test-             │
+    #   │ 20260829_063238                             │
+    # so the fragments after the label are concatenated until the row ends.
+    for index, line in enumerate(lines):
+        if "Logging Directory:" not in line:
+            continue
+        parts: list[str] = []
+        for follow in lines[index + 1 : index + 6]:
+            cell = follow.replace("│", "").strip()
+            if not cell or cell[0] in "╰─╯" or ":" in cell:
+                break
+            parts.append(cell)
+        joined = "".join(parts)
+        if joined.startswith("logs_rl/"):
+            return joined
+    return None
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
