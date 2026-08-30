@@ -418,6 +418,25 @@ def build_command(
     ]
 
 
+def _logging_directory(log_path: Path) -> str | None:
+    """The Hydra run directory this branch trained in, from its own log.
+
+    Every branch of a campaign gets its own run directory and its own resolved
+    config.yaml. The evaluator symlinks ONE config beside every checkpoint it
+    scores, so without this the fixed and lucid checkpoints of a campaign sit
+    beside a config that says mode=off. Architecture is shared so nothing loads
+    wrongly, but the provenance is false, which is the class of defect this
+    programme exists to catch.
+    """
+    try:
+        text = log_path.read_text(errors="ignore")
+    except OSError:
+        return None
+    import re
+    match = re.search(r"Logging Directory:\s*\n?\s*│?\s*(logs_rl/[^\s│]+)", text)
+    return match.group(1) if match else None
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -577,6 +596,7 @@ def main(argv=None) -> int:
                     "yoked_source": ARMS[mode][2],
                     "yoked_cross_seed": mode in CROSS_SEED_ARMS,
                     "term_lambda_overrides": ARM_TERM_OVERRIDES.get(mode, {}),
+                    "run_dir": _logging_directory(log_path),
                     "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
                     "term_lambda_caps": (
