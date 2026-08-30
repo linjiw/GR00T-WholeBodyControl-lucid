@@ -46,6 +46,7 @@ from gear_sonic.research.practice_utility import dr_scaling as DS
 
 ANCHOR = "anchor"
 FOCUS = "focus"
+YARDSTICK = "yardstick"
 
 
 @dataclass(frozen=True)
@@ -65,14 +66,31 @@ class CohortAssignment:
     anchor_ids: tuple[int, ...]
     reserved_focus_ids: tuple[int, ...]
     focus_strata: tuple[tuple[int, ...], ...] = ()
+    #: Environments held at lambda = 0 as the self-reference for the margin
+    #: signal. Neither anchor nor focus; excluded from every stratum.
+    yardstick_ids: tuple[int, ...] = ()
 
     @property
     def num_anchor(self) -> int:
         return len(self.anchor_ids)
 
     @property
+    def num_yardstick(self) -> int:
+        return len(self.yardstick_ids)
+
+    @property
     def num_focus(self) -> int:
-        return self.num_envs - self.num_anchor
+        return self.num_envs - self.num_anchor - self.num_yardstick
+
+    def yardstick_mask(self, device: Any = None) -> torch.Tensor:
+        mask = torch.zeros(self.num_envs, dtype=torch.bool)
+        if self.yardstick_ids:
+            mask[list(self.yardstick_ids)] = True
+        return mask.to(device) if device is not None else mask
+
+    def focus_mask(self, device: Any = None) -> torch.Tensor:
+        mask = ~(self.mask() | self.yardstick_mask())
+        return mask.to(device) if device is not None else mask
 
     @property
     def num_strata(self) -> int:
@@ -103,6 +121,8 @@ class CohortAssignment:
             "seed": self.seed,
             "num_anchor": self.num_anchor,
             "num_focus": self.num_focus,
+            "num_yardstick": self.num_yardstick,
+            "yardstick_ids": list(self.yardstick_ids),
             "num_strata": self.num_strata,
             "stratum_sizes": [len(ids) for ids in self.focus_strata],
             "stratum_weights": list(stratum_weights(self.num_strata)),
@@ -129,6 +149,7 @@ def assign_cohorts(
     seed: int,
     reserved_focus_ids: tuple[int, ...] | list[int] = (),
     num_strata: int = 1,
+    num_yardstick: int = 0,
 ) -> CohortAssignment:
     """Draw a seeded permutation and tag exactly ``round(alpha * N)`` anchors.
 
@@ -154,7 +175,12 @@ def assign_cohorts(
     anchors = tuple(sorted(candidates[:num_anchor]))
     if num_strata < 1:
         raise ValueError(f"num_strata must be >= 1, got {num_strata}")
-    anchor_set = set(anchors)
+    if num_yardstick < 0 or num_anchor + num_yardstick + len(reserved) > num_envs:
+        raise ValueError("anchor + yardstick + reserved exceed the environment count")
+    # Yardstick envs come next in the same seeded permutation, so they are a
+    # fixed random subset, never the reserved (observer) envs, never anchors.
+    yardstick = tuple(sorted(candidates[num_anchor : num_anchor + num_yardstick]))
+    anchor_set = set(anchors) | set(yardstick)
     focus_pool = [i for i in permutation if i not in anchor_set]
     if num_strata == 1:
         strata: tuple[tuple[int, ...], ...] = (tuple(sorted(focus_pool)),)
@@ -173,6 +199,7 @@ def assign_cohorts(
         anchor_ids=anchors,
         reserved_focus_ids=reserved,
         focus_strata=strata,
+        yardstick_ids=yardstick,
     )
 
 
@@ -208,6 +235,19 @@ class CohortDispatch:
         object.__setattr__(self, "calls", {ANCHOR: 0, FOCUS: 0})
         object.__setattr__(self, "env_counts", {ANCHOR: 0, FOCUS: 0})
         object.__setattr__(self, "all_envs_mode", False)
+        object.__setattr__(self, "_yardstick_mask", None)
+        object.__setattr__(self, "_yardstick_params", None)
+        object.__setattr__(self, "_yardstick_buckets", None)
+
+    def set_yardstick(
+        self, mask: torch.Tensor, params: dict[str, Any], buckets: torch.Tensor | None = None
+    ) -> None:
+        """Hold these environments at the given (lambda = 0) parameters."""
+        object.__setattr__(self, "_yardstick_mask", mask.detach().cpu().bool())
+        object.__setattr__(self, "_yardstick_params", DS._deep_copy(params))
+        object.__setattr__(
+            self, "_yardstick_buckets", buckets.clone() if isinstance(buckets, torch.Tensor) else None
+        )
 
     # ------------------------------------------------------------- strata --
 
@@ -269,6 +309,20 @@ class CohortDispatch:
             focus_ids = ids[(~mask).to(ids.device)]
 
         results = []
+        ymask = object.__getattribute__(self, "_yardstick_mask")
+        if ymask is not None and not self.all_envs_mode:
+            in_yard = ymask[focus_ids.cpu()].to(focus_ids.device)
+            yard_ids, focus_ids = focus_ids[in_yard], focus_ids[~in_yard]
+            if yard_ids.numel() > 0:
+                self.calls[YARDSTICK] = self.calls.get(YARDSTICK, 0) + 1
+                self.env_counts[YARDSTICK] = self.env_counts.get(YARDSTICK, 0) + int(yard_ids.numel())
+                merged = dict(params)
+                merged.update(object.__getattribute__(self, "_yardstick_params"))
+                results.append(
+                    self._call_with_buckets(
+                        env, yard_ids, merged, object.__getattribute__(self, "_yardstick_buckets")
+                    )
+                )
         if focus_ids.numel() > 0:
             self.calls[FOCUS] += 1
             self.env_counts[FOCUS] += int(focus_ids.numel())

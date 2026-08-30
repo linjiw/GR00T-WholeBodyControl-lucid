@@ -109,6 +109,14 @@ ARM_RETURN_GUARD: dict[str, str] = {
     "ta_lucid_50_latcap_s4_rg": "relative",
 }
 ARM_SPREAD_STRATA.update({arm: 4 for arm in CAP_ARMS})
+#: The margin-signal arm: same strata and relative guard as lucid_s4_rg, but
+#: the controller reads the termination margin from every env as a ratio
+#: against a 64-env yardstick cohort held at lambda = 0, with a dead band.
+MARGIN_ARMS = ("lucid_margin_s4_rg",)
+ARMS.update({"lucid_margin_s4_rg": ("lucid", 0.0, None)})
+ARM_SPREAD_STRATA.update({arm: 4 for arm in MARGIN_ARMS})
+ARM_RETURN_GUARD.update({arm: "relative" for arm in MARGIN_ARMS})
+MARGIN_OBSERVER = "gear_sonic.research.practice_utility.margin_observer.MarginObserverCallback"
 LATONLY_ARMS = ("lucid_latonly_s4_rg", "ta_lucid_50_latonly_s4_rg")
 ARM_SPREAD_STRATA.update({arm: 4 for arm in LATONLY_ARMS})
 ARM_RETURN_GUARD.update({arm: "relative" for arm in LATONLY_ARMS})
@@ -202,6 +210,14 @@ def parse_args(argv=None):
         default=0.5,
         help="cap arms: ceiling on the actuation-latency channel's share of lambda",
     )
+    parser.add_argument("--margin-horizon", type=int, default=12,
+                        help="margin arms: prefix length K of each episode the margin is averaged over")
+    parser.add_argument("--margin-band-lo", type=float, default=1.10,
+                        help="margin arms: below this focus/yardstick ratio the dose rises")
+    parser.add_argument("--margin-band-hi", type=float, default=1.30,
+                        help="margin arms: above this ratio the dose falls; between, it holds")
+    parser.add_argument("--yardstick-envs", type=int, default=64,
+                        help="margin arms: environments held at lambda=0 as the self-reference")
     parser.add_argument(
         "--return-relative-drop",
         type=float,
@@ -327,6 +343,22 @@ def build_command(
         if mode in CAP_ARMS
         else []
     )
+    margin = (
+        [
+            f"++callbacks.margin_observer._target_={MARGIN_OBSERVER}",
+            "++callbacks.margin_observer.enabled=true",
+            f"++callbacks.margin_observer.branch_id={branch_id}",
+            f"++callbacks.margin_observer.output_dir={artifact_dir}",
+            f"++callbacks.margin_observer.horizon={args.margin_horizon}",
+            f"++callbacks.margin_observer.band_lo={args.margin_band_lo}",
+            f"++callbacks.margin_observer.band_hi={args.margin_band_hi}",
+            "++callbacks.lucid_curriculum.signal=margin",
+            f"++callbacks.lucid_curriculum.yardstick_envs={args.yardstick_envs}",
+            f"++callbacks.lucid_curriculum.margin_branch_id={branch_id}",
+        ]
+        if mode in MARGIN_ARMS
+        else []
+    )
     strata = ARM_SPREAD_STRATA.get(mode, 1)
     guard = ARM_RETURN_GUARD.get(mode, "absolute")
     spread = [f"++callbacks.lucid_curriculum.spread_strata={strata}"] if strata > 1 else []
@@ -393,6 +425,7 @@ def build_command(
         *yoked,
         *overrides,
         *caps,
+        *margin,
         *spread,
         *relative_guard,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
@@ -614,6 +647,12 @@ def main(argv=None) -> int:
                     "run_dir": _logging_directory(log_path),
                     "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
+                    "signal": "margin" if mode in MARGIN_ARMS else "gap",
+                    "margin": (
+                        {"horizon": args.margin_horizon, "band": [args.margin_band_lo, args.margin_band_hi],
+                         "yardstick_envs": args.yardstick_envs}
+                        if mode in MARGIN_ARMS else None
+                    ),
                     "term_lambda_caps": (
                         {"randomize_action_delay": args.latency_cap} if mode in CAP_ARMS else {}
                     ),

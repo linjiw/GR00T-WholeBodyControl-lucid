@@ -211,6 +211,43 @@ class LucidDRController:
         self.history.append(step)
         return step
 
+    def update_with_error(self, error: float, mean_return: float | None = None) -> ControllerStep:
+        """Advance one epoch on an error the caller already computed.
+
+        The same PI law and the same guards as :meth:`update`; only the error
+        term is supplied instead of derived from ``delta_target - gap``. Used by
+        the margin signal, whose dead band makes "no error" a real state.
+        """
+        self.epoch += 1
+        config = self.config
+        before = self.lambda_value
+        reference = self.return_reference
+        if self._guard(mean_return):
+            self.integral = 0.0
+            self.lambda_value = max(config.lambda_min, self.lambda_value * config.return_decay)
+            step = ControllerStep(
+                epoch=self.epoch, gap_quantile=float("nan"), error=0.0, integral=self.integral,
+                control=0.0, lambda_before=before, lambda_after=self.lambda_value,
+                mean_return=mean_return, guard_tripped=True, low_return_streak=self.low_return_streak,
+                num_gap_samples=0, return_reference=reference,
+            )
+            self.history.append(step)
+            return step
+        error = float(error)
+        self.integral = _clip(self.integral + error, -config.integral_max, config.integral_max)
+        control = _clip(config.kp * error + config.ki * self.integral, -1.0, 1.0)
+        self.lambda_value = _clip(
+            self.lambda_value + config.alpha * control, config.lambda_min, config.lambda_max
+        )
+        step = ControllerStep(
+            epoch=self.epoch, gap_quantile=float("nan"), error=error, integral=self.integral,
+            control=control, lambda_before=before, lambda_after=self.lambda_value,
+            mean_return=mean_return, low_return_streak=self.low_return_streak,
+            num_gap_samples=0, return_reference=reference,
+        )
+        self.history.append(step)
+        return step
+
     @property
     def return_reference(self) -> float | None:
         """Best return seen in the trailing window, or ``None`` before any."""

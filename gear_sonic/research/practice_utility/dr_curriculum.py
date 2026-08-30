@@ -91,6 +91,9 @@ class LucidCurriculumCallback(TrainerCallback):
         term_lambda_overrides: dict[str, float] | None = None,
         term_lambda_caps: dict[str, float] | None = None,
         spread_strata: int = 1,
+        signal: str = "gap",
+        yardstick_envs: int = 0,
+        margin_branch_id: str | None = None,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked"):
             raise ValueError(
@@ -106,6 +109,18 @@ class LucidCurriculumCallback(TrainerCallback):
             raise ValueError("mode='yoked' requires yoked_schedule_path")
         if int(spread_strata) < 1:
             raise ValueError(f"spread_strata must be >= 1, got {spread_strata}")
+        if signal not in ("gap", "margin"):
+            raise ValueError(f"signal must be 'gap' or 'margin', got {signal!r}")
+        if signal == "margin" and int(yardstick_envs) < 1:
+            raise ValueError("signal='margin' needs yardstick_envs >= 1: the ratio is against them")
+        # --- the controller input ------------------------------------------
+        # "gap": the frozen-encoder latent gap from one tracked env (the
+        # manuscript's signal). "margin": the termination margin from every
+        # env, as a ratio against a yardstick cohort held at lambda = 0 in the
+        # same run, with a dead band -- see margin_signal.py for why.
+        self.signal = signal
+        self.yardstick_envs = int(yardstick_envs)
+        self.margin_branch_id = margin_branch_id
         # --- TACE: target-anchored exposure -------------------------------
         # A fixed cohort of environments always samples the full (lambda = 1)
         # envelope; the curriculum only moves the rest. alpha = 0 is the plain
@@ -285,6 +300,29 @@ class LucidCurriculumCallback(TrainerCallback):
                 "yoked_index": index,
                 "yoked_schedule_length": len(self._yoked_schedule),
             }
+        elif self.signal == "margin":
+            observer = self._margin_observer()
+            mean_return = self._mean_return(state)
+            if observer is None:
+                # No signal is not "raise the dose": hold.
+                outcome = self.controller.update_with_error(0.0, mean_return=mean_return)
+                ratio = None
+            else:
+                observer.ensure_flushed(step)
+                outcome = self.controller.update_with_error(
+                    observer.current_error(), mean_return=mean_return
+                )
+                ratio = observer.current_ratio()
+            self._apply(outcome.lambda_after)
+            record = {
+                "global_step": step,
+                "mode": "lucid",
+                "signal": "margin",
+                "lambda": outcome.lambda_after,
+                "margin_ratio": ratio,
+                "margin_observer_present": observer is not None,
+                **outcome.to_dict(),
+            }
         else:
             gaps = self._gaps()
             mean_return = self._mean_return(state)
@@ -293,6 +331,7 @@ class LucidCurriculumCallback(TrainerCallback):
             record = {
                 "global_step": step,
                 "mode": "lucid",
+                "signal": "gap",
                 "lambda": outcome.lambda_after,
                 **outcome.to_dict(),
             }
@@ -327,7 +366,9 @@ class LucidCurriculumCallback(TrainerCallback):
         self.baseline = DS.capture_baseline(manager)
         self.scalable = DS.scalable_terms(manager)
         self._env = env
-        if (self.anchor_ratio > 0.0 or self.spread_strata > 1) and self.assignment is None:
+        if (
+            self.anchor_ratio > 0.0 or self.spread_strata > 1 or self.yardstick_envs > 0
+        ) and self.assignment is None:
             num_envs = _num_envs_of(env, manager)
             if num_envs is None:
                 raise RuntimeError("TACE needs the environment count to assign cohorts")
@@ -337,12 +378,46 @@ class LucidCurriculumCallback(TrainerCallback):
                 reserved = tuple(sorted({*reserved, int(observer.tracked_env)}))
             seed = self.anchor_seed if self.anchor_seed is not None else 0
             self.assignment = TACE.assign_cohorts(
-                num_envs, self.anchor_ratio, seed, reserved, num_strata=self.spread_strata
+                num_envs, self.anchor_ratio, seed, reserved,
+                num_strata=self.spread_strata, num_yardstick=self.yardstick_envs,
             )
             anchor_params, anchor_buckets = self._anchor_target(manager)
             self.dispatchers = TACE.install(
                 manager, self.baseline, self.assignment, anchor_params, anchor_buckets
             )
+            if self.yardstick_envs > 0:
+                self._install_yardstick()
+            margin = self._margin_observer()
+            if margin is not None:
+                margin.set_cohorts(self.assignment.focus_mask(), self.assignment.yardstick_mask())
+
+    def _install_yardstick(self) -> None:
+        """Hold the yardstick cohort at lambda = 0 on every dispatched term."""
+        from gear_sonic.research.practice_utility import events_reset_safe as ERS
+
+        assert self.assignment is not None and self.baseline is not None
+        mask = self.assignment.yardstick_mask()
+        for name, dispatch in self.dispatchers.items():
+            base = self.baseline.get(name)
+            if base is None:
+                continue
+            params = DS.scaled_term_params(base, 0.0)
+            buckets = None
+            if any(key in params for key in DS.MATERIAL_RANGE_KEYS):
+                buckets = ERS.draw_material_buckets(
+                    dispatch.inner,
+                    static_friction_range=DS._as_pair(params.get("static_friction_range")),
+                    dynamic_friction_range=DS._as_pair(params.get("dynamic_friction_range")),
+                    restitution_range=DS._as_pair(params.get("restitution_range")),
+                )
+            dispatch.set_yardstick(mask, params, buckets)
+
+    def _margin_observer(self):
+        if self.signal != "margin":
+            return None
+        from gear_sonic.research.practice_utility import margin_observer as MO
+
+        return MO.get_active_margin_observer(self.margin_branch_id or self.branch_id)
 
     def _anchor_target(
         self, manager: Any
@@ -532,6 +607,8 @@ class LucidCurriculumCallback(TrainerCallback):
             "mode": self.mode,
             "branch_id": self.branch_id,
             "spread_strata": self.spread_strata,
+            "signal": self.signal,
+            "yardstick_envs": self.yardstick_envs,
             "controller": self.controller.state_dict(),
             "scalable_terms": self.scalable,
             "term_lambda_overrides": self.term_lambda_overrides,
