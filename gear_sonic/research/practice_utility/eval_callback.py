@@ -83,6 +83,8 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
                 allow_extrapolation=True,
             )
             self._dr_scale_report = report.to_dict()
+            if self.non_latency_dr_scale > 1.0:
+                self._dr_scale_report["physical_clamp"] = DS.clamp_physical(event_manager)
         if self.fixed_latency_steps is not None:
             self._latency_report = _pin_action_delay(
                 event_manager, float(self.fixed_latency_steps)

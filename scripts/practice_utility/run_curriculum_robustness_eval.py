@@ -37,6 +37,7 @@ PRESET_FIXED_LATENCY_STEPS = {
     "lat_20ms": 4,
     "lat_30ms": 6,
     "lat_40ms": 8,
+    "lat_50ms": 10,
     "lat_60ms": 12,
 }
 #: Physics-only ladder: the five non-latency channels scaled, actuation latency
@@ -53,6 +54,8 @@ PRESET_PHYSICS_ONLY = {
     "phys_100": 1.0,
     "phys_125": 1.25,
     "phys_150": 1.5,
+    "phys_175": 1.75,
+    "phys_200": 2.0,
 }
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",

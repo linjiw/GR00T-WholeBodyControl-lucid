@@ -225,6 +225,60 @@ def apply_lambda(
     )
 
 
+#: Physical validity limits for extrapolated ranges. Affine extrapolation past
+#: lambda = 1 can leave the physically meaningful region: at 1.5x the friction
+#: envelope [0.3, 1.6] centred on 0.95 becomes [-0.025, 1.925], and PhysX does
+#: not accept a negative friction coefficient. Every extrapolated evaluation cell
+#: measured before this clamp existed carried that invalid low tail.
+PHYSICAL_LIMITS: dict[str, tuple[float, float]] = {
+    "static_friction_range": (0.05, 4.0),
+    "dynamic_friction_range": (0.05, 4.0),
+    "restitution_range": (0.0, 1.0),
+    "mass_distribution_params": (0.1, 10.0),
+}
+
+
+def clamp_physical(event_manager: Any) -> dict[str, Any]:
+    """Pull every live range back inside :data:`PHYSICAL_LIMITS`.
+
+    Reports exactly which ``term.key`` was clamped and from what, so a receipt
+    cannot claim a range no simulator ever ran. Material buckets are redrawn
+    with ``make_consistent`` so dynamic friction never exceeds static.
+    """
+    clamped: dict[str, dict[str, Any]] = {}
+    for name, cfg in _iter_terms(event_manager):
+        params = getattr(cfg, "params", None)
+        if not isinstance(params, dict):
+            continue
+        touched = False
+        for key, (lo_lim, hi_lim) in PHYSICAL_LIMITS.items():
+            value = params.get(key)
+            pair = _as_pair(value)
+            if pair is None:
+                continue
+            lo, hi = pair
+            new_lo, new_hi = max(lo, lo_lim), min(hi, hi_lim)
+            if (new_lo, new_hi) != (lo, hi):
+                params[key] = [new_lo, new_hi]
+                clamped.setdefault(name, {})[key] = {"from": [lo, hi], "to": [new_lo, new_hi]}
+                touched = True
+        if touched and any(key in params for key in MATERIAL_RANGE_KEYS):
+            from gear_sonic.research.practice_utility.events_reset_safe import (
+                resample_material_buckets,
+            )
+            term = getattr(cfg, "func", None)
+            if term is not None:
+                resample_material_buckets(
+                    term,
+                    static_friction_range=_as_pair(params.get("static_friction_range")),
+                    dynamic_friction_range=_as_pair(params.get("dynamic_friction_range")),
+                    restitution_range=_as_pair(params.get("restitution_range")),
+                    make_consistent=True,
+                )
+                clamped[name]["material_buckets_redrawn_consistent"] = True
+    return {"limits": {k: list(v) for k, v in PHYSICAL_LIMITS.items()}, "clamped": clamped}
+
+
 def capture_baseline(event_manager: Any) -> dict[str, dict[str, Any]]:
     """Snapshot every term's range parameters before any scaling is applied."""
     baseline: dict[str, dict[str, Any]] = {}

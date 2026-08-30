@@ -123,3 +123,49 @@ def test_the_ladder_rungs_cover_the_training_envelope_and_beyond():
     for name in E.PRESET_FIXED_LATENCY_STEPS:
         assert E.PRESETS[name] == "tracking/lucid_eval_clean"
         assert name not in E.PRESET_DR_SCALE
+
+
+class _MatTerm:
+    def __init__(self):
+        self.material_buckets = torch.tensor([[0.3, 0.3, 0.0], [1.6, 1.2, 0.5]])
+    def __call__(self, *a, **k): return None
+
+
+class _Cfg:
+    def __init__(self, params, func=None):
+        self.params = params; self.mode = "reset"; self.func = func
+
+
+class _Mgr:
+    def __init__(self, terms):
+        self.active_terms = list(terms); self._term_cfgs = list(terms.values())
+
+
+def test_extrapolated_friction_is_clamped_to_physical_validity():
+    # 1.5x the [0.3, 1.6] envelope about 0.95 is [-0.025, 1.925]; PhysX does
+    # not accept negative friction. Every extrapolated cell before this clamp
+    # carried that tail.
+    term = _MatTerm()
+    mgr = _Mgr({
+        "physics_material": _Cfg({"static_friction_range": [-0.025, 1.925],
+                                  "dynamic_friction_range": [0.075, 1.425],
+                                  "restitution_range": [0.0, 0.75], "num_buckets": 2}, term),
+        "randomize_rigid_body_mass": _Cfg({"mass_distribution_params": [-0.2, 2.5]}),
+        "push_robot": _Cfg({"velocity_range": {"x": [-9.0, 9.0]}}),
+    })
+    report = DS.clamp_physical(mgr)
+    assert mgr._term_cfgs[0].params["static_friction_range"] == [0.05, 1.925]
+    assert mgr._term_cfgs[1].params["mass_distribution_params"] == [0.1, 2.5]
+    assert mgr._term_cfgs[2].params["velocity_range"]["x"] == [-9.0, 9.0]  # no limit declared
+    assert report["clamped"]["physics_material"]["static_friction_range"]["from"] == [-0.025, 1.925]
+    assert report["clamped"]["physics_material"]["material_buckets_redrawn_consistent"] is True
+    # redrawn buckets respect the floor and dynamic <= static
+    b = term.material_buckets
+    assert float(b[:, 0].min()) >= 0.05 and bool((b[:, 1] <= b[:, 0]).all())
+
+
+def test_an_in_envelope_range_is_untouched():
+    mgr = _Mgr({"physics_material": _Cfg({"static_friction_range": [0.3, 1.6]})})
+    report = DS.clamp_physical(mgr)
+    assert report["clamped"] == {}
+    assert mgr._term_cfgs[0].params["static_friction_range"] == [0.3, 1.6]
