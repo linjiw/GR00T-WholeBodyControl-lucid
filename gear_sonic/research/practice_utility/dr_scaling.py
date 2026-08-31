@@ -144,7 +144,11 @@ def scale_params(
     return baseline
 
 
-def scaled_term_params(baseline_term: dict[str, Any], lambda_value: float) -> dict[str, Any]:
+def scaled_term_params(
+    baseline_term: dict[str, Any],
+    lambda_value: float,
+    allow_extrapolation: bool = False,
+) -> dict[str, Any]:
     """Every range of one term, scaled to ``lambda``, without touching the term.
 
     :func:`apply_lambda` writes the scaled ranges back onto the live event
@@ -153,7 +157,7 @@ def scaled_term_params(baseline_term: dict[str, Any], lambda_value: float) -> di
     hand to the per-stratum samplers, so the pure computation lives here.
     """
     return {
-        key: scale_params(original, lambda_value, RANGE_NOMINALS[key])
+        key: scale_params(original, lambda_value, RANGE_NOMINALS[key], allow_extrapolation)
         for key, original in baseline_term.items()
         if key in RANGE_NOMINALS
     }
@@ -277,6 +281,44 @@ def clamp_physical(event_manager: Any) -> dict[str, Any]:
                 )
                 clamped[name]["material_buckets_redrawn_consistent"] = True
     return {"limits": {k: list(v) for k, v in PHYSICAL_LIMITS.items()}, "clamped": clamped}
+
+
+def clamp_params_physical(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Clamp one term's scaled params to physical validity, without a manager.
+
+    The dispatcher path (strata, anchors) hands scaled parameter dicts straight
+    to per-cohort samplers and never writes the live event config, so
+    :func:`clamp_physical` cannot see them. Same limits, same report shape;
+    dynamic friction is additionally kept at or below static.
+    """
+    clamped: dict[str, dict[str, Any]] = {}
+    out = dict(params)
+    for key, (lo_lim, hi_lim) in PHYSICAL_LIMITS.items():
+        value = out.get(key)
+        if not (isinstance(value, (list, tuple)) and len(value) == 2):
+            continue
+        lo, hi = float(value[0]), float(value[1])
+        new_lo, new_hi = max(lo, lo_lim), min(hi, hi_lim)
+        if (new_lo, new_hi) != (lo, hi):
+            clamped[key] = {"from": [lo, hi], "to": [new_lo, new_hi]}
+            out[key] = [new_lo, new_hi]
+    static = out.get("static_friction_range")
+    dynamic = out.get("dynamic_friction_range")
+    if (
+        isinstance(static, (list, tuple))
+        and isinstance(dynamic, (list, tuple))
+        and len(static) == 2
+        and len(dynamic) == 2
+        and float(dynamic[1]) > float(static[1])
+    ):
+        hi_cap = float(static[1])
+        new_range = [min(float(dynamic[0]), hi_cap), hi_cap]
+        clamped["dynamic_friction_range"] = {
+            "from": [float(dynamic[0]), float(dynamic[1])],
+            "to": list(new_range),
+        }
+        out["dynamic_friction_range"] = new_range
+    return out, clamped
 
 
 def capture_baseline(event_manager: Any) -> dict[str, dict[str, Any]]:

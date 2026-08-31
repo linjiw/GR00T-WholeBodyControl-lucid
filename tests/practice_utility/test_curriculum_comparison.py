@@ -113,3 +113,28 @@ def test_cross_seed_yoked_uses_next_seed_schedule_from_source_receipt(tmp_path):
         "8601": "/art/seed_8602/c.jsonl",
         "8602": "/art/seed_8600/c.jsonl",
     }
+
+
+import pytest
+
+
+def test_fixed_150_extends_support_explicitly():
+    a = args()
+    a.max_delay = 12
+    cmd = R.build_command(a, "fixed_150", 8600, "b", Path("/tmp/artifact"))
+    assert "++callbacks.lucid_curriculum.fixed_lambda=1.5" in cmd
+    assert "++callbacks.lucid_curriculum.allow_extrapolation=true" in cmd
+    assert "++callbacks.lucid_curriculum.mode=fixed" in cmd
+
+
+def test_fixed_150_refuses_an_undersized_delay_buffer():
+    # 1.5x the 0-40 ms envelope needs 12 steps of buffer; the delayed-actuator
+    # process clamps silently, so the launcher must fail loudly instead.
+    with pytest.raises(SystemExit, match="max-delay 12"):
+        R.build_command(args(), "fixed_150", 8600, "b", Path("/tmp/artifact"))
+
+
+def test_ordinary_arms_keep_the_envelope_and_no_flag():
+    cmd = R.build_command(args(), "fixed", 8600, "b", Path("/tmp/artifact"))
+    assert "++callbacks.lucid_curriculum.fixed_lambda=1.0" in cmd
+    assert not any("allow_extrapolation" in part for part in cmd)

@@ -94,6 +94,7 @@ class LucidCurriculumCallback(TrainerCallback):
         signal: str = "gap",
         yardstick_envs: int = 0,
         margin_branch_id: str | None = None,
+        allow_extrapolation: bool = False,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked"):
             raise ValueError(
@@ -176,6 +177,27 @@ class LucidCurriculumCallback(TrainerCallback):
         self.output_dir = output_dir
         self.branch_id = branch_id
         self.fixed_lambda = float(fixed_lambda)
+        self.allow_extrapolation = bool(allow_extrapolation)
+        self._clamp_report: dict[str, Any] | None = None
+        # The eval/training asymmetry: evaluation may score a policy outside the
+        # envelope, but training crosses lambda = 1 only through this explicit
+        # flag, and only for the open-loop fixed mode -- a controller that can
+        # extrapolate on its own initiative is how a support experiment becomes
+        # an uncontrolled one.
+        if self.allow_extrapolation and mode != "fixed":
+            raise ValueError(
+                "allow_extrapolation is a fixed-mode support extension; "
+                f"controller-driven mode {mode!r} stays hard-capped at lambda = 1"
+            )
+        if self.fixed_lambda > 1.0 and not self.allow_extrapolation:
+            raise ValueError(
+                f"fixed_lambda={self.fixed_lambda} is outside the training envelope; "
+                "pass allow_extrapolation=true to extend support past lambda = 1 deliberately"
+            )
+        if not 0.0 <= self.fixed_lambda <= DS.MAX_EXTRAPOLATION:
+            raise ValueError(
+                f"fixed_lambda must be in [0, {DS.MAX_EXTRAPOLATION}], got {self.fixed_lambda}"
+            )
         self.update_every = max(1, int(update_every))
         # After a (re)start the gap and return estimates are dominated by the
         # restart transient -- measured at up to 28% relative spread in the first
@@ -190,7 +212,10 @@ class LucidCurriculumCallback(TrainerCallback):
         if mode == "lucid":
             starting_lambda = initial_lambda
         elif mode == "fixed":
-            starting_lambda = fixed_lambda
+            # The controller is inert in fixed mode (_apply reads fixed_lambda
+            # directly); its config stays envelope-bound even when a support
+            # extension trains past 1, so no controller path can ever follow.
+            starting_lambda = min(fixed_lambda, 1.0)
         elif mode == "yoked":
             starting_lambda = self._yoked_schedule[0] if self._yoked_schedule else initial_lambda
         else:
@@ -274,13 +299,16 @@ class LucidCurriculumCallback(TrainerCallback):
             }
             self._apply(1.0)
         elif self.mode == "fixed":
+            self._apply(self.fixed_lambda)
             record = {
                 "global_step": step,
                 "mode": "fixed",
                 "lambda": self.fixed_lambda,
                 "gap_quantile": None,
             }
-            self._apply(self.fixed_lambda)
+            if self.allow_extrapolation:
+                record["allow_extrapolation"] = True
+                record["physical_clamp"] = sorted((self._clamp_report or {}).get("clamped", {}))
         elif self.mode == "off":
             record = {"global_step": step, "mode": "off", "lambda": 0.0, "gap_quantile": None}
             self._apply(0.0)
@@ -444,7 +472,9 @@ class LucidCurriculumCallback(TrainerCallback):
             base = self.baseline.get(name)
             if base is None:
                 continue
-            scaled = DS.scaled_term_params(base, ceiling)
+            scaled = DS.scaled_term_params(base, ceiling, self.allow_extrapolation)
+            if self.allow_extrapolation:
+                scaled, _ = DS.clamp_params_physical(scaled)
             params[name] = scaled
             cfg = terms.get(name)
             func = getattr(cfg, "func", None) if cfg is not None else None
@@ -476,6 +506,7 @@ class LucidCurriculumCallback(TrainerCallback):
             self.baseline,
             lambda_value,
             exclude_terms=per_term,
+            allow_extrapolation=self.allow_extrapolation,
         )
         for name in per_term:
             if name in self.baseline:
@@ -483,7 +514,13 @@ class LucidCurriculumCallback(TrainerCallback):
                     self._event_manager,
                     {name: self.baseline[name]},
                     self._channel_lambda(name, lambda_value),
+                    allow_extrapolation=self.allow_extrapolation,
                 )
+        if self.allow_extrapolation:
+            # Affine extension past lambda = 1 can leave the physically valid
+            # region (friction went negative at 1.5x before the eval-side clamp
+            # existed); clamp the live config and keep the report for the record.
+            self._clamp_report = DS.clamp_physical(self._event_manager)
         self._apply_strata(lambda_value)
 
     def _apply_strata(self, lambda_value: float) -> None:
@@ -509,7 +546,11 @@ class LucidCurriculumCallback(TrainerCallback):
                 if index == len(weights) - 1:
                     dispatch.set_stratum(index, None)
                     continue
-                params = DS.scaled_term_params(base, channel_lambda * weight)
+                params = DS.scaled_term_params(
+                    base, channel_lambda * weight, self.allow_extrapolation
+                )
+                if self.allow_extrapolation:
+                    params, _ = DS.clamp_params_physical(params)
                 buckets = None
                 if any(key in params for key in DS.MATERIAL_RANGE_KEYS):
                     buckets = ERS.draw_material_buckets(

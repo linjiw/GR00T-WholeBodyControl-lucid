@@ -116,6 +116,13 @@ MARGIN_ARMS = ("lucid_margin_s4_rg",)
 ARMS.update({"lucid_margin_s4_rg": ("lucid", 0.0, None)})
 ARM_SPREAD_STRATA.update({arm: 4 for arm in MARGIN_ARMS})
 ARM_RETURN_GUARD.update({arm: "relative" for arm in MARGIN_ARMS})
+#: Support-extension arms: fixed DR trained PAST the lambda = 1 envelope -- the
+#: frontier-exposure lever the capability ladder identified (every arm orders by
+#: time spent at the hardest physics it ever saw). Training-side physical clamps
+#: apply (friction floor etc.), and the delay buffer must be sized for the
+#: extended latency range or it silently clamps; build_command enforces that.
+ARM_FIXED_LAMBDA: dict[str, float] = {"fixed_150": 1.5}
+ARMS.update({"fixed_150": ("fixed", 0.0, None)})
 MARGIN_OBSERVER = "gear_sonic.research.practice_utility.margin_observer.MarginObserverCallback"
 LATONLY_ARMS = ("lucid_latonly_s4_rg", "ta_lucid_50_latonly_s4_rg")
 ARM_SPREAD_STRATA.update({arm: 4 for arm in LATONLY_ARMS})
@@ -361,6 +368,24 @@ def build_command(
     )
     strata = ARM_SPREAD_STRATA.get(mode, 1)
     guard = ARM_RETURN_GUARD.get(mode, "absolute")
+    fixed_lambda_value = ARM_FIXED_LAMBDA.get(mode, 1.0)
+    extrapolation = (
+        ["++callbacks.lucid_curriculum.allow_extrapolation=true"]
+        if mode in ARM_FIXED_LAMBDA
+        else []
+    )
+    if mode in ARM_FIXED_LAMBDA:
+        # 8 steps = the 40 ms training ceiling at 200 Hz; the delayed-actuator
+        # buffer clamps any drawn delay to its allocated capacity WITHOUT error,
+        # so an undersized buffer would quietly turn 1.5x latency back into 1.0x.
+        needed = fixed_lambda_value * 8
+        needed = int(needed) if float(needed).is_integer() else int(needed) + 1
+        if args.max_delay < needed:
+            raise SystemExit(
+                f"{mode} trains latency at {fixed_lambda_value}x the 0-40 ms envelope, "
+                f"which needs a delay-buffer capacity of {needed} steps; the buffer "
+                f"silently clamps to --max-delay ({args.max_delay}). Pass --max-delay {needed}."
+            )
     spread = [f"++callbacks.lucid_curriculum.spread_strata={strata}"] if strata > 1 else []
     if strata > 1 and anchor_ratio == 0.0:
         # Strata need the cohort machinery, which the callback only installs
@@ -432,7 +457,8 @@ def build_command(
         f"++callbacks.lucid_curriculum.branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
         "++callbacks.lucid_curriculum.initial_lambda=0.0",
-        "++callbacks.lucid_curriculum.fixed_lambda=1.0",
+        f"++callbacks.lucid_curriculum.fixed_lambda={fixed_lambda_value}",
+        *extrapolation,
         f"++callbacks.lucid_curriculum.delta_target={args.delta_target}",
         f"++callbacks.lucid_curriculum.kp={args.kp}",
         f"++callbacks.lucid_curriculum.ki={args.ki}",
@@ -647,6 +673,11 @@ def main(argv=None) -> int:
                     "run_dir": _logging_directory(log_path),
                     "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
+                    "fixed_lambda": ARM_FIXED_LAMBDA.get(mode, 1.0),
+                    "allow_extrapolation": mode in ARM_FIXED_LAMBDA,
+                    "physical_clamp": (
+                        curriculum[-1].get("physical_clamp") if curriculum else None
+                    ),
                     "signal": "margin" if mode in MARGIN_ARMS else "gap",
                     "margin": (
                         {"horizon": args.margin_horizon, "band": [args.margin_band_lo, args.margin_band_hi],

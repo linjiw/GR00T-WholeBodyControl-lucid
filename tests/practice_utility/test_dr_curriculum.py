@@ -5,6 +5,7 @@ import json
 import pytest
 
 from gear_sonic.research.practice_utility import dr_scaling as DS
+from gear_sonic.research.practice_utility.dr_curriculum import LucidCurriculumCallback
 from gear_sonic.research.practice_utility.dr_controller import (
     LucidDRController,
     PIConfig,
@@ -766,3 +767,87 @@ class TestWarmupHold:
         callback.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
         callback.on_step_end(None, FakeStateWithHistory(1, mean_reward=10.0), None, env=env)
         assert callback.controller.lambda_value > 0.0
+
+
+class TestSupportExtension:
+    """fixed_150: training past lambda = 1 is explicit, fixed-mode-only, and clamped."""
+
+    def test_scaled_term_params_refuses_extrapolation_without_the_flag(self):
+        with pytest.raises(ValueError, match="lambda must be in"):
+            DS.scaled_term_params({"mass_distribution_params": [0.8, 1.2]}, 1.5)
+
+    def test_scaled_term_params_extends_about_the_nominal_with_the_flag(self):
+        params = DS.scaled_term_params(
+            {"mass_distribution_params": [0.8, 1.2]}, 1.5, allow_extrapolation=True
+        )
+        assert params["mass_distribution_params"] == pytest.approx([0.7, 1.3])
+
+    def test_controller_modes_may_not_extrapolate(self):
+        with pytest.raises(ValueError, match="fixed-mode"):
+            LucidCurriculumCallback(enabled=True, mode="lucid", allow_extrapolation=True)
+
+    def test_fixed_lambda_past_one_requires_the_flag(self):
+        with pytest.raises(ValueError, match="allow_extrapolation"):
+            LucidCurriculumCallback(enabled=True, mode="fixed", fixed_lambda=1.5)
+
+    def test_fixed_lambda_is_bounded_by_the_extrapolation_ceiling(self):
+        with pytest.raises(ValueError, match="must be in"):
+            LucidCurriculumCallback(
+                enabled=True, mode="fixed", fixed_lambda=5.0, allow_extrapolation=True
+            )
+
+    def test_apply_at_150_extends_and_physically_clamps_the_live_config(self):
+        cur = LucidCurriculumCallback(
+            enabled=True, mode="fixed", fixed_lambda=1.5, allow_extrapolation=True
+        )
+        m = Manager(
+            {
+                "physics_material": MaterialCfg(mode="reset"),
+                "randomize_rigid_body_mass": Term(
+                    "reset", {"mass_distribution_params": [0.8, 1.2], "operation": "scale"}
+                ),
+            }
+        )
+        cur._event_manager = m
+        cur.baseline = DS.capture_baseline(m)
+        cur._apply(1.5)
+        mass = m._terms["randomize_rigid_body_mass"].params["mass_distribution_params"]
+        assert mass == pytest.approx([0.7, 1.3])
+        # friction [0.3, 1.6] about its midpoint 0.95 extends to [-0.025, 1.925];
+        # the clamp must lift the low edge to physical validity.
+        static = m._terms["physics_material"].params["static_friction_range"]
+        assert static[0] == pytest.approx(0.05) and static[1] == pytest.approx(1.925)
+        assert cur._clamp_report is not None
+        assert "physics_material" in cur._clamp_report["clamped"]
+        buckets = m._terms["physics_material"].func.material_buckets
+        assert float(buckets[:, 0].min()) >= 0.049
+
+    def test_apply_at_one_is_unchanged_with_the_flag_off(self):
+        cur = LucidCurriculumCallback(enabled=True, mode="fixed", fixed_lambda=1.0)
+        m = manager()
+        cur._event_manager = m
+        cur.baseline = DS.capture_baseline(m)
+        cur._apply(1.0)
+        assert m._terms["randomize_rigid_body_mass"].params["mass_distribution_params"] == pytest.approx([0.8, 1.2])
+        assert cur._clamp_report is None
+
+
+class TestClampParamsPhysical:
+    def test_friction_floor_and_report(self):
+        out, report = DS.clamp_params_physical({"static_friction_range": [-0.025, 1.925]})
+        assert out["static_friction_range"] == pytest.approx([0.05, 1.925])
+        assert report["static_friction_range"]["from"] == pytest.approx([-0.025, 1.925])
+
+    def test_dynamic_kept_at_or_below_static(self):
+        out, report = DS.clamp_params_physical(
+            {"static_friction_range": [0.1, 1.0], "dynamic_friction_range": [0.2, 1.4]}
+        )
+        assert out["dynamic_friction_range"] == pytest.approx([0.2, 1.0])
+        assert "dynamic_friction_range" in report
+
+    def test_untouched_params_pass_through(self):
+        out, report = DS.clamp_params_physical(
+            {"velocity_range": {"x": [-0.75, 0.75]}, "mass_distribution_params": [0.7, 1.3]}
+        )
+        assert report == {}
+        assert out["mass_distribution_params"] == pytest.approx([0.7, 1.3])
