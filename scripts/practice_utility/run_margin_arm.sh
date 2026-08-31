@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# The termination-margin arm, queued behind the live campaign.
+# The termination-margin arm, queued behind the live campaign AND the
+# LUCID+PLR study (queue_lucid_plr_signal.py, another session's service).
 # Preregistered: manifests/lucid_margin_signal_preregistration_20260830.json
+# Chained third because the PLR queue's gpu_idle_gate is one-shot: if anything
+# holds the GPU when it fires, that whole study dies unlaunched.
 set -uo pipefail
 LUCID_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${LUCID_ENV_SH:-$LUCID_REPO/../env/lucid_env.sh}"
@@ -9,11 +12,22 @@ export WANDB_MODE=online
 export LUCID_GPU_WAIT_SECONDS=7200
 OUT="$LUCID_ROOT/outputs"; LOG="$OUT/lucid_campaign.log"
 P="$LUCID_ROOT/manifests/replicate_panel_panel_hob002_k512.json"
+QSTATUS="$LUCID_ROOT/manifests/lucid_plr_signal_ne1024_20260830_queue_status.json"
+QPID=1297554
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 receipt_of() { grep -o "receipt [^ ]*json" "$1" | tail -1 | cut -d' ' -f2; }
+plr_terminal() {
+  phase=$(grep -o '"phase"[: ]*"[^"]*"' "$QSTATUS" 2>/dev/null | tail -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  case "$phase" in complete|failed) return 0;; esac
+  kill -0 "$QPID" 2>/dev/null || return 0   # queue process gone without a terminal phase
+  return 1
+}
 
-say "margin arm armed; waiting for the lucid campaign"
+say "margin arm armed (rechained); waiting for the lucid campaign"
 while ! grep -q "lucid campaign done" "$LOG" 2>/dev/null; do sleep 120; done
+say "campaign done; waiting for the PLR study (queue pid $QPID) to reach a terminal state"
+while ! plr_terminal; do sleep 300; done
+say "PLR queue terminal (phase=$(grep -o '"phase"[: ]*"[^"]*"' "$QSTATUS" 2>/dev/null | tail -1)); margin arm starts"
 
 say "margin arm: lucid_margin_s4_rg x 3 seeds x 8000 it"
 python scripts/practice_utility/run_curriculum_comparison.py \
