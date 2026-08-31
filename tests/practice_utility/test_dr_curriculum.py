@@ -5,7 +5,6 @@ import json
 import pytest
 
 from gear_sonic.research.practice_utility import dr_scaling as DS
-from gear_sonic.research.practice_utility.dr_curriculum import LucidCurriculumCallback
 from gear_sonic.research.practice_utility.dr_controller import (
     LucidDRController,
     PIConfig,
@@ -821,6 +820,28 @@ class TestSupportExtension:
         assert "physics_material" in cur._clamp_report["clamped"]
         buckets = m._terms["physics_material"].func.material_buckets
         assert float(buckets[:, 0].min()) >= 0.049
+
+    def test_fixed_150_is_applied_on_the_first_rollout_and_through_warmup(self):
+        env = FakeEnvWithEvents()
+        cur = LucidCurriculumCallback(
+            enabled=True,
+            mode="fixed",
+            fixed_lambda=1.5,
+            allow_extrapolation=True,
+            warmup_iterations=3,
+        )
+        cur.on_train_begin(None, FakeStateWithHistory(0), None, env=env)
+        mass = env.event_manager._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ]
+        assert mass == pytest.approx([0.7, 1.3])
+
+        cur.on_step_end(None, FakeStateWithHistory(1), None, env=env)
+        assert cur.history[-1]["warmup_hold"] is True
+        assert cur.history[-1]["lambda"] == pytest.approx(1.5)
+        assert env.event_manager._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ] == pytest.approx([0.7, 1.3])
 
     def test_apply_at_one_is_unchanged_with_the_flag_off(self):
         cur = LucidCurriculumCallback(enabled=True, mode="fixed", fixed_lambda=1.0)

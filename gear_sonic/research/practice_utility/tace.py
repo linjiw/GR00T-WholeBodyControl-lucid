@@ -38,7 +38,7 @@ for the duration of the call.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import torch
 
@@ -150,6 +150,7 @@ def assign_cohorts(
     reserved_focus_ids: tuple[int, ...] | list[int] = (),
     num_strata: int = 1,
     num_yardstick: int = 0,
+    stratum_sizes: Sequence[int] | None = None,
 ) -> CohortAssignment:
     """Draw a seeded permutation and tag exactly ``round(alpha * N)`` anchors.
 
@@ -160,6 +161,13 @@ def assign_cohorts(
     reason they are placed in the **top** focus stratum: the controller must
     read the frontier it is deciding whether to expand, not the easier company
     training underneath it.
+
+    ``stratum_sizes`` overrides the round-robin near-equal split with explicit
+    final group sizes, low stratum first, top stratum last, reserved envs
+    counted inside the top stratum's size. ``None`` keeps the round-robin split
+    byte-identical to every run that predates the parameter. Explicit sizes are
+    what lets a support arm hold most of the population at the frontier while a
+    thin tail spreads over the easier doses (the expand-don't-replace mixture).
     """
     if num_envs <= 0:
         raise ValueError(f"num_envs must be positive, got {num_envs}")
@@ -182,10 +190,40 @@ def assign_cohorts(
     yardstick = tuple(sorted(candidates[num_anchor : num_anchor + num_yardstick]))
     anchor_set = set(anchors) | set(yardstick)
     focus_pool = [i for i in permutation if i not in anchor_set]
-    if num_strata == 1:
-        strata: tuple[tuple[int, ...], ...] = (tuple(sorted(focus_pool)),)
+    if stratum_sizes is not None:
+        sizes = tuple(int(s) for s in stratum_sizes)
+        num_focus = len(focus_pool)
+        if len(sizes) != num_strata:
+            raise ValueError(
+                f"stratum_sizes has {len(sizes)} entries for num_strata={num_strata}"
+            )
+        if any(s < 1 for s in sizes):
+            raise ValueError(f"every stratum size must be >= 1, got {sizes}")
+        if sum(sizes) != num_focus:
+            raise ValueError(
+                f"stratum_sizes sum to {sum(sizes)} but the focus cohort has "
+                f"{num_focus} environments"
+            )
+        if sizes[-1] < len(reserved):
+            raise ValueError(
+                f"top stratum size {sizes[-1]} cannot hold the "
+                f"{len(reserved)} reserved (observer) environments"
+            )
+        unreserved = [i for i in focus_pool if i not in reserved_set]
+        groups = []
+        cursor = 0
+        # Fill the lower strata from the seeded permutation order; the top
+        # stratum takes the remainder plus the reserved observer envs, so the
+        # controller still reads the frontier it believes it set.
+        for size in sizes[:-1]:
+            groups.append(unreserved[cursor : cursor + size])
+            cursor += size
+        groups.append(unreserved[cursor:] + list(reserved))
+        strata = tuple(tuple(sorted(group)) for group in groups)
+    elif num_strata == 1:
+        strata = (tuple(sorted(focus_pool)),)
     else:
-        groups: list[list[int]] = [[] for _ in range(num_strata)]
+        groups = [[] for _ in range(num_strata)]
         # Round-robin over the seeded permutation: near-equal sizes, no bias
         # toward any environment index, and deterministic given the seed.
         for position, env_id in enumerate(i for i in focus_pool if i not in reserved_set):

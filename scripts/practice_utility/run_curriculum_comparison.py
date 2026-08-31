@@ -127,7 +127,46 @@ MARGIN_OBSERVER = "gear_sonic.research.practice_utility.margin_observer.MarginOb
 LATONLY_ARMS = ("lucid_latonly_s4_rg", "ta_lucid_50_latonly_s4_rg")
 ARM_SPREAD_STRATA.update({arm: 4 for arm in LATONLY_ARMS})
 ARM_RETURN_GUARD.update({arm: "relative" for arm in LATONLY_ARMS})
+#: Expand-don't-replace support arms: open-loop fixed-mode per-env lambda
+#: mixtures. The top stratum pins ``ARM_TOP_FRACTION`` of the focus cohort at
+#: ``fixed_lambda`` -- the frontier, where the capability ladder says all the
+#: resolution lives -- while the remaining envs spread over the lower doses
+#: ``fixed_lambda * (k+1)/K`` as the retention tail. ``fixed_u`` keeps the
+#: frontier at the lambda = 1 envelope (the pure mixture control);
+#: ``fixed_u150`` puts it at 1.5x with training-side physical clamps, fusing
+#: the fixed_150 support lever with the mixture. The controller is inert
+#: (fixed mode), so no signal can evacuate the frontier.
+EXPAND_ARMS = ("fixed_u", "fixed_u150")
+ARMS.update({arm: ("fixed", 0.0, None) for arm in EXPAND_ARMS})
+ARM_SPREAD_STRATA.update({arm: 8 for arm in EXPAND_ARMS})
+ARM_FIXED_LAMBDA.update({"fixed_u150": 1.5})
+ARM_TOP_FRACTION: dict[str, float] = {arm: 0.75 for arm in EXPAND_ARMS}
+#: Stage-A anti-collapse arm: the same unstratified latent-gap curriculum and
+#: relative return guard as ``lucid_rg``, but PI-law decreases are projected
+#: away. The return guard remains the only path that can lower lambda.
+RATCHET_ARMS = ("lucid_ratchet_rg",)
+ARMS.update({arm: ("lucid", 0.0, None) for arm in RATCHET_ARMS})
+ARM_RETURN_GUARD.update({arm: "relative" for arm in RATCHET_ARMS})
 MODES = tuple(ARMS)
+
+
+def expand_stratum_sizes(num_focus: int, num_strata: int, top_fraction: float) -> list[int]:
+    """Final stratum sizes for an expand arm: thin near-equal tail, fat top."""
+    if not 0.0 < top_fraction < 1.0:
+        raise ValueError(f"top_fraction must be in (0, 1), got {top_fraction}")
+    if num_strata < 2:
+        raise ValueError(f"expand arms need >= 2 strata, got {num_strata}")
+    top = int(round(top_fraction * num_focus))
+    tail = num_focus - top
+    lower = num_strata - 1
+    if tail < lower:
+        raise ValueError(
+            f"{num_focus} focus envs leave a {tail}-env tail, too thin for "
+            f"{lower} lower strata"
+        )
+    base, extra = divmod(tail, lower)
+    sizes = [base + (1 if index < extra else 0) for index in range(lower)]
+    return sizes + [top]
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
     "latent_p90",
@@ -202,7 +241,8 @@ def parse_args(argv=None):
         "--consolidation-fraction",
         type=float,
         default=0.0,
-        help="TACE arms only: final fraction of the budget with every env on the full envelope",
+        help="curriculum arms (never 'off'): final fraction of the budget with "
+        "every env on the full envelope",
     )
     parser.add_argument("--max-delay", type=int, default=8)
     parser.add_argument("--delta-target", type=float, default=0.778)
@@ -331,9 +371,20 @@ def build_command(
         [
             f"++callbacks.lucid_curriculum.anchor_ratio={anchor_ratio}",
             f"++callbacks.lucid_curriculum.anchor_seed={seed}",
-            f"++callbacks.lucid_curriculum.consolidation_fraction={args.consolidation_fraction}",
         ]
         if anchor_ratio > 0.0
+        else []
+    )
+    # Consolidation is forwarded for every curriculum arm, not only anchored
+    # ones -- the anchor-gated list silently dropped it for exactly the
+    # anchor_ratio = 0 arms whose collapsed final checkpoints motivated it.
+    # 'off' is the no-DR control and must never receive a full-envelope phase.
+    # A zero fraction emits nothing, so every existing arm's command line is
+    # byte-identical to the receipts it trained under.
+    consolidation_fraction = float(getattr(args, "consolidation_fraction", 0.0) or 0.0)
+    consolidation = (
+        [f"++callbacks.lucid_curriculum.consolidation_fraction={consolidation_fraction}"]
+        if consolidation_fraction > 0.0 and curriculum_mode != "off"
         else []
     )
     yoked = (
@@ -391,6 +442,12 @@ def build_command(
         # Strata need the cohort machinery, which the callback only installs
         # when it has a seed to draw the partition from.
         spread.append(f"++callbacks.lucid_curriculum.anchor_seed={seed}")
+    if mode in ARM_TOP_FRACTION:
+        sizes = expand_stratum_sizes(args.num_envs, strata, ARM_TOP_FRACTION[mode])
+        spread.append(
+            "++callbacks.lucid_curriculum.stratum_sizes="
+            "[" + ",".join(str(size) for size in sizes) + "]"
+        )
     relative_guard = (
         [
             f"++callbacks.lucid_curriculum.return_guard={guard}",
@@ -398,6 +455,11 @@ def build_command(
             f"++callbacks.lucid_curriculum.return_window={args.return_window}",
         ]
         if guard != "absolute"
+        else []
+    )
+    ratchet = (
+        ["++callbacks.lucid_curriculum.monotonic=true"]
+        if mode in RATCHET_ARMS
         else []
     )
     origin = [] if getattr(args, "from_scratch", False) else [f"checkpoint={args.checkpoint}"]
@@ -447,12 +509,14 @@ def build_command(
         "++callbacks.lucid_curriculum.enabled=true",
         f"++callbacks.lucid_curriculum.mode={curriculum_mode}",
         *tace,
+        *consolidation,
         *yoked,
         *overrides,
         *caps,
         *margin,
         *spread,
         *relative_guard,
+        *ratchet,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
@@ -663,6 +727,15 @@ def main(argv=None) -> int:
                     row.get("mean_return") is not None for row in curriculum
                 ),
                 "return_guard_trips": sum(bool(row.get("guard_tripped")) for row in curriculum),
+                **(
+                    {
+                        "ratchet_bind_rows": sum(
+                            bool(row.get("latch_active")) for row in curriculum
+                        )
+                    }
+                    if mode in RATCHET_ARMS
+                    else {}
+                ),
                 "scalable_terms": curriculum[-1].get("scalable_terms", []) if curriculum else [],
                 "arm_spec": {
                     "curriculum_mode": ARMS[mode][0],
@@ -673,6 +746,7 @@ def main(argv=None) -> int:
                     "run_dir": _logging_directory(log_path),
                     "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
+                    **({"monotonic": True} if mode in RATCHET_ARMS else {}),
                     "fixed_lambda": ARM_FIXED_LAMBDA.get(mode, 1.0),
                     "allow_extrapolation": mode in ARM_FIXED_LAMBDA,
                     "physical_clamp": (
@@ -718,8 +792,8 @@ def main(argv=None) -> int:
         and set(arm["scalable_terms"]) == expected_terms
         for branch_id, arm in arms.items()
     )
-    if "lucid" in modes:
-        lucid_arms = [arm for arm in arms.values() if arm["mode"] == "lucid"]
+    lucid_arms = [arm for arm in arms.values() if ARMS[arm["mode"]][0] == "lucid"]
+    if lucid_arms:
         mechanics_ok = mechanics_ok and all(arm["mean_return_observed"] for arm in lucid_arms)
     for arm in arms.values():
         ratio = ARMS[arm["mode"]][1]

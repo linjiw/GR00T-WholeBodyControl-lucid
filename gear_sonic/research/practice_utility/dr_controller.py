@@ -79,6 +79,22 @@ class PIConfig:
     return_guard: str = "absolute"
     return_relative_drop: float = 0.25
     return_window: int = 8
+    #: Upward-only lambda moves: the PI law may raise difficulty but never
+    #: lower it; the return guard stays the sole downward path. Deletes the
+    #: observed anti-gate collapse mode by construction. Default off so every
+    #: existing receipt's controller reproduces exactly.
+    monotonic: bool = False
+    #: Signal-agnostic anti-gate protection: while the trailing window of mean
+    #: returns sits at >= ``latch_threshold`` x the run's best trailing-window
+    #: mean and is non-decreasing, lambda decreases from the PI law are
+    #: refused (guard
+    #: trips still lower lambda). The two observed collapses -- lambda cut at
+    #: peak competence with zero guard trips -- are exactly the state this
+    #: latch binds in. Default off; H_M2 must stay falsifiable for arms whose
+    #: preregistration reports anti-gating as an outcome.
+    competence_latch: bool = False
+    latch_threshold: float = 0.95
+    latch_window: int = 500
 
     def __post_init__(self) -> None:
         if not 0.0 < self.quantile < 1.0:
@@ -103,6 +119,12 @@ class PIConfig:
             )
         if self.return_window < 2:
             raise ValueError(f"return_window must be >= 2, got {self.return_window}")
+        if not 0.0 < self.latch_threshold <= 1.0:
+            raise ValueError(
+                f"latch_threshold must be in (0, 1], got {self.latch_threshold}"
+            )
+        if self.latch_window < 10:
+            raise ValueError(f"latch_window must be >= 10, got {self.latch_window}")
 
 
 @dataclass
@@ -121,6 +143,10 @@ class ControllerStep:
     low_return_streak: int = 0
     num_gap_samples: int = 0
     return_reference: float | None = None
+    #: True on epochs where the competence latch (or monotonic mode) refused a
+    #: lambda decrease the PI law asked for -- the audit trail that keeps a
+    #: bound latch visible as evidence of signal invalidity.
+    latch_active: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,6 +168,54 @@ class LucidDRController:
         self.low_return_streak = 0
         self.return_window: deque[float] = deque(maxlen=max(2, self.config.return_window))
         self.history: list[ControllerStep] = []
+        # Competence-latch state: the best *window mean* seen so far and the
+        # current trailing window. Comparing a window mean with the best
+        # single noisy iteration makes the 0.95 threshold effectively
+        # unreachable on the observed runs, so both sides of the comparison
+        # deliberately have the same aggregation.
+        self.latch_best_mean: float | None = None
+        self.latch_returns: deque[float] = deque(maxlen=max(10, self.config.latch_window))
+
+    def _observe_return(self, mean_return: float | None) -> None:
+        if mean_return is None:
+            return
+        self.latch_returns.append(float(mean_return))
+        if len(self.latch_returns) < self.config.latch_window:
+            return
+        window_mean = sum(self.latch_returns) / len(self.latch_returns)
+        if self.latch_best_mean is None or window_mean > self.latch_best_mean:
+            self.latch_best_mean = window_mean
+
+    def _latch_binds(self) -> bool:
+        """Is the policy demonstrably thriving right now?
+
+        A *full* trailing-window mean at >= ``latch_threshold`` x the best
+        trailing-window mean so far, and the window's second half no worse
+        than its first: the exact regime both observed anti-gate collapses ran
+        their lambda cuts in.
+        """
+        window = list(self.latch_returns)
+        if len(window) < self.config.latch_window:
+            return False
+        if self.latch_best_mean is None or self.latch_best_mean <= 0.0:
+            return False
+        mean = sum(window) / len(window)
+        if mean < self.config.latch_threshold * self.latch_best_mean:
+            return False
+        half = len(window) // 2
+        first = sum(window[:half]) / half
+        second = sum(window[half:]) / (len(window) - half)
+        return second >= first
+
+    def _apply_floor(self, lambda_before: float, lambda_after: float) -> tuple[float, bool]:
+        """Refuse PI-law decreases in monotonic mode or while the latch binds."""
+        if lambda_after >= lambda_before:
+            return lambda_after, False
+        if self.config.monotonic:
+            return lambda_before, True
+        if self.config.competence_latch and self._latch_binds():
+            return lambda_before, True
+        return lambda_after, False
 
     def update(
         self,
@@ -163,6 +237,7 @@ class LucidDRController:
         self.epoch += 1
         config = self.config
         before = self.lambda_value
+        self._observe_return(mean_return)
 
         if gap_quantile is None:
             gap_quantile = _quantile(gaps or [], config.quantile)
@@ -201,12 +276,13 @@ class LucidDRController:
         self.lambda_value = _clip(
             self.lambda_value + config.alpha * control, config.lambda_min, config.lambda_max
         )
+        self.lambda_value, latched = self._apply_floor(before, self.lambda_value)
 
         step = ControllerStep(
             epoch=self.epoch, gap_quantile=gap_quantile, error=error, integral=self.integral,
             control=control, lambda_before=before, lambda_after=self.lambda_value,
             mean_return=mean_return, low_return_streak=self.low_return_streak,
-            num_gap_samples=num_samples, return_reference=reference,
+            num_gap_samples=num_samples, return_reference=reference, latch_active=latched,
         )
         self.history.append(step)
         return step
@@ -221,6 +297,7 @@ class LucidDRController:
         self.epoch += 1
         config = self.config
         before = self.lambda_value
+        self._observe_return(mean_return)
         reference = self.return_reference
         if self._guard(mean_return):
             self.integral = 0.0
@@ -239,11 +316,12 @@ class LucidDRController:
         self.lambda_value = _clip(
             self.lambda_value + config.alpha * control, config.lambda_min, config.lambda_max
         )
+        self.lambda_value, latched = self._apply_floor(before, self.lambda_value)
         step = ControllerStep(
             epoch=self.epoch, gap_quantile=float("nan"), error=error, integral=self.integral,
             control=control, lambda_before=before, lambda_after=self.lambda_value,
             mean_return=mean_return, low_return_streak=self.low_return_streak,
-            num_gap_samples=0, return_reference=reference,
+            num_gap_samples=0, return_reference=reference, latch_active=latched,
         )
         self.history.append(step)
         return step
@@ -305,6 +383,8 @@ class LucidDRController:
             "epoch": self.epoch,
             "low_return_streak": self.low_return_streak,
             "return_window": list(self.return_window),
+            "latch_best_mean": self.latch_best_mean,
+            "latch_returns": list(self.latch_returns),
             "config": asdict(self.config),
         }
 
@@ -315,6 +395,15 @@ class LucidDRController:
         self.low_return_streak = int(state.get("low_return_streak", 0))
         self.return_window.clear()
         self.return_window.extend(float(v) for v in state.get("return_window", ()))
+        self.latch_returns.clear()
+        self.latch_returns.extend(float(v) for v in state.get("latch_returns", ()))
+        best_mean = state.get("latch_best_mean")
+        self.latch_best_mean = float(best_mean) if best_mean is not None else None
+        # Compatibility with any state written by the short-lived development
+        # implementation: recompute a like-for-like window statistic instead
+        # of restoring its incomparable best single-iteration return.
+        if self.latch_best_mean is None and len(self.latch_returns) >= self.config.latch_window:
+            self.latch_best_mean = sum(self.latch_returns) / len(self.latch_returns)
 
 
 def calibrate_target(

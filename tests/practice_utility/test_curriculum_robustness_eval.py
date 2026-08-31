@@ -13,6 +13,10 @@ def args():
     )
 
 
+def test_ratchet_arm_is_selectable_for_the_matched_ladder():
+    assert "lucid_ratchet_rg" in R.MODES
+
+
 def test_command_is_frozen_matched_evaluation():
     command = R.build_command(
         args(),

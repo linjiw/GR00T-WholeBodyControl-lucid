@@ -91,6 +91,11 @@ class LucidCurriculumCallback(TrainerCallback):
         term_lambda_overrides: dict[str, float] | None = None,
         term_lambda_caps: dict[str, float] | None = None,
         spread_strata: int = 1,
+        stratum_sizes: tuple[int, ...] | list[int] | None = None,
+        monotonic: bool = False,
+        competence_latch: bool = False,
+        latch_threshold: float = 0.95,
+        latch_window: int = 500,
         signal: str = "gap",
         yardstick_envs: int = 0,
         margin_branch_id: str | None = None,
@@ -110,6 +115,11 @@ class LucidCurriculumCallback(TrainerCallback):
             raise ValueError("mode='yoked' requires yoked_schedule_path")
         if int(spread_strata) < 1:
             raise ValueError(f"spread_strata must be >= 1, got {spread_strata}")
+        if stratum_sizes is not None and len(tuple(stratum_sizes)) != int(spread_strata):
+            raise ValueError(
+                f"stratum_sizes has {len(tuple(stratum_sizes))} entries "
+                f"for spread_strata={spread_strata}"
+            )
         if signal not in ("gap", "margin"):
             raise ValueError(f"signal must be 'gap' or 'margin', got {signal!r}")
         if signal == "margin" and int(yardstick_envs) < 1:
@@ -136,6 +146,12 @@ class LucidCurriculumCallback(TrainerCallback):
         # lost 23-27 points of clean success, and the arm with the widest
         # realized intensity mixture (50% anchor) lost the least.
         self.spread_strata = int(spread_strata)
+        # Explicit final stratum sizes (low first, top last, observer envs
+        # counted in the top). None keeps the round-robin equal split that
+        # every pre-existing arm trained with.
+        self.stratum_sizes = (
+            tuple(int(s) for s in stratum_sizes) if stratum_sizes is not None else None
+        )
         self.anchor_seed = anchor_seed
         self.anchor_reserved_focus_envs = tuple(int(i) for i in anchor_reserved_focus_envs)
         self.consolidation_fraction = float(consolidation_fraction)
@@ -234,6 +250,10 @@ class LucidCurriculumCallback(TrainerCallback):
                 return_guard=return_guard,
                 return_relative_drop=return_relative_drop,
                 return_window=return_window,
+                monotonic=bool(monotonic),
+                competence_latch=bool(competence_latch),
+                latch_threshold=float(latch_threshold),
+                latch_window=int(latch_window),
             ),
             initial_lambda=starting_lambda,
         )
@@ -242,6 +262,13 @@ class LucidCurriculumCallback(TrainerCallback):
         self.history: list[dict[str, Any]] = []
         self._event_manager: Any = None
         self._env: Any = None
+        # The controller deliberately remains capped at one even for a
+        # fixed-mode support extension. Keep the dose actually sent to the
+        # event manager separately so startup, warmup, and telemetry cannot
+        # accidentally report/apply the controller's capped placeholder.
+        self._last_applied_lambda = float(
+            self.fixed_lambda if self.mode == "fixed" else self.controller.lambda_value
+        )
 
     # ------------------------------------------------------------ lifecycle --
 
@@ -260,7 +287,7 @@ class LucidCurriculumCallback(TrainerCallback):
         # Apply the starting intensity before the first rollout, so iteration 1
         # already trains under the curriculum rather than under whatever the
         # config happened to declare.
-        self._apply(self.controller.lambda_value)
+        self._apply(self._mode_lambda())
         return control
 
     def on_step_end(self, args, state, control, **kwargs):  # noqa: ARG002
@@ -273,11 +300,12 @@ class LucidCurriculumCallback(TrainerCallback):
             self._start_step = step
         if step - self._start_step < self.warmup_iterations:
             # Hold, but keep applying, so the restored intensity is in force.
-            self._apply(self.controller.lambda_value)
+            warmup_lambda = self._mode_lambda()
+            self._apply(warmup_lambda)
             record = {
                 "global_step": step,
                 "mode": self.mode,
-                "lambda": self.controller.lambda_value,
+                "lambda": warmup_lambda,
                 "gap_quantile": None,
                 "warmup_hold": True,
                 "scalable_terms": self.scalable,
@@ -370,7 +398,7 @@ class LucidCurriculumCallback(TrainerCallback):
         if self.term_lambda_caps:
             record["term_lambda_caps"] = self.term_lambda_caps
             record["realized_channel_lambdas"] = {
-                name: self._channel_lambda(name, self.controller.lambda_value)
+                name: self._channel_lambda(name, self._last_applied_lambda)
                 for name in sorted(self.term_lambda_caps)
             }
         if self._resumed_from is not None:
@@ -385,6 +413,14 @@ class LucidCurriculumCallback(TrainerCallback):
         return control
 
     # ------------------------------------------------------------- internals --
+
+    def _mode_lambda(self) -> float:
+        """Intensity in force before a feedback update for the current mode."""
+        if self.mode == "fixed":
+            return self.fixed_lambda
+        if self.mode == "off":
+            return 0.0
+        return self.controller.lambda_value
 
     def _bind(self, env: Any) -> None:
         manager = _event_manager_of(env)
@@ -408,6 +444,7 @@ class LucidCurriculumCallback(TrainerCallback):
             self.assignment = TACE.assign_cohorts(
                 num_envs, self.anchor_ratio, seed, reserved,
                 num_strata=self.spread_strata, num_yardstick=self.yardstick_envs,
+                stratum_sizes=self.stratum_sizes,
             )
             anchor_params, anchor_buckets = self._anchor_target(manager)
             self.dispatchers = TACE.install(
@@ -498,6 +535,7 @@ class LucidCurriculumCallback(TrainerCallback):
         return lambda_value if cap is None else min(lambda_value, cap)
 
     def _apply(self, lambda_value: float) -> None:
+        self._last_applied_lambda = float(lambda_value)
         if self._event_manager is None or self.baseline is None:
             return
         per_term = tuple(self.term_lambda_overrides) + tuple(self.term_lambda_caps)
@@ -622,7 +660,7 @@ class LucidCurriculumCallback(TrainerCallback):
             "num_strata": self.assignment.num_strata,
             "stratum_sizes": [len(ids) for ids in self.assignment.focus_strata],
             "stratum_lambdas": [
-                self.controller.lambda_value * w
+                self._last_applied_lambda * w
                 for w in TACE.stratum_weights(self.assignment.num_strata)
             ],
             "consolidating": self._consolidating,
