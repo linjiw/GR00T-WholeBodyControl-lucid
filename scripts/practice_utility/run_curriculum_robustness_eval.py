@@ -64,6 +64,12 @@ PRESET_FIXED_LATENCY_STEPS = {
     "lat_40ms": 8,
     "lat_50ms": 10,
     "lat_60ms": 12,
+    # Held-out rungs past the 60 ms ceiling of the training envelope. Each one
+    # needs a delay buffer at least this deep (``--max-delay``); the default 12
+    # would silently clamp all three onto the 60 ms rung.
+    "lat_80ms": 16,
+    "lat_100ms": 20,
+    "lat_120ms": 24,
 }
 #: Physics-only ladder: the five non-latency channels scaled, actuation latency
 #: pinned to ZERO. The `dr_*` cells all carry the full 0-40 ms latency envelope
@@ -127,6 +133,44 @@ def requested_preset_metadata(presets: list[str]) -> dict[str, dict[str, Any]]:
             row["fixed_latency_steps"] = PRESET_FIXED_LATENCY_STEPS[preset]
         metadata[preset] = row
     return metadata
+
+
+#: Steps pinned by the stock ``latency_60ms`` event preset (see its YAML).
+LATENCY_60MS_STEPS = 12
+
+
+def requested_latency_steps(preset: str) -> int | None:
+    """Physics steps a latency cell pins its live lag to; None for non-latency cells."""
+    if preset in PRESET_FIXED_LATENCY_STEPS:
+        return PRESET_FIXED_LATENCY_STEPS[preset]
+    if preset == "latency_60ms":
+        return LATENCY_60MS_STEPS
+    return None
+
+
+def assert_latency_within_capacity(presets: list[str], max_delay: int) -> None:
+    """Refuse any latency cell whose requested lag exceeds the delay-buffer capacity.
+
+    ``--max-delay`` sizes the actuator delay buffers, and ``events_reset_safe``
+    clamps every requested lag to that capacity with ``min(high, capacity)``
+    without raising. A ``lat_120ms`` cell (24 steps) run at the default
+    capacity of 12 would therefore be measured as a 60 ms cell, and
+    ``lat_80ms``/``lat_100ms``/``lat_120ms`` would collapse onto one
+    measurement with no error. Fail closed before anything is launched.
+    """
+    truncated = [
+        (preset, steps)
+        for preset in presets
+        if (steps := requested_latency_steps(preset)) is not None and steps > max_delay
+    ]
+    if truncated:
+        cells = ", ".join(f"{preset} ({steps} steps)" for preset, steps in truncated)
+        needed = max(steps for _, steps in truncated)
+        raise ValueError(
+            f"latency cell(s) exceed the delay-buffer capacity and would be silently "
+            f"truncated to {max_delay} steps ({max_delay * 5} ms): {cells}; "
+            f"--max-delay is {max_delay}. Raise --max-delay to at least {needed}."
+        )
 
 
 CALLBACK = "gear_sonic.research.practice_utility.eval_callback.PracticeRobustnessEvalCallback"
@@ -363,6 +407,7 @@ def build_command(
     output_dir: Path,
     motion_file: str,
 ) -> list[str]:
+    assert_latency_within_capacity([preset], args.max_delay)
     return [
         sys.executable,
         str(REPO / "scripts" / "practice_utility" / "eval_with_delay.py"),
@@ -525,6 +570,8 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    presets = list(dict.fromkeys(args.presets))
+    assert_latency_within_capacity(presets, args.max_delay)
     training_receipt = load_json(args.training_receipt)
     suite = (
         panel_suite(args.panel_receipt)
@@ -536,7 +583,6 @@ def main(argv=None) -> int:
     checkpoints = checkpoint_index(training_receipt)
     receipt_modes = list(dict.fromkeys(arm["mode"] for arm in training_receipt["arms"].values()))
     modes = list(dict.fromkeys(args.modes)) if args.modes else receipt_modes
-    presets = list(dict.fromkeys(args.presets))
     specs = []
     for seed_index, checkpoint_seed in enumerate(args.seeds):
         eval_seed = args.eval_seed_base + seed_index

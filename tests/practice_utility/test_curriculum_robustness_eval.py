@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.practice_utility import run_curriculum_robustness_eval as R
 
 
@@ -109,3 +111,99 @@ def test_delay_contract_distinguishes_presets():
             }
         },
     )
+
+
+def test_heldout_latency_presets_have_exact_step_values():
+    assert R.PRESET_FIXED_LATENCY_STEPS["lat_80ms"] == 16
+    assert R.PRESET_FIXED_LATENCY_STEPS["lat_100ms"] == 20
+    assert R.PRESET_FIXED_LATENCY_STEPS["lat_120ms"] == 24
+    for name in ("lat_80ms", "lat_100ms", "lat_120ms"):
+        assert R.PRESETS[name] == "tracking/lucid_eval_clean"
+        assert R.requested_preset_metadata([name])[name]["fixed_latency_steps"] == (
+            R.PRESET_FIXED_LATENCY_STEPS[name]
+        )
+
+
+def test_existing_latency_ladder_values_are_unchanged():
+    assert {k: v for k, v in R.PRESET_FIXED_LATENCY_STEPS.items() if v <= 12} == {
+        "lat_10ms": 2,
+        "lat_20ms": 4,
+        "lat_30ms": 6,
+        "lat_40ms": 8,
+        "lat_50ms": 10,
+        "lat_60ms": 12,
+    }
+    assert R.PRESET_PHYSICS_ONLY == {
+        "phys_000": 0.0,
+        "phys_025": 0.25,
+        "phys_050": 0.5,
+        "phys_075": 0.75,
+        "phys_100": 1.0,
+        "phys_125": 1.25,
+        "phys_150": 1.5,
+        "phys_175": 1.75,
+        "phys_200": 2.0,
+    }
+
+
+def test_truncated_latency_cell_is_refused_at_default_capacity():
+    with pytest.raises(ValueError) as excinfo:
+        R.assert_latency_within_capacity(["lat_120ms"], 12)
+    message = str(excinfo.value)
+    assert "lat_120ms" in message
+    assert "24 steps" in message
+    assert "--max-delay is 12" in message
+    assert "Raise --max-delay" in message
+
+
+def test_every_truncated_cell_is_named_not_just_the_first():
+    with pytest.raises(ValueError) as excinfo:
+        R.assert_latency_within_capacity(["lat_60ms", "lat_80ms", "lat_100ms", "lat_120ms"], 12)
+    message = str(excinfo.value)
+    assert "lat_60ms" not in message
+    for name in ("lat_80ms (16 steps)", "lat_100ms (20 steps)", "lat_120ms (24 steps)"):
+        assert name in message
+    assert "at least 24" in message
+
+
+def test_latency_cell_within_capacity_is_accepted():
+    R.assert_latency_within_capacity(["lat_120ms"], 24)
+    R.assert_latency_within_capacity(["lat_80ms", "lat_100ms", "lat_120ms"], 24)
+    R.assert_latency_within_capacity(["lat_60ms", "latency_60ms"], 12)
+
+
+def test_physics_only_presets_ignore_latency_capacity():
+    # Latency is pinned to zero in these cells, so no buffer depth can truncate them.
+    R.assert_latency_within_capacity(list(R.PRESET_PHYSICS_ONLY), 0)
+    R.assert_latency_within_capacity(["id_clean", "dr_full", "dr_125", "phys_125"], 12)
+    command = R.build_command(
+        args(), Path("/tmp/model.pt"), "lucid", "phys_125", 8700, "branch", Path("/tmp/out"), "/m"
+    )
+    assert "++callbacks.practice_eval.fixed_latency_steps=0" in command
+    assert "++callbacks.practice_eval.non_latency_dr_scale=1.25" in command
+    assert command[2:4] == ["--max-delay", "12"]
+
+
+def test_build_command_refuses_a_truncating_latency_cell():
+    with pytest.raises(ValueError, match="lat_120ms"):
+        R.build_command(
+            args(), Path("/tmp/model.pt"), "lucid", "lat_120ms", 8700, "b", Path("/tmp/out"), "/m"
+        )
+    wide = SimpleNamespace(max_delay=24, num_envs=128, smpl_motion_file="smpl")
+    command = R.build_command(
+        wide, Path("/tmp/model.pt"), "lucid", "lat_120ms", 8700, "b", Path("/tmp/out"), "/m"
+    )
+    assert "++callbacks.practice_eval.fixed_latency_steps=24" in command
+    assert command[2:4] == ["--max-delay", "24"]
+
+
+def test_main_fails_closed_before_touching_any_input(tmp_path):
+    missing = tmp_path / "no_such_receipt.json"
+    with pytest.raises(ValueError, match="lat_120ms"):
+        R.main(["--presets", "lat_120ms", "--training-receipt", str(missing)])
+    # The same launch with enough capacity gets past the guard and proceeds as before.
+    with pytest.raises(FileNotFoundError):
+        R.main(["--presets", "lat_120ms", "--max-delay", "24", "--training-receipt", str(missing)])
+    # A physics-only run at the default capacity is not gated at all.
+    with pytest.raises(FileNotFoundError):
+        R.main(["--presets", "phys_125", "--training-receipt", str(missing)])
