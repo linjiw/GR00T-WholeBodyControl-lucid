@@ -93,6 +93,7 @@ EXPECTED_NON_LATENCY_TERMS = EXPECTED_SCALABLE_TERMS - {"randomize_action_delay"
 EVALUATOR_RELATIVE_PATH = "scripts/practice_utility/run_curriculum_robustness_eval.py"
 ANALYZER_RELATIVE_PATH = "scripts/practice_utility/analyze_support_screen.py"
 TRAINER_RELATIVE_PATH = "scripts/practice_utility/run_curriculum_comparison.py"
+EXPECTED_ENVIRONMENT_BOOTSTRAP = Path("/home/linjiw/lucid/env/lucid_env.sh")
 REQUIRED_FROZEN_INPUTS = {
     "panel_receipt",
     "h_r2_analysis",
@@ -102,6 +103,7 @@ REQUIRED_FROZEN_INPUTS = {
     "historical_fixed_freeze_manifest",
     "historical_fixed_checkpoint",
     "historical_fixed_config",
+    "environment_bootstrap",
 }
 
 # Frozen screening thresholds. Rates and AUCs are fractions, not percentage points.
@@ -310,6 +312,11 @@ def audit_preregistration(path: Path, expected_sha: str) -> dict[str, Any]:
         expected = _require_sha(entry.get("sha256"), f"preregistration.frozen_inputs.{key}")
         _require_file_hash(materialized, expected, f"preregistration.frozen_inputs.{key}")
         inputs[key] = {"path": str(materialized), "sha256": expected}
+    _require_exact(
+        Path(inputs["environment_bootstrap"]["path"]),
+        EXPECTED_ENVIRONMENT_BOOTSTRAP.resolve(),
+        "preregistration.frozen_inputs.environment_bootstrap.path",
+    )
 
     design = prereg.get("design") or {}
     training = design.get("training") or {}

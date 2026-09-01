@@ -585,6 +585,7 @@ def write_prereg(tmp_path, panel, h_r2, historical_training, historical_freeze, 
         "historical_fixed_freeze_manifest": historical_freeze,
         "historical_fixed_checkpoint": checkpoint,
         "historical_fixed_config": config,
+        "environment_bootstrap": A.EXPECTED_ENVIRONMENT_BOOTSTRAP,
     }
     prereg = {
         "kind": "lucid_tier2_support_screen_preregistration",
@@ -803,6 +804,33 @@ def test_verified_must_be_a_nonempty_list(tmp_path):
     kwargs, evidence = build_evidence(tmp_path)
     mutate_json(evidence["evaluations"]["fixed_150"], lambda value: value.update(verified=True))
     with pytest.raises(ValueError, match="nonempty list"):
+        A.analyze(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("attack", "message"),
+    [
+        ("missing", "missing one or more required frozen inputs"),
+        ("path", "environment_bootstrap.path"),
+        ("hash", "environment_bootstrap.sha256"),
+    ],
+)
+def test_environment_bootstrap_is_path_and_hash_bound(tmp_path, attack, message):
+    kwargs, evidence = build_evidence(tmp_path)
+    prereg = json.loads(evidence["prereg"].read_text())
+    entry = prereg["frozen_inputs"]["environment_bootstrap"]
+    if attack == "missing":
+        del prereg["frozen_inputs"]["environment_bootstrap"]
+    elif attack == "path":
+        foreign = tmp_path / "foreign_lucid_env.sh"
+        foreign.write_bytes(A.EXPECTED_ENVIRONMENT_BOOTSTRAP.read_bytes())
+        entry.update(path=str(foreign.resolve()), sha256=A.sha256(foreign))
+    else:
+        entry["sha256"] = "0" * 64
+    write_json(evidence["prereg"], prereg)
+    kwargs["expected_preregistration_sha"] = A.sha256(evidence["prereg"])
+
+    with pytest.raises(ValueError, match=message):
         A.analyze(**kwargs)
 
 
