@@ -63,7 +63,10 @@ EXPECTED_PHYSICS_STEP_MS = 5
 EXPECTED_PANEL_SHA256 = "e2e61933405e6701b0563eb4df793b6faf5c90d8ae5b7d8fc1e11f47142aefd7"
 EXPECTED_PANEL_ALIAS_SHA256 = "4b0fae026d8763e5cb1a39957ab8131e5372e1d47d4ec7e526791b76fe7f1430"
 EXPECTED_EVALUATOR_SHA256 = "308e24150e4d4f03d0abf0dc6a427063ac662904bb3a7765488a9bff63cd94ca"
-SCREENING_EVAL_SEED = {"8601": 8701}
+# The evaluator derives seeds by position, so split one-seed invocations must
+# pass the corresponding base explicitly.  Freeze the mapping here rather than
+# merely checking that ratchet and fixed happened to use the same seed.
+EXPECTED_EVALUATION_SEED = {"8600": 8700, "8601": 8701, "8602": 8702}
 
 # Frozen program conventions.  Rates, AUCs, and margins are all fractions.
 FRONTIER_MARGIN = 0.02
@@ -115,6 +118,8 @@ def _put_unique(
     numeric = float(value)
     if not math.isfinite(numeric):
         raise ValueError(f"non-finite robustness value for {key} in {source}: {value}")
+    if not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"robustness rate outside [0, 1] for {key} in {source}: {value}")
     previous = target.get(key)
     if previous is not None and not math.isclose(
         previous, numeric, rel_tol=0.0, abs_tol=FLOAT_TOLERANCE
@@ -130,33 +135,18 @@ def collect_robustness(
 ) -> dict[tuple[str, str, str, str], float]:
     """Collect ``(mode, metric, preset, training_seed) -> rate`` values.
 
-    Current evaluator receipts carry a ``mode_summary``.  The ``runs`` fallback
-    keeps the analyzer useful for a receipt interrupted after individual runs
-    were written but before its summary was assembled.  Duplicate identical
-    cells are harmless; conflicting duplicates are rejected rather than made
-    order-dependent.
+    Decision values come from individually audited run summaries.  A legacy
+    aggregate-only fallback remains for non-claim diagnostic receipts, but the
+    strict instrument audit requires complete runs and reconciles the aggregate
+    keyspace exactly.  Duplicate identical cells are harmless; conflicting
+    duplicates are rejected rather than made order-dependent.
     """
 
     values: dict[tuple[str, str, str, str], float] = {}
     for path in receipt_paths:
         receipt = load_json(path)
-        summary = receipt.get("mode_summary") or {}
-        for preset, modes in summary.items():
-            for mode, block in modes.items():
-                for metric in METRICS:
-                    per_seed = (block.get("metrics") or {}).get(metric, {}).get(
-                        "per_checkpoint_seed"
-                    ) or {}
-                    for seed, value in per_seed.items():
-                        _put_unique(
-                            values, (str(mode), metric, str(preset), str(seed)), value, path
-                        )
-
-        # Do not double-read a normal receipt.  ``runs`` is only a fallback
-        # when no aggregate summary survived.
-        if summary:
-            continue
-        for run in (receipt.get("runs") or {}).values():
+        runs = receipt.get("runs") or {}
+        for run in runs.values():
             if not run.get("complete", True):
                 continue
             mode = run.get("mode")
@@ -172,6 +162,19 @@ def collect_robustness(
                     run_summary.get(metric),
                     path,
                 )
+        if runs:
+            continue
+        summary = receipt.get("mode_summary") or {}
+        for preset, modes in summary.items():
+            for mode, block in modes.items():
+                for metric in METRICS:
+                    per_seed = (block.get("metrics") or {}).get(metric, {}).get(
+                        "per_checkpoint_seed"
+                    ) or {}
+                    for seed, value in per_seed.items():
+                        _put_unique(
+                            values, (str(mode), metric, str(preset), str(seed)), value, path
+                        )
     return values
 
 
@@ -235,12 +238,19 @@ def audit_instrument(receipt_paths: Iterable[Path]) -> dict[str, Any]:
         checkpoint_hashes = set(before.values())
 
         runs = receipt.get("runs") or {}
+        mode_summary = receipt.get("mode_summary") or {}
         if not runs:
             errors.append(f"{path}: no evaluation runs recorded")
+        receipt_seeds: set[str] = set()
+        receipt_eval_seeds: dict[str, set[int]] = {}
+        run_metric_keys: set[tuple[str, str, str, str]] = set()
         for branch_id, run in runs.items():
             mode = str(run.get("mode") or "")
             seed = str(run.get("checkpoint_seed"))
             preset = str(run.get("preset") or "")
+            receipt_seeds.add(seed)
+            if run.get("evaluation_seed") is not None:
+                receipt_eval_seeds.setdefault(seed, set()).add(int(run["evaluation_seed"]))
             key = (mode, seed, preset)
             if mode not in (RATCHET_MODE, FIXED_MODE):
                 errors.append(f"{path}: unexpected mode {mode!r}")
@@ -250,12 +260,83 @@ def audit_instrument(receipt_paths: Iterable[Path]) -> dict[str, Any]:
                 errors.append(f"{path}: incomplete cell {branch_id}")
             if run.get("checkpoint_sha256") not in checkpoint_hashes:
                 errors.append(f"{path}: cell {branch_id} has an unpinned checkpoint hash")
+            run_summary = run.get("summary") or {}
+            aggregate_metrics = ((mode_summary.get(preset) or {}).get(mode) or {}).get(
+                "metrics"
+            ) or {}
+            for metric in METRICS:
+                run_metric_keys.add((mode, seed, preset, metric))
+                run_value = run_summary.get(metric)
+                aggregate_value = (
+                    (aggregate_metrics.get(metric) or {}).get("per_checkpoint_seed", {}).get(seed)
+                )
+                if (
+                    run_value is None
+                    or aggregate_value is None
+                    or not math.isclose(
+                        float(run_value),
+                        float(aggregate_value),
+                        rel_tol=0.0,
+                        abs_tol=FLOAT_TOLERANCE,
+                    )
+                ):
+                    errors.append(
+                        f"{path}: {branch_id} {metric} run/aggregate mismatch: "
+                        f"{run_value!r} versus {aggregate_value!r}"
+                    )
             if key in cells:
                 errors.append(f"duplicate evaluation cell {key} in {path}")
             cells[key] = {
                 "evaluation_seed": run.get("evaluation_seed"),
                 "receipt": str(path),
             }
+
+        aggregate_metric_keys: set[tuple[str, str, str, str]] = set()
+        for preset, modes in mode_summary.items():
+            for mode, block in modes.items():
+                for metric in METRICS:
+                    per_seed = (block.get("metrics") or {}).get(metric, {}).get(
+                        "per_checkpoint_seed"
+                    ) or {}
+                    aggregate_metric_keys.update(
+                        (str(mode), str(seed), str(preset), metric) for seed in per_seed
+                    )
+        if aggregate_metric_keys != run_metric_keys:
+            errors.append(
+                f"{path}: aggregate/run metric keyspace differs: "
+                f"missing={sorted(run_metric_keys - aggregate_metric_keys)} "
+                f"extra={sorted(aggregate_metric_keys - run_metric_keys)}"
+            )
+
+        protocol_seeds = {str(seed) for seed in protocol.get("checkpoint_seeds") or []}
+        if protocol_seeds != receipt_seeds:
+            errors.append(
+                f"{path}: protocol checkpoint seeds {sorted(protocol_seeds)} "
+                f"do not match runs {sorted(receipt_seeds)}"
+            )
+        protocol_eval_map = {
+            str(seed): int(value)
+            for seed, value in (protocol.get("evaluation_seed_by_checkpoint_seed") or {}).items()
+        }
+        observed_eval_map = {
+            seed: next(iter(values))
+            for seed, values in receipt_eval_seeds.items()
+            if len(values) == 1
+        }
+        if any(len(values) != 1 for values in receipt_eval_seeds.values()):
+            errors.append(f"{path}: a checkpoint seed has multiple evaluation seeds")
+        if protocol_eval_map != observed_eval_map:
+            errors.append(
+                f"{path}: protocol evaluation-seed map {protocol_eval_map} "
+                f"does not match runs {observed_eval_map}"
+            )
+        protocol_modes = {str(mode) for mode in protocol.get("modes") or []}
+        run_modes = {str(run.get("mode") or "") for run in runs.values()}
+        if protocol_modes != run_modes:
+            errors.append(
+                f"{path}: protocol modes {sorted(protocol_modes)} "
+                f"do not match runs {sorted(run_modes)}"
+            )
 
         receipt_records.append(
             {
@@ -272,6 +353,11 @@ def audit_instrument(receipt_paths: Iterable[Path]) -> dict[str, Any]:
     }
     if seeds_by_mode[RATCHET_MODE] != seeds_by_mode[FIXED_MODE]:
         errors.append(f"ratchet/fixed training seeds are not paired: {seeds_by_mode}")
+    unexpected_seeds = (seeds_by_mode[RATCHET_MODE] | seeds_by_mode[FIXED_MODE]) - set(
+        EXPECTED_EVALUATION_SEED
+    )
+    if unexpected_seeds:
+        errors.append(f"unexpected training seeds: {sorted(unexpected_seeds)}")
 
     for mode, seeds in seeds_by_mode.items():
         for seed in sorted(seeds):
@@ -300,10 +386,13 @@ def audit_instrument(receipt_paths: Iterable[Path]) -> dict[str, Any]:
             continue
         evaluation_seed = next(iter(eval_seeds))
         evaluation_seed_by_training_seed[seed] = evaluation_seed
-        frozen_screening_seed = SCREENING_EVAL_SEED.get(seed)
-        if frozen_screening_seed is not None and evaluation_seed != frozen_screening_seed:
+        expected_evaluation_seed = EXPECTED_EVALUATION_SEED.get(seed)
+        if expected_evaluation_seed is None:
+            errors.append(f"training seed {seed} has no frozen evaluation-seed mapping")
+        elif evaluation_seed != expected_evaluation_seed:
             errors.append(
-                f"training seed {seed} used eval seed {evaluation_seed}, expected {frozen_screening_seed}"
+                f"training seed {seed} used eval seed {evaluation_seed}, "
+                f"expected {expected_evaluation_seed}"
             )
 
     audit = {
@@ -314,6 +403,7 @@ def audit_instrument(receipt_paths: Iterable[Path]) -> dict[str, Any]:
         "cell_count": len(cells),
         "paired_training_seeds": sorted(seeds_by_mode[RATCHET_MODE] & seeds_by_mode[FIXED_MODE]),
         "evaluation_seed_by_training_seed": evaluation_seed_by_training_seed,
+        "expected_evaluation_seed_by_training_seed": dict(EXPECTED_EVALUATION_SEED),
         "launcher_sha256": sorted(launcher_hashes),
         "panel_sha256": sorted(panel_hashes),
     }
@@ -532,7 +622,9 @@ def _gate(value: bool | None) -> str:
     return "pass" if value else "fail"
 
 
-def mechanism_for_arm(arm: dict[str, Any], receipt_path: Path) -> dict[str, Any]:
+def mechanism_for_arm(
+    arm: dict[str, Any], receipt_path: Path, receipt_config: dict[str, Any]
+) -> dict[str, Any]:
     rows, curriculum_path = _curriculum_rows(arm, receipt_path)
     ordered = sorted(
         enumerate(rows),
@@ -593,6 +685,33 @@ def mechanism_for_arm(arm: dict[str, Any], receipt_path: Path) -> dict[str, Any]
         not unguarded_decreases and not blocked_hold_violations if transitions else None
     )
 
+    configured_iterations = receipt_config.get("iterations")
+    configured_warmup = receipt_config.get("warmup_iterations")
+    global_steps = [row.get("global_step") for row in rows]
+    expected_steps = (
+        list(range(1, int(configured_iterations) + 1)) if configured_iterations is not None else []
+    )
+    post_warmup = [
+        row
+        for row in rows
+        if row.get("global_step") is not None
+        and configured_warmup is not None
+        and int(row["global_step"]) > int(configured_warmup)
+    ]
+    required_control_fields = ("lambda_before", "lambda_after", "guard_tripped", "latch_active")
+    telemetry_pass = (
+        configured_iterations == 8000
+        and configured_warmup == 10
+        and len(rows) == configured_iterations
+        and len(lambda_rows) == configured_iterations
+        and global_steps == expected_steps
+        and len(post_warmup) == configured_iterations - configured_warmup
+        and all(
+            all(field in row and row[field] is not None for field in required_control_fields)
+            for row in post_warmup
+        )
+    )
+
     terminal: dict[str, Any]
     if max_step is None:
         terminal = {
@@ -632,7 +751,42 @@ def mechanism_for_arm(arm: dict[str, Any], receipt_path: Path) -> dict[str, Any]
             "gate": _gate(terminal_pass),
         }
 
-    configured_monotonic = (arm.get("arm_spec") or {}).get("monotonic")
+    arm_spec = arm.get("arm_spec") or {}
+    configured_monotonic = arm_spec.get("monotonic")
+    configuration = {
+        "from_scratch": receipt_config.get("from_scratch"),
+        "num_envs": receipt_config.get("num_envs"),
+        "iterations": receipt_config.get("iterations"),
+        "warmup_iterations": receipt_config.get("warmup_iterations"),
+        "modes": receipt_config.get("modes"),
+        "consolidation_fraction": receipt_config.get("consolidation_fraction"),
+        "max_delay_steps": receipt_config.get("max_delay_steps"),
+        "curriculum_mode": arm_spec.get("curriculum_mode"),
+        "anchor_ratio": arm_spec.get("anchor_ratio"),
+        "spread_strata": arm_spec.get("spread_strata"),
+        "return_guard": arm_spec.get("return_guard"),
+        "monotonic": configured_monotonic,
+        "fixed_lambda": arm_spec.get("fixed_lambda"),
+        "allow_extrapolation": arm_spec.get("allow_extrapolation"),
+        "yardstick": arm_spec.get("margin"),
+    }
+    configuration_pass = (
+        configuration["from_scratch"] is True
+        and configuration["num_envs"] == 1024
+        and configuration["iterations"] == 8000
+        and configuration["warmup_iterations"] == 10
+        and configuration["modes"] == [RATCHET_MODE]
+        and configuration["consolidation_fraction"] == 0
+        and configuration["max_delay_steps"] == 8
+        and configuration["curriculum_mode"] == "lucid"
+        and configuration["anchor_ratio"] == 0.0
+        and configuration["spread_strata"] == 1
+        and configuration["return_guard"] == "relative"
+        and configuration["monotonic"] is True
+        and configuration["fixed_lambda"] == 1.0
+        and configuration["allow_extrapolation"] is False
+        and configuration["yardstick"] is None
+    )
     receipt_bind_rows = arm.get("ratchet_bind_rows")
     summary_consistent = (
         int(receipt_bind_rows) == len(blocked) if receipt_bind_rows is not None else None
@@ -651,9 +805,17 @@ def mechanism_for_arm(arm: dict[str, Any], receipt_path: Path) -> dict[str, Any]
         "rows": len(rows),
         "lambda_rows": len(lambda_rows),
         "configured_monotonic": configured_monotonic,
-        "configuration_gate": _gate(
-            configured_monotonic if configured_monotonic is not None else None
-        ),
+        "configuration": configuration,
+        "configuration_gate": _gate(configuration_pass),
+        "telemetry_contract": {
+            "expected_rows": configured_iterations,
+            "observed_rows": len(rows),
+            "lambda_rows": len(lambda_rows),
+            "post_warmup_rows": len(post_warmup),
+            "required_post_warmup_fields": list(required_control_fields),
+            "contiguous_global_steps": global_steps == expected_steps,
+            "gate": _gate(telemetry_pass),
+        },
         "reach_lambda_095_by_step_500": {
             "threshold": HIGH_LAMBDA,
             "deadline_step": REACH_BY_STEP,
@@ -671,6 +833,7 @@ def mechanism_for_arm(arm: dict[str, Any], receipt_path: Path) -> dict[str, Any]
             "guard_is_only_legal_decrease_gate": _gate(decrease_invariant),
             "receipt_ratchet_bind_rows": receipt_bind_rows,
             "receipt_bind_count_consistent": summary_consistent,
+            "receipt_bind_count_gate": _gate(summary_consistent),
         },
         "terminal_1000_high_lambda_exposure": terminal,
     }
@@ -681,6 +844,7 @@ def collect_mechanisms(training_paths: Iterable[Path]) -> tuple[dict[str, Any], 
     ignored_modes: set[str] = set()
     for path in training_paths:
         receipt = load_json(path)
+        receipt_config = receipt.get("config") or {}
         for arm in (receipt.get("arms") or {}).values():
             mode = str(arm.get("mode", ""))
             if mode != RATCHET_MODE:
@@ -693,15 +857,17 @@ def collect_mechanisms(training_paths: Iterable[Path]) -> tuple[dict[str, Any], 
             key = str(seed)
             if key in by_seed:
                 raise ValueError(f"duplicate ratchet training arm for seed {key}")
-            by_seed[key] = mechanism_for_arm(arm, path)
+            by_seed[key] = mechanism_for_arm(arm, path, receipt_config)
     return dict(sorted(by_seed.items())), sorted(ignored_modes)
 
 
 def mechanism_summary(per_seed: dict[str, Any]) -> dict[str, Any]:
     gate_paths = (
         ("configuration_gate",),
+        ("telemetry_contract", "gate"),
         ("reach_lambda_095_by_step_500", "gate"),
         ("pi_decrease_control", "guard_is_only_legal_decrease_gate"),
+        ("pi_decrease_control", "receipt_bind_count_gate"),
         ("terminal_1000_high_lambda_exposure", "gate"),
     )
 
@@ -723,6 +889,9 @@ def mechanism_summary(per_seed: dict[str, Any]) -> dict[str, Any]:
             for seed, block in per_seed.items()
             if block["pi_decrease_control"]["blocking_observed"]
         ],
+        "H_R3_collapse_deletion_implied_by_H_R0": {
+            seed: passed for seed, passed in per_seed_pass.items()
+        },
         "interpretation": (
             "A zero blocked-row count means the PI law did not request a logged decrease; "
             "it is not treated as a mechanism failure. Any actual lambda decrease must be "
@@ -793,7 +962,12 @@ def preregistered_decision(
         "capability_components": list(components),
         "capability_components_pass": component_pass,
         "lat_50ms_is_secondary": True,
-        "directional_claim_authorized": scope["directional_claim_authorized"],
+        "noninferiority_decision_eligible": len(paired) == EXPECTED_PAIRED_SEEDS,
+        # Kept false to avoid downstream readers treating "directional" as a
+        # superiority claim.  The narrow authorized claim has its own field.
+        "directional_claim_authorized": False,
+        "noninferiority_claim_authorized": status == "pass",
+        "superiority_claim_authorized": False,
         "interpretation": interpretation,
     }
 
@@ -826,7 +1000,10 @@ def claim_scope(comparisons: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "status": status,
         "paired_training_seeds": primary["paired_seeds"],
         "num_paired_training_seeds": count,
-        "directional_claim_authorized": count == EXPECTED_PAIRED_SEEDS,
+        "noninferiority_decision_eligible": count == EXPECTED_PAIRED_SEEDS,
+        "directional_claim_authorized": False,
+        "noninferiority_claim_authorized": False,
+        "superiority_claim_authorized": False,
         "statement": statement,
     }
 
@@ -902,6 +1079,11 @@ def analyze(robustness_paths: Sequence[Path], training_paths: Sequence[Path]) ->
         for endpoint, comparison in endpoints.items()
     }
     joint = {
+        "binding": False,
+        "interpretation": (
+            "Descriptive same-seed conjunction including the secondary latency cell. "
+            "The binding H_R2 decision is component-wise 2-of-3 on the four AUC endpoints."
+        ),
         "success_primary": success_joint,
         "progress_co_primary": progress_joint,
         "success_and_progress": joint_noninferiority(all_components),
@@ -910,6 +1092,8 @@ def analyze(robustness_paths: Sequence[Path], training_paths: Sequence[Path]) ->
     mechanism, ignored_training_modes = collect_mechanisms(training_paths)
     scope = claim_scope(comparisons)
     decision = preregistered_decision(comparisons, mechanism, scope)
+    scope["directional_claim_authorized"] = False
+    scope["noninferiority_claim_authorized"] = decision["noninferiority_claim_authorized"]
     verified = [
         "normalized trapezoidal success/progress AUCs computed without imputation",
         "ratchet-minus-fixed comparisons paired on training seed",
@@ -947,6 +1131,7 @@ def analyze(robustness_paths: Sequence[Path], training_paths: Sequence[Path]) ->
             "in_envelope_margin": IN_ENVELOPE_MARGIN,
             "latency_margin": LATENCY_MARGIN,
             "expected_paired_seeds": EXPECTED_PAIRED_SEEDS,
+            "expected_evaluation_seed_by_training_seed": dict(EXPECTED_EVALUATION_SEED),
             "required_within_margin_seeds": REQUIRED_WITHIN_MARGIN_SEEDS,
             "high_lambda_threshold": HIGH_LAMBDA,
             "reach_by_step": REACH_BY_STEP,

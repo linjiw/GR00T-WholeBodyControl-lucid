@@ -44,6 +44,9 @@ def eval_receipt(rows):
         "launcher_sha256": A.EXPECTED_EVALUATOR_SHA256,
         "protocol": {
             "num_envs": A.EXPECTED_NUM_ENVS,
+            "checkpoint_seeds": seeds,
+            "evaluation_seed_by_checkpoint_seed": {str(seed): seed + 100 for seed in seeds},
+            "modes": [A.RATCHET_MODE, A.FIXED_MODE],
             "max_delay_capacity_steps": A.EXPECTED_MAX_DELAY,
             "physics_step_ms": A.EXPECTED_PHYSICS_STEP_MS,
             "no_learning": True,
@@ -85,6 +88,7 @@ def full_grid_rows(seeds, ratchet=(0.80, 0.70), fixed=(0.81, 0.71)):
 
 def write_training(tmp_path, seed=8600, rows=None, *, monotonic=True):
     rows = rows or []
+    tmp_path.mkdir(parents=True, exist_ok=True)
     curriculum = tmp_path / f"curriculum_{seed}.jsonl"
     curriculum.write_text("".join(json.dumps(row) + "\n" for row in rows))
     receipt = tmp_path / f"training_{seed}.json"
@@ -97,16 +101,34 @@ def write_training(tmp_path, seed=8600, rows=None, *, monotonic=True):
                         "mode": A.RATCHET_MODE,
                         "curriculum_path": str(curriculum),
                         "ratchet_bind_rows": sum(bool(row.get("latch_active")) for row in rows),
-                        "arm_spec": {"monotonic": monotonic},
+                        "arm_spec": {
+                            "curriculum_mode": "lucid",
+                            "anchor_ratio": 0.0,
+                            "spread_strata": 1,
+                            "return_guard": "relative",
+                            "monotonic": monotonic,
+                            "fixed_lambda": 1.0,
+                            "allow_extrapolation": False,
+                            "margin": None,
+                        },
                     }
-                }
+                },
+                "config": {
+                    "from_scratch": True,
+                    "num_envs": 1024,
+                    "iterations": 8000,
+                    "warmup_iterations": 10,
+                    "modes": [A.RATCHET_MODE],
+                    "consolidation_fraction": 0,
+                    "max_delay_steps": 8,
+                },
             }
         )
     )
     return receipt
 
 
-def healthy_curriculum(num_rows=1200):
+def healthy_curriculum(num_rows=8000):
     rows = []
     for step in range(1, num_rows + 1):
         before = min(1.0, step / 100.0)
@@ -212,7 +234,9 @@ class TestMechanism:
         assert block["reach_lambda_095_by_step_500"]["first_reach_step"] == 95
         assert block["reach_lambda_095_by_step_500"]["gate"] == "pass"
         assert block["pi_decrease_control"]["blocked_pi_decrease_rows"] == 1
+        assert block["pi_decrease_control"]["receipt_bind_count_gate"] == "pass"
         assert block["pi_decrease_control"]["guard_is_only_legal_decrease_gate"] == "pass"
+        assert block["telemetry_contract"]["gate"] == "pass"
         assert block["terminal_1000_high_lambda_exposure"]["high_lambda_fraction"] == 1.0
         assert block["terminal_1000_high_lambda_exposure"]["gate"] == "pass"
         assert A.mechanism_summary(per_seed)["all_available_seeds_pass"] is True
@@ -240,6 +264,14 @@ class TestMechanism:
         assert terminal["observed_iterations"] == 600
         assert terminal["gate"] == "not_evaluable"
 
+    def test_missing_post_warmup_control_field_fails_telemetry(self, tmp_path):
+        rows = healthy_curriculum()
+        del rows[100]["latch_active"]
+        receipt = write_training(tmp_path, rows=rows)
+        per_seed, _ = A.collect_mechanisms([receipt])
+        assert per_seed["8600"]["telemetry_contract"]["gate"] == "fail"
+        assert A.mechanism_summary(per_seed)["all_available_seeds_pass"] is False
+
     @pytest.mark.parametrize(("low_rows", "expected"), [(50, "pass"), (51, "fail")])
     def test_terminal_gate_uses_preregistered_95_percent_floor(self, tmp_path, low_rows, expected):
         rows = healthy_curriculum()
@@ -263,6 +295,58 @@ class TestReceipt:
         evaluation.write_text(json.dumps(eval_receipt(rows)))
         with pytest.raises(ValueError, match="preset set differs"):
             A.audit_instrument([evaluation])
+
+    def test_instrument_audit_rejects_wrong_confirmation_eval_seed(self, tmp_path):
+        receipt = eval_receipt(full_grid_rows((8602,)))
+        receipt["protocol"]["evaluation_seed_by_checkpoint_seed"]["8602"] = 8700
+        for run in receipt["runs"].values():
+            run["evaluation_seed"] = 8700
+        evaluation = tmp_path / "evaluation.json"
+        evaluation.write_text(json.dumps(receipt))
+        with pytest.raises(ValueError, match="expected 8702"):
+            A.audit_instrument([evaluation])
+
+    def test_instrument_audit_rejects_protocol_run_seed_mismatch(self, tmp_path):
+        receipt = eval_receipt(full_grid_rows((8600,)))
+        receipt["protocol"]["checkpoint_seeds"] = [8601]
+        evaluation = tmp_path / "evaluation.json"
+        evaluation.write_text(json.dumps(receipt))
+        with pytest.raises(ValueError, match="protocol checkpoint seeds"):
+            A.audit_instrument([evaluation])
+
+    def test_instrument_audit_rejects_run_aggregate_mismatch(self, tmp_path):
+        receipt = eval_receipt(full_grid_rows((8600,)))
+        branch = next(iter(receipt["runs"].values()))
+        branch["summary"]["success_rate"] = 0.123
+        evaluation = tmp_path / "evaluation.json"
+        evaluation.write_text(json.dumps(receipt))
+        with pytest.raises(ValueError, match="run/aggregate mismatch"):
+            A.audit_instrument([evaluation])
+
+    def test_instrument_audit_rejects_aggregate_only_phantom_seed(self, tmp_path):
+        receipt = eval_receipt(full_grid_rows((8600,)))
+        receipt["mode_summary"]["phys_200"][A.RATCHET_MODE]["metrics"]["success_rate"][
+            "per_checkpoint_seed"
+        ]["8602"] = 1.0
+        evaluation = tmp_path / "evaluation.json"
+        evaluation.write_text(json.dumps(receipt))
+        with pytest.raises(ValueError, match="aggregate/run metric keyspace differs"):
+            A.audit_instrument([evaluation])
+
+    def test_analyzer_rejects_rate_outside_unit_interval(self, tmp_path):
+        receipt = eval_receipt(full_grid_rows((8600,)))
+        branch = next(iter(receipt["runs"].values()))
+        branch["summary"]["success_rate"] = 1.01
+        preset = branch["preset"]
+        mode = branch["mode"]
+        seed = str(branch["checkpoint_seed"])
+        receipt["mode_summary"][preset][mode]["metrics"]["success_rate"]["per_checkpoint_seed"][
+            seed
+        ] = 1.01
+        evaluation = tmp_path / "evaluation.json"
+        evaluation.write_text(json.dumps(receipt))
+        with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+            A.analyze([evaluation], [write_training(tmp_path, rows=healthy_curriculum())])
 
     def test_cli_writes_screening_receipt_with_both_metrics(self, tmp_path):
         evaluation = tmp_path / "evaluation.json"
@@ -288,6 +372,8 @@ class TestReceipt:
         assert receipt["instrument_audit"]["passed"] is True
         assert receipt["claim_scope"]["status"] == "screening_only"
         assert receipt["claim_scope"]["directional_claim_authorized"] is False
+        assert receipt["claim_scope"]["superiority_claim_authorized"] is False
+        assert receipt["joint_noninferiority"]["binding"] is False
         assert receipt["preregistered_decision"]["status"] == "screen_pass"
         assert receipt["preregistered_decision"]["lat_50ms_is_secondary"] is True
         assert (
@@ -314,4 +400,20 @@ class TestReceipt:
         assert receipt["preregistered_decision"]["status"] == "not_evaluable"
         assert receipt["frozen_contract"]["in_envelope_margin"] == 0.01
         assert receipt["claim_scope"]["status"] == "three_seed_decision"
+        assert receipt["claim_scope"]["noninferiority_decision_eligible"] is True
+        assert receipt["claim_scope"]["noninferiority_claim_authorized"] is False
+        assert receipt["claim_scope"]["superiority_claim_authorized"] is False
         assert receipt["joint_noninferiority"]["success_primary"]["verdict"] == "pass"
+
+    def test_three_seed_pass_authorizes_only_noninferiority(self, tmp_path):
+        evaluation = tmp_path / "evaluation.json"
+        evaluation.write_text(json.dumps(eval_receipt(full_grid_rows((8600, 8601, 8602)))))
+        training = [
+            write_training(tmp_path / str(seed), seed=seed, rows=healthy_curriculum())
+            for seed in (8600, 8601, 8602)
+        ]
+        receipt = A.analyze([evaluation], training)
+        assert receipt["preregistered_decision"]["status"] == "pass"
+        assert receipt["claim_scope"]["noninferiority_decision_eligible"] is True
+        assert receipt["claim_scope"]["noninferiority_claim_authorized"] is True
+        assert receipt["claim_scope"]["superiority_claim_authorized"] is False
