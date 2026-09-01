@@ -33,25 +33,50 @@ episodes that ended by reaching the end of the clip rather than by a
 termination condition. Three properties earn it the job, and the alternatives
 fail at least one:
 
-============  ========  ==============  =========================
+============= ========  ===============  =========================
 signal        anchored  population-wide  bounded / outcome-defined
-============  ========  ==============  =========================
-latent gap    no        no (one env)     no (learned, drifting)
-mean return   no        yes              no (unbounded, scale-drifts)
+============= ========  ===============  =========================
+latent gap    NO        no (one env)     no (learned, drifting)
+mean return   yes       yes              NO (unbounded, scale-drifts)
 time-out rate yes       yes              yes ([0, 1], an outcome)
-============  ========  ==============  =========================
+============= ========  ===============  =========================
 
-"Anchored" was checked offline before this module was written: across five
-runs held at a constant lambda = 1.0, the latent gap's p90 wandered between
-0.20 and 0.95 with no monotone relation to training progress, while the
-time-out rate rose monotonically from below 0.02 to about 0.95 by iteration
-5,000-6,000 and stayed there.
+Anchoring was measured, not assumed, before this module was written. Across
+five runs whose applied lambda is pinned at 1.0 -- three fixed-DR arms and two
+monotone-ratchet arms -- the rank correlation of each signal against the
+iteration index was:
 
-The one caveat, stated because it is the whole point of the module: the
-time-out rate is still *difficulty-relative*. The collapsed run reached 0.988,
-higher than any healthy fixed-DR arm, because it had made its own exam easier.
-It is admissible as a gate signal only under a monotone actuator and only when
-read at the probe level. Both conditions are structural here.
+    latent gap p90   -0.30 to +0.11   (mean -0.04, 54% monotone, 19 reversals)
+    time-out rate    +0.985 to +0.992 (mean +0.987, 92% monotone, 5 reversals)
+    mean return      +0.967 to +0.980 (mean +0.973, 95% monotone, 3 reversals)
+
+Difficulty is constant in those runs, so competence is the only thing left
+moving. The latent gap does not track it. That is a disqualification measured
+on five independent runs, and it holds regardless of how the controller
+consuming it is tuned.
+
+The gap is worse than merely uninformative: its direction is set by the arm
+rather than by the policy. Against the same iteration index it correlates
+-0.66 in the no-randomization arm, about zero in the fixed arms, and +0.39 and
++0.50 in the two arms that evacuated difficulty. In those two the gap *rose*
+while lambda was being cut, which is precisely the sign that drives a PI
+controller to cut further. The collapse is that loop, and it is visible in
+the instrument itself.
+
+Mean return, by contrast, *is* anchored -- the table's earlier draft claimed
+otherwise and the audit above corrected it. Return is disqualified for a
+different reason: it is unbounded and its scale drifts across a run (roughly
+1.4 to 11-12 on these arms, and to 15.9 on a collapsed one), so no fixed
+threshold has a stable meaning. A gate needs an absolute level to compare
+against, and only a bounded outcome rate supplies one.
+
+The caveat that remains, stated because it is the whole point of the module:
+the time-out rate is *difficulty-relative*, exactly as return is. The
+collapsed run reached 0.986, above every healthy fixed-DR arm, because it had
+made its own exam easier. Survival is admissible as a gate signal only under a
+monotone actuator and only when read at the probe level -- never at the level
+currently being trained. Both conditions are structural here rather than
+configured.
 
 The law, once per iteration::
 
