@@ -18,10 +18,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from gear_sonic.research.practice_utility import dr_scaling as DS
-from gear_sonic.research.practice_utility import observer as OBS
-from gear_sonic.research.practice_utility import quality_telemetry as QT
-from gear_sonic.research.practice_utility import tace as TACE
+from gear_sonic.research.practice_utility import (
+    dr_scaling as DS,
+    observer as OBS,
+    quality_telemetry as QT,
+    tace as TACE,
+)
 from gear_sonic.research.practice_utility.dr_controller import (
     LucidDRController,
     PIConfig,
@@ -100,10 +102,30 @@ class LucidCurriculumCallback(TrainerCallback):
         yardstick_envs: int = 0,
         margin_branch_id: str | None = None,
         allow_extrapolation: bool = False,
+        survival_branch_id: str | None = None,
+        gate_threshold: float = 0.80,
+        gate_window: int = 200,
+        gate_step: float = 0.125,
+        gate_probe_offset: float = 0.125,
+        gate_dwell: int = 200,
+        gate_min_episodes: int = 200,
+        gate_lambda_max: float = 1.5,
+        gate_probe_max: float = 2.0,
+        gate_guard_action: str = "freeze",
+        gate_tail_fraction: float = 0.25,
+        #: Where an expansion arm starts. Support expansion begins where fixed
+        #: randomization already sits, so the arm's first difference from fixed
+        #: DR is an expansion rather than a warm-up. Read instead of
+        #: ``initial_lambda``, which every launcher passes as 0.0.
+        gate_initial_frontier: float = 1.0,
+        ramp_start_lambda: float = 1.0,
+        ramp_end_lambda: float = 1.5,
+        ramp_begin_iteration: int = 1000,
+        ramp_end_iteration: int = 5000,
     ) -> None:
-        if mode not in ("lucid", "fixed", "off", "yoked"):
+        if mode not in ("lucid", "fixed", "off", "yoked", "gate", "ramp"):
             raise ValueError(
-                f"unknown curriculum mode {mode!r}; expected lucid/fixed/off/yoked"
+                f"unknown curriculum mode {mode!r}; expected " "lucid/fixed/off/yoked/gate/ramp"
             )
         if not 0.0 <= float(anchor_ratio) <= 1.0:
             raise ValueError(f"anchor_ratio must be in [0, 1], got {anchor_ratio}")
@@ -162,11 +184,12 @@ class LucidCurriculumCallback(TrainerCallback):
         # Per-term fixed intensities applied after the global lambda: a channel
         # attribution tool (e.g. everything at 1 except latency at 0).
         self.term_lambda_overrides = {
-            str(k): float(v) for k, v in (dict(term_lambda_overrides) if term_lambda_overrides else {}).items()
+            str(k): float(v)
+            for k, v in (dict(term_lambda_overrides) if term_lambda_overrides else {}).items()
         }
         for name, value in self.term_lambda_overrides.items():
             if not 0.0 <= value <= 1.0:
-                raise ValueError(f'term_lambda_overrides[{name!r}] must be in [0, 1], got {value}')
+                raise ValueError(f"term_lambda_overrides[{name!r}] must be in [0, 1], got {value}")
         # A *cap* is the per-channel ceiling the scalar curriculum cannot
         # express: the channel follows lambda up to its own limit and no
         # further. An override pins a channel at a constant regardless of
@@ -174,7 +197,8 @@ class LucidCurriculumCallback(TrainerCallback):
         # actuation latency" is a cap, not an override, and it is the shape
         # LUCID-MC needs if one channel turns out to carry the harm.
         self.term_lambda_caps = {
-            str(k): float(v) for k, v in (dict(term_lambda_caps) if term_lambda_caps else {}).items()
+            str(k): float(v)
+            for k, v in (dict(term_lambda_caps) if term_lambda_caps else {}).items()
         }
         for name, value in self.term_lambda_caps.items():
             if not 0.0 <= value <= 1.0:
@@ -197,13 +221,17 @@ class LucidCurriculumCallback(TrainerCallback):
         self._clamp_report: dict[str, Any] | None = None
         # The eval/training asymmetry: evaluation may score a policy outside the
         # envelope, but training crosses lambda = 1 only through this explicit
-        # flag, and only for the open-loop fixed mode -- a controller that can
-        # extrapolate on its own initiative is how a support experiment becomes
-        # an uncontrolled one.
-        if self.allow_extrapolation and mode != "fixed":
+        # flag, and only for modes whose applied support cannot contract -- a
+        # *bidirectional* controller that can also extrapolate is how a support
+        # experiment becomes an uncontrolled one. The gap-driven "lucid" mode
+        # stays hard-capped at 1 for exactly that reason; "gate" and "ramp" are
+        # admitted because both are monotone by construction (see
+        # survival_gate.py) and neither can lower applied support by its own
+        # decision rule.
+        if self.allow_extrapolation and mode not in ("fixed", "gate", "ramp"):
             raise ValueError(
-                "allow_extrapolation is a fixed-mode support extension; "
-                f"controller-driven mode {mode!r} stays hard-capped at lambda = 1"
+                "allow_extrapolation is a support extension for the monotone "
+                f"modes fixed/gate/ramp; mode {mode!r} stays hard-capped at lambda = 1"
             )
         if self.fixed_lambda > 1.0 and not self.allow_extrapolation:
             raise ValueError(
@@ -225,8 +253,81 @@ class LucidCurriculumCallback(TrainerCallback):
         self._start_step: int | None = None
         self._resumed_from: dict[str, Any] | None = None
 
+        # --- monotone support expansion (gate / ramp) -----------------------
+        # Both modes drive a *frontier* rather than a point: the focus cohort is
+        # split into a retained tail, a frontier stratum, and -- for the gate --
+        # a probe stratum one step above the frontier. They share this entire
+        # layout so that the only difference between the feedback arm and its
+        # control is how the frontier moves, which is the comparison the ratchet
+        # result showed the programme was missing.
+        self.gate_probe_offset = float(gate_probe_offset)
+        self.gate_tail_fraction = float(gate_tail_fraction)
+        self.ramp_start_lambda = float(ramp_start_lambda)
+        self.ramp_end_lambda = float(ramp_end_lambda)
+        self.ramp_begin_iteration = int(ramp_begin_iteration)
+        self.ramp_end_iteration = int(ramp_end_iteration)
+        self.survival_branch_id = survival_branch_id
+        self.gate: Any = None
+        self._frontier_lambda: float | None = None
+        #: Absolute per-stratum intensities for the current iteration, low
+        #: first. When set, ``_apply_strata`` uses these instead of scaling the
+        #: frontier by the TACE weights, which is what lets one stratum sit
+        #: *above* the frontier.
+        self._stratum_lambdas_absolute: tuple[float, ...] | None = None
+        if mode in ("gate", "ramp"):
+            if not 0.0 <= self.gate_tail_fraction < 1.0:
+                raise ValueError(f"gate_tail_fraction must be in [0, 1), got {gate_tail_fraction}")
+            ceiling = (
+                gate_lambda_max
+                if mode == "gate"
+                else max(self.ramp_start_lambda, self.ramp_end_lambda)
+            )
+            if ceiling > 1.0 and not self.allow_extrapolation:
+                raise ValueError(
+                    f"mode {mode!r} targets lambda {ceiling} outside the training "
+                    "envelope; pass allow_extrapolation=true to extend support "
+                    "past lambda = 1 deliberately"
+                )
+            if self.spread_strata < 2:
+                raise ValueError(
+                    f"mode {mode!r} needs spread_strata >= 2: a frontier stratum "
+                    "and, for the gate, a probe stratum above it"
+                )
+            if mode == "ramp" and self.ramp_end_lambda < self.ramp_start_lambda:
+                raise ValueError(
+                    "ramp_end_lambda must be >= ramp_start_lambda: the open-loop "
+                    "control is monotone for the same reason the gate is"
+                )
+        if mode == "gate":
+            from gear_sonic.research.practice_utility import survival_gate as SG
+
+            self.gate = SG.SurvivalGateController(
+                SG.SurvivalGateConfig(
+                    threshold=float(gate_threshold),
+                    window=int(gate_window),
+                    step_size=float(gate_step),
+                    probe_offset=self.gate_probe_offset,
+                    dwell=int(gate_dwell),
+                    min_episodes=int(gate_min_episodes),
+                    lambda_max=float(gate_lambda_max),
+                    probe_max=float(gate_probe_max),
+                    return_relative_drop=float(return_relative_drop),
+                    return_window=int(return_window),
+                    guard_action=str(gate_guard_action),
+                ),
+                initial_lambda=float(min(gate_initial_frontier, gate_lambda_max)),
+            )
+            self._frontier_lambda = self.gate.frontier
+        elif mode == "ramp":
+            self._frontier_lambda = self.ramp_start_lambda
+
         if mode == "lucid":
             starting_lambda = initial_lambda
+        elif mode in ("gate", "ramp"):
+            # The PI controller is inert in these modes; keep its config
+            # envelope-bound so no controller path can follow the frontier
+            # above 1, exactly as fixed mode does.
+            starting_lambda = min(float(self._frontier_lambda or 0.0), 1.0)
         elif mode == "fixed":
             # The controller is inert in fixed mode (_apply reads fixed_lambda
             # directly); its config stays envelope-bound even when a support
@@ -266,9 +367,12 @@ class LucidCurriculumCallback(TrainerCallback):
         # fixed-mode support extension. Keep the dose actually sent to the
         # event manager separately so startup, warmup, and telemetry cannot
         # accidentally report/apply the controller's capped placeholder.
-        self._last_applied_lambda = float(
-            self.fixed_lambda if self.mode == "fixed" else self.controller.lambda_value
-        )
+        if self.mode == "fixed":
+            self._last_applied_lambda = float(self.fixed_lambda)
+        elif self._frontier_lambda is not None:
+            self._last_applied_lambda = float(self._frontier_lambda)
+        else:
+            self._last_applied_lambda = float(self.controller.lambda_value)
 
     # ------------------------------------------------------------ lifecycle --
 
@@ -340,6 +444,78 @@ class LucidCurriculumCallback(TrainerCallback):
         elif self.mode == "off":
             record = {"global_step": step, "mode": "off", "lambda": 0.0, "gap_quantile": None}
             self._apply(0.0)
+        elif self.mode == "gate":
+            observer = self._survival_observer()
+            mean_return = self._mean_return(state)
+            probe_survival, probe_episodes = (None, 0)
+            if observer is not None:
+                observer.ensure_flushed(step)
+                probe_survival, probe_episodes = observer.current_probe()
+            outcome = self.gate.update(
+                probe_survival=probe_survival,
+                probe_episodes=probe_episodes,
+                mean_return=mean_return,
+            )
+            self._frontier_lambda = outcome.frontier_after
+            self._apply(outcome.frontier_after)
+            record = {
+                "global_step": step,
+                "mode": "gate",
+                "signal": "survival",
+                # ``lambda`` stays the frontier for every downstream reader that
+                # already parses this field as "the intensity the arm trains at".
+                "lambda": outcome.frontier_after,
+                "gap_quantile": None,
+                "frontier_lambda": outcome.frontier_after,
+                "population_survival": (
+                    observer.current_population() if observer is not None else None
+                ),
+                "survival_observer_present": observer is not None,
+                "allow_extrapolation": self.allow_extrapolation,
+                "physical_clamp": sorted((self._clamp_report or {}).get("clamped", {})),
+                **outcome.to_dict(),
+            }
+        elif self.mode == "ramp":
+            from gear_sonic.research.practice_utility import survival_gate as SG
+
+            observer = self._survival_observer()
+            if observer is not None:
+                observer.ensure_flushed(step)
+            index = step - (self._start_step or 0)
+            frontier = SG.linear_ramp_lambda(
+                index,
+                start_lambda=self.ramp_start_lambda,
+                end_lambda=self.ramp_end_lambda,
+                begin_iteration=self.ramp_begin_iteration,
+                end_iteration=self.ramp_end_iteration,
+            )
+            self._frontier_lambda = frontier
+            self._apply(frontier)
+            probe_survival, probe_episodes = (
+                observer.current_probe() if observer is not None else (None, 0)
+            )
+            record = {
+                "global_step": step,
+                "mode": "ramp",
+                # Open loop: the schedule reads nothing. Probe survival is
+                # recorded at the same place the gate would read it, so the two
+                # arms produce comparable telemetry and the control can be
+                # checked to have gated on nothing.
+                "signal": "none",
+                "lambda": frontier,
+                "gap_quantile": None,
+                "frontier_lambda": frontier,
+                "probe_lambda": frontier + self.gate_probe_offset,
+                "probe_survival": probe_survival,
+                "probe_episodes": probe_episodes,
+                "population_survival": (
+                    observer.current_population() if observer is not None else None
+                ),
+                "ramp_index": index,
+                "mean_return": self._mean_return(state),
+                "allow_extrapolation": self.allow_extrapolation,
+                "physical_clamp": sorted((self._clamp_report or {}).get("clamped", {})),
+            }
         elif self.mode == "yoked":
             # Replay a recorded lambda trajectory, indexed by iteration since
             # (re)start, with no feedback. The attribution control for TA-LUCID:
@@ -420,7 +596,63 @@ class LucidCurriculumCallback(TrainerCallback):
             return self.fixed_lambda
         if self.mode == "off":
             return 0.0
+        if self._frontier_lambda is not None:
+            return float(self._frontier_lambda)
         return self.controller.lambda_value
+
+    # ------------------------------------------------- support expansion --
+
+    def _survival_observer(self):
+        if self.mode not in ("gate", "ramp"):
+            return None
+        from gear_sonic.research.practice_utility import survival_observer as SO
+
+        return SO.get_active_survival_observer(self.survival_branch_id or self.branch_id)
+
+    def _probe_stratum_index(self) -> int | None:
+        """The stratum held above the frontier: always the top one.
+
+        Present in both gate and ramp so the two arms allocate environments
+        identically. In ramp mode it is measured and logged but gates nothing,
+        which is what makes the pair a clean attribution control.
+        """
+        if self.mode not in ("gate", "ramp") or self.spread_strata < 2:
+            return None
+        return self.spread_strata - 1
+
+    def _expansion_stratum_lambdas(self, frontier: float) -> tuple[float, ...]:
+        """Absolute intensity per stratum: retained tail, frontier, probe.
+
+        Support is *expanded*, never moved. The tail strata keep sampling the
+        intensities the policy already trained on -- the campaign measured a
+        collapsed arm scoring below its own mid-training capsule, so retention
+        is not free -- while the frontier stratum carries the mass and the
+        probe sits one step beyond it.
+        """
+        count = self.spread_strata
+        probe_index = self._probe_stratum_index()
+        if probe_index is None:
+            return tuple(frontier * w for w in TACE.stratum_weights(count))
+        # The probe is derived from the frontier actually being applied, never
+        # from the gate's own copy of it: the two can differ during warm-up, a
+        # resume, or consolidation, and taking the gate's copy there would place
+        # the probe *below* the frontier and quietly delete the stratum that the
+        # whole design depends on. The gate contributes only its ceiling.
+        probe = frontier + self.gate_probe_offset
+        if self.gate is not None:
+            probe = min(probe, float(self.gate.config.probe_max))
+        probe = max(float(probe), float(frontier))
+        # Strata 0 .. count-3 span the retained tail, stratum count-2 is the
+        # frontier itself, stratum count-1 is the probe.
+        tail = count - 2
+        lambdas: list[float] = []
+        for index in range(tail):
+            # Evenly spaced across (0, frontier), never including 0: a stratum
+            # at exactly zero is the "off" arm, which is a different question.
+            lambdas.append(frontier * float(index + 1) / float(tail + 1))
+        lambdas.append(float(frontier))
+        lambdas.append(float(probe))
+        return tuple(lambdas)
 
     def _bind(self, env: Any) -> None:
         manager = _event_manager_of(env)
@@ -442,8 +674,12 @@ class LucidCurriculumCallback(TrainerCallback):
                 reserved = tuple(sorted({*reserved, int(observer.tracked_env)}))
             seed = self.anchor_seed if self.anchor_seed is not None else 0
             self.assignment = TACE.assign_cohorts(
-                num_envs, self.anchor_ratio, seed, reserved,
-                num_strata=self.spread_strata, num_yardstick=self.yardstick_envs,
+                num_envs,
+                self.anchor_ratio,
+                seed,
+                reserved,
+                num_strata=self.spread_strata,
+                num_yardstick=self.yardstick_envs,
                 stratum_sizes=self.stratum_sizes,
             )
             anchor_params, anchor_buckets = self._anchor_target(manager)
@@ -455,6 +691,11 @@ class LucidCurriculumCallback(TrainerCallback):
             margin = self._margin_observer()
             if margin is not None:
                 margin.set_cohorts(self.assignment.focus_mask(), self.assignment.yardstick_mask())
+            survival = self._survival_observer()
+            if survival is not None:
+                # Attribution is by environment id, fixed for the run, so the
+                # gate can read the probe cohort apart from the frontier.
+                survival.set_strata(self.assignment.stratum_masks(), self._probe_stratum_index())
 
     def _install_yardstick(self) -> None:
         """Hold the yardstick cohort at lambda = 0 on every dispatched term."""
@@ -484,9 +725,7 @@ class LucidCurriculumCallback(TrainerCallback):
 
         return MO.get_active_margin_observer(self.margin_branch_id or self.branch_id)
 
-    def _anchor_target(
-        self, manager: Any
-    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    def _anchor_target(self, manager: Any) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         """The envelope the anchor cohort should sample: *this arm's* target.
 
         For an unrestricted channel that is the captured baseline. For a channel
@@ -559,6 +798,8 @@ class LucidCurriculumCallback(TrainerCallback):
             # region (friction went negative at 1.5x before the eval-side clamp
             # existed); clamp the live config and keep the report for the record.
             self._clamp_report = DS.clamp_physical(self._event_manager)
+        if self.mode in ("gate", "ramp") and self.spread_strata > 1:
+            self._stratum_lambdas_absolute = self._expansion_stratum_lambdas(float(lambda_value))
         self._apply_strata(lambda_value)
 
     def _apply_strata(self, lambda_value: float) -> None:
@@ -574,6 +815,7 @@ class LucidCurriculumCallback(TrainerCallback):
             return
         from gear_sonic.research.practice_utility import events_reset_safe as ERS
 
+        absolute = self._stratum_lambdas_absolute
         weights = TACE.stratum_weights(self.spread_strata)
         for name, dispatch in self.dispatchers.items():
             base = self.baseline.get(name)
@@ -581,12 +823,22 @@ class LucidCurriculumCallback(TrainerCallback):
                 continue
             channel_lambda = self._channel_lambda(name, lambda_value)
             for index, weight in enumerate(weights):
-                if index == len(weights) - 1:
+                if absolute is None and index == len(weights) - 1:
+                    # The top stratum samples the event manager's own params,
+                    # which apply_lambda has just written. That is what makes
+                    # spread_strata = 1 identical to the pre-strata curriculum,
+                    # so it is preserved for every arm that does not place a
+                    # stratum above the frontier.
                     dispatch.set_stratum(index, None)
                     continue
-                params = DS.scaled_term_params(
-                    base, channel_lambda * weight, self.allow_extrapolation
-                )
+                if absolute is not None:
+                    # A stratum may sit above the frontier, so the intensity is
+                    # absolute rather than a fraction of it. Channel caps and
+                    # overrides still apply, per channel, at that intensity.
+                    stratum_lambda = self._channel_lambda(name, float(absolute[index]))
+                else:
+                    stratum_lambda = channel_lambda * weight
+                params = DS.scaled_term_params(base, stratum_lambda, self.allow_extrapolation)
                 if self.allow_extrapolation:
                     params, _ = DS.clamp_params_physical(params)
                 buckets = None
@@ -659,10 +911,15 @@ class LucidCurriculumCallback(TrainerCallback):
             "anchor_ratio": self.assignment.anchor_ratio,
             "num_strata": self.assignment.num_strata,
             "stratum_sizes": [len(ids) for ids in self.assignment.focus_strata],
-            "stratum_lambdas": [
-                self._last_applied_lambda * w
-                for w in TACE.stratum_weights(self.assignment.num_strata)
-            ],
+            "stratum_lambdas": (
+                list(self._stratum_lambdas_absolute)
+                if self._stratum_lambdas_absolute is not None
+                else [
+                    self._last_applied_lambda * w
+                    for w in TACE.stratum_weights(self.assignment.num_strata)
+                ]
+            ),
+            "probe_stratum": self._probe_stratum_index(),
             "consolidating": self._consolidating,
             "dispatch": {name: d.telemetry() for name, d in self.dispatchers.items()},
         }
@@ -689,6 +946,8 @@ class LucidCurriculumCallback(TrainerCallback):
             "signal": self.signal,
             "yardstick_envs": self.yardstick_envs,
             "controller": self.controller.state_dict(),
+            "gate": self.gate.state_dict() if self.gate is not None else None,
+            "frontier_lambda": self._frontier_lambda,
             "scalable_terms": self.scalable,
             "term_lambda_overrides": self.term_lambda_overrides,
             "term_lambda_caps": self.term_lambda_caps,
@@ -705,6 +964,19 @@ class LucidCurriculumCallback(TrainerCallback):
         straight there reintroduces exactly the shock the curriculum is meant to
         avoid, so the move can be capped and closed over subsequent epochs.
         """
+        gate_state = state.get("gate")
+        if gate_state and self.gate is not None:
+            # Restored as-is and never rolled back: a resume that lowered
+            # applied support would be the failure this arm exists to delete.
+            self.gate.load_state_dict(gate_state)
+            self._frontier_lambda = self.gate.frontier
+            self._resumed_from = {
+                "frontier": self.gate.frontier,
+                "expansions": self.gate.expansions,
+                "iteration": self.gate.iteration,
+            }
+        elif state.get("frontier_lambda") is not None and self.mode == "ramp":
+            self._frontier_lambda = float(state["frontier_lambda"])
         controller_state = state.get("controller")
         if not controller_state:
             return

@@ -164,6 +164,94 @@ EXPECTED_SCALABLE_TERMS = {
 RATCHET_ARMS = ("lucid_ratchet_rg",)
 ARMS.update({arm: ("lucid", 0.0, None) for arm in RATCHET_ARMS})
 ARM_RETURN_GUARD.update({arm: "relative" for arm in RATCHET_ARMS})
+#: Monotone support-expansion arms, the pair the ratchet result asked for.
+#: ``gate_150`` widens the frontier when a probe stratum held one step ABOVE it
+#: survives; ``ramp_150`` widens it on a fixed linear schedule and reads
+#: nothing. They share stratum count, stratum sizes, probe placement and
+#: terminal support, so the only thing that differs is the decision rule -- the
+#: comparison that the ratchet arm, being distributionally identical to fixed
+#: DR, could not make. Both are monotone by construction, so neither can
+#: evacuate difficulty the way the unconstrained controller did in 2 of 6 cells.
+EXPANSION_ARMS = ("gate_150", "ramp_150")
+SURVIVAL_OBSERVER = (
+    "gear_sonic.research.practice_utility.survival_observer.SurvivalObserverCallback"
+)
+ARMS.update({"gate_150": ("gate", 0.0, None), "ramp_150": ("ramp", 0.0, None)})
+ARM_SPREAD_STRATA.update({arm: 8 for arm in EXPANSION_ARMS})
+ARM_RETURN_GUARD.update({arm: "relative" for arm in EXPANSION_ARMS})
+#: Frontier ceiling per expansion arm. Kept separate from ARM_FIXED_LAMBDA
+#: because these arms do not train at a fixed lambda: they *end* there.
+ARM_FRONTIER_MAX: dict[str, float] = {arm: 1.5 for arm in EXPANSION_ARMS}
+#: Cohort shares: a 12.5% probe above the frontier, 62.5% at the frontier, and
+#: a 25% retained tail -- the same tail share as the fixed_u150 mixture, so the
+#: retention question and the scheduling question stay separable.
+EXPANSION_PROBE_FRACTION = 0.125
+EXPANSION_FRONTIER_FRACTION = 0.625
+#: The probe sits one expansion step above the frontier, so a probe draw is
+#: always the next support level rather than the current one.
+EXPANSION_STEP = 0.125
+
+
+def _max_frontier_drop(curriculum: list[dict[str, Any]]) -> float:
+    """Largest downward movement of the applied frontier, over a whole run.
+
+    Zero is the claim. It is computed from the written trajectory rather than
+    from the controller's own state so that the receipt checks the arm rather
+    than trusting it.
+    """
+    worst = 0.0
+    previous: float | None = None
+    for row in curriculum:
+        value = row.get("frontier_lambda", row.get("lambda"))
+        if not isinstance(value, (int, float)):
+            continue
+        if previous is not None and value < previous:
+            worst = max(worst, previous - float(value))
+        previous = float(value)
+    return worst
+
+
+def expansion_stratum_sizes(
+    num_focus: int,
+    num_strata: int,
+    frontier_fraction: float = EXPANSION_FRONTIER_FRACTION,
+    probe_fraction: float = EXPANSION_PROBE_FRACTION,
+) -> list[int]:
+    """Stratum sizes for an expansion arm: tail, then frontier, then probe.
+
+    Order matters: the callback reads the last stratum as the probe and the
+    second to last as the frontier, so the sizes are returned in that order.
+    """
+    if not 0.0 < probe_fraction < 1.0:
+        raise ValueError(f"probe_fraction must be in (0, 1), got {probe_fraction}")
+    if not 0.0 < frontier_fraction < 1.0:
+        raise ValueError(f"frontier_fraction must be in (0, 1), got {frontier_fraction}")
+    if frontier_fraction + probe_fraction >= 1.0:
+        raise ValueError(
+            "frontier and probe shares must leave a retention tail, got "
+            f"{frontier_fraction} + {probe_fraction}"
+        )
+    if num_strata < 3:
+        raise ValueError(f"expansion arms need >= 3 strata, got {num_strata}")
+    probe = int(round(probe_fraction * num_focus))
+    frontier = int(round(frontier_fraction * num_focus))
+    tail_total = num_focus - probe - frontier
+    lower = num_strata - 2
+    if tail_total < lower:
+        raise ValueError(
+            f"{num_focus} focus envs leave a {tail_total}-env tail, too thin for "
+            f"{lower} lower strata"
+        )
+    base, extra = divmod(tail_total, lower)
+    sizes = [base + (1 if index < extra else 0) for index in range(lower)]
+    return sizes + [frontier, probe]
+
+
+#: Every arm whose applied lambda can exceed the lambda = 1 envelope, and the
+#: ceiling it can reach. The delay-buffer capacity check reads THIS, not the
+#: fixed-lambda table: an expansion arm launched at the default --max-delay
+#: would silently train latency at 1.0x while its telemetry claimed 1.5x.
+ARM_LAMBDA_CEILING: dict[str, float] = {**ARM_FIXED_LAMBDA, **ARM_FRONTIER_MAX}
 MODES = tuple(ARMS)
 
 
@@ -505,6 +593,51 @@ def parse_args(argv=None):
         default=8,
         help="relative-guard arms: how many epochs of its own history an arm is judged against",
     )
+    parser.add_argument(
+        "--gate-threshold",
+        type=float,
+        default=0.80,
+        help="gate arm: probe-stratum survival the trailing window must average to expand",
+    )
+    parser.add_argument(
+        "--gate-window",
+        type=int,
+        default=200,
+        help="gate arm: iterations of probe survival averaged before an expansion may fire",
+    )
+    parser.add_argument(
+        "--gate-dwell",
+        type=int,
+        default=200,
+        help="gate arm: iterations that must pass after an expansion before the next",
+    )
+    parser.add_argument(
+        "--gate-min-episodes",
+        type=int,
+        default=200,
+        help="gate arm: probe episodes required in the window; below this it holds",
+    )
+    parser.add_argument(
+        "--gate-guard-action",
+        choices=("freeze", "decay"),
+        default="freeze",
+        help=(
+            "gate arm: what the return guard does. 'freeze' halts expansion and keeps "
+            "applied support; 'decay' also contracts it, which is recorded as an incident"
+        ),
+    )
+    parser.add_argument(
+        "--ramp-begin-iteration",
+        type=int,
+        default=1000,
+        help="ramp arm: iteration the open-loop frontier starts rising at",
+    )
+    parser.add_argument(
+        "--ramp-end-iteration",
+        type=int,
+        default=5000,
+        help="ramp arm: iteration the open-loop frontier reaches its ceiling",
+    )
     parser.add_argument("--exp", default="manager/universal_token/all_modes/sonic_release")
     parser.add_argument(
         "--terminations",
@@ -679,20 +812,23 @@ def build_command(
                 f"{mode} pins its frontier mixture for the full run; "
                 "--consolidation-fraction must be 0"
             )
+    ceiling = ARM_LAMBDA_CEILING.get(mode, 1.0)
     extrapolation = (
-        ["++callbacks.lucid_curriculum.allow_extrapolation=true"]
-        if mode in ARM_FIXED_LAMBDA
-        else []
+        ["++callbacks.lucid_curriculum.allow_extrapolation=true"] if ceiling > 1.0 else []
     )
-    if mode in ARM_FIXED_LAMBDA:
+    if ceiling > 1.0:
         # 8 steps = the 40 ms training ceiling at 200 Hz; the delayed-actuator
         # buffer clamps any drawn delay to its allocated capacity WITHOUT error,
         # so an undersized buffer would quietly turn 1.5x latency back into 1.0x.
-        needed = fixed_lambda_value * 8
+        # Gated on the arm's effective lambda ceiling rather than on membership
+        # of the fixed-lambda table: an expansion arm reaches 1.5 too, and
+        # gating on the table would have let it through silently.
+        reach = ceiling + (EXPANSION_STEP if mode in EXPANSION_ARMS else 0.0)
+        needed = reach * 8
         needed = int(needed) if float(needed).is_integer() else int(needed) + 1
         if args.max_delay < needed:
             raise SystemExit(
-                f"{mode} trains latency at {fixed_lambda_value}x the 0-40 ms envelope, "
+                f"{mode} trains latency at up to {reach}x the 0-40 ms envelope, "
                 f"which needs a delay-buffer capacity of {needed} steps; the buffer "
                 f"silently clamps to --max-delay ({args.max_delay}). Pass --max-delay {needed}."
             )
@@ -707,6 +843,38 @@ def build_command(
             "++callbacks.lucid_curriculum.stratum_sizes="
             "[" + ",".join(str(size) for size in sizes) + "]"
         )
+    expansion: list[str] = []
+    if mode in EXPANSION_ARMS:
+        sizes = expansion_stratum_sizes(args.num_envs, strata)
+        spread.append(
+            "++callbacks.lucid_curriculum.stratum_sizes="
+            "[" + ",".join(str(size) for size in sizes) + "]"
+        )
+        expansion = [
+            f"++callbacks.survival_observer._target_={SURVIVAL_OBSERVER}",
+            "++callbacks.survival_observer.enabled=true",
+            f"++callbacks.survival_observer.branch_id={branch_id}",
+            f"++callbacks.survival_observer.output_dir={artifact_dir}",
+            f"++callbacks.lucid_curriculum.survival_branch_id={branch_id}",
+            f"++callbacks.lucid_curriculum.gate_probe_offset={EXPANSION_STEP}",
+        ]
+        if mode == "gate_150":
+            expansion += [
+                f"++callbacks.lucid_curriculum.gate_threshold={args.gate_threshold}",
+                f"++callbacks.lucid_curriculum.gate_window={args.gate_window}",
+                f"++callbacks.lucid_curriculum.gate_step={EXPANSION_STEP}",
+                f"++callbacks.lucid_curriculum.gate_dwell={args.gate_dwell}",
+                f"++callbacks.lucid_curriculum.gate_min_episodes={args.gate_min_episodes}",
+                f"++callbacks.lucid_curriculum.gate_lambda_max={ARM_FRONTIER_MAX[mode]}",
+                f"++callbacks.lucid_curriculum.gate_guard_action={args.gate_guard_action}",
+            ]
+        else:
+            expansion += [
+                "++callbacks.lucid_curriculum.ramp_start_lambda=1.0",
+                f"++callbacks.lucid_curriculum.ramp_end_lambda={ARM_FRONTIER_MAX[mode]}",
+                f"++callbacks.lucid_curriculum.ramp_begin_iteration={args.ramp_begin_iteration}",
+                f"++callbacks.lucid_curriculum.ramp_end_iteration={args.ramp_end_iteration}",
+            ]
     relative_guard = (
         [
             f"++callbacks.lucid_curriculum.return_guard={guard}",
@@ -772,6 +940,7 @@ def build_command(
         *spread,
         *relative_guard,
         *ratchet,
+        *expansion,
         f"++callbacks.lucid_curriculum.observer_branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.branch_id={branch_id}",
         f"++callbacks.lucid_curriculum.output_dir={artifact_dir}",
@@ -999,6 +1168,26 @@ def main(argv=None) -> int:
                     if mode in RATCHET_ARMS
                     else {}
                 ),
+                **(
+                    {
+                        # The safety claim for an expansion arm, computed from
+                        # its own telemetry rather than asserted: applied
+                        # support must never have moved down.
+                        "final_frontier_lambda": (
+                            curriculum[-1].get("frontier_lambda") if curriculum else None
+                        ),
+                        "expansions": sum(bool(row.get("fired")) for row in curriculum),
+                        "applied_decreases": sum(
+                            bool(row.get("applied_decrease")) for row in curriculum
+                        ),
+                        "max_frontier_drop": _max_frontier_drop(curriculum),
+                        "probe_rows": sum(
+                            row.get("probe_survival") is not None for row in curriculum
+                        ),
+                    }
+                    if mode in EXPANSION_ARMS
+                    else {}
+                ),
                 "scalable_terms": curriculum[-1].get("scalable_terms", []) if curriculum else [],
                 "arm_spec": {
                     "curriculum_mode": ARMS[mode][0],
@@ -1014,18 +1203,59 @@ def main(argv=None) -> int:
                     "stratum_sizes": (
                         expand_arm_contract(mode, args.num_envs)["stratum_sizes"]
                         if mode in EXPAND_ARMS
-                        else None
+                        else (
+                            expansion_stratum_sizes(args.num_envs, ARM_SPREAD_STRATA[mode])
+                            if mode in EXPANSION_ARMS
+                            else None
+                        )
                     ),
                     "stratum_lambdas": (
                         expand_arm_contract(mode, args.num_envs)["stratum_lambdas"]
                         if mode in EXPAND_ARMS
-                        else None
+                        else (
+                            curriculum[-1].get("tace", {}).get("stratum_lambdas")
+                            if mode in EXPANSION_ARMS and curriculum
+                            else None
+                        )
+                    ),
+                    **(
+                        {
+                            "frontier_max": ARM_FRONTIER_MAX[mode],
+                            "probe_offset": EXPANSION_STEP,
+                            "probe_fraction": EXPANSION_PROBE_FRACTION,
+                            "frontier_fraction": EXPANSION_FRONTIER_FRACTION,
+                            "monotone_by_construction": True,
+                            "signal": "survival" if mode == "gate_150" else "none",
+                            "gate": (
+                                {
+                                    "threshold": args.gate_threshold,
+                                    "window": args.gate_window,
+                                    "dwell": args.gate_dwell,
+                                    "min_episodes": args.gate_min_episodes,
+                                    "guard_action": args.gate_guard_action,
+                                }
+                                if mode == "gate_150"
+                                else None
+                            ),
+                            "ramp": (
+                                {
+                                    "start_lambda": 1.0,
+                                    "end_lambda": ARM_FRONTIER_MAX[mode],
+                                    "begin_iteration": args.ramp_begin_iteration,
+                                    "end_iteration": args.ramp_end_iteration,
+                                }
+                                if mode == "ramp_150"
+                                else None
+                            ),
+                        }
+                        if mode in EXPANSION_ARMS
+                        else {}
                     ),
                     "top_fraction": ARM_TOP_FRACTION.get(mode),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
                     **({"monotonic": True} if mode in RATCHET_ARMS else {}),
                     "fixed_lambda": ARM_FIXED_LAMBDA.get(mode, 1.0),
-                    "allow_extrapolation": mode in ARM_FIXED_LAMBDA,
+                    "allow_extrapolation": ARM_LAMBDA_CEILING.get(mode, 1.0) > 1.0,
                     "physical_clamp": (
                         curriculum[-1].get("physical_clamp") if curriculum else None
                     ),

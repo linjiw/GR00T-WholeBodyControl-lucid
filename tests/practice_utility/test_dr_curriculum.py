@@ -782,8 +782,31 @@ class TestSupportExtension:
         assert params["mass_distribution_params"] == pytest.approx([0.7, 1.3])
 
     def test_controller_modes_may_not_extrapolate(self):
-        with pytest.raises(ValueError, match="fixed-mode"):
+        # The bidirectional gap-driven controller stays hard-capped at 1: a
+        # scheduler that can both lower difficulty and leave the envelope turns
+        # a support experiment into an uncontrolled one.
+        with pytest.raises(ValueError, match="hard-capped"):
             LucidCurriculumCallback(enabled=True, mode="lucid", allow_extrapolation=True)
+
+    def test_monotone_expansion_modes_may_extrapolate(self):
+        # gate and ramp are admitted because neither can lower applied support
+        # by its own decision rule.
+        for mode in ("gate", "ramp"):
+            cur = LucidCurriculumCallback(
+                enabled=True,
+                mode=mode,
+                allow_extrapolation=True,
+                spread_strata=8,
+                gate_lambda_max=1.5,
+                ramp_end_lambda=1.5,
+            )
+            assert cur.allow_extrapolation is True
+
+    def test_expansion_modes_past_one_require_the_flag(self):
+        with pytest.raises(ValueError, match="allow_extrapolation"):
+            LucidCurriculumCallback(enabled=True, mode="gate", spread_strata=8, gate_lambda_max=1.5)
+        with pytest.raises(ValueError, match="allow_extrapolation"):
+            LucidCurriculumCallback(enabled=True, mode="ramp", spread_strata=8, ramp_end_lambda=1.5)
 
     def test_fixed_lambda_past_one_requires_the_flag(self):
         with pytest.raises(ValueError, match="allow_extrapolation"):
@@ -849,7 +872,9 @@ class TestSupportExtension:
         cur._event_manager = m
         cur.baseline = DS.capture_baseline(m)
         cur._apply(1.0)
-        assert m._terms["randomize_rigid_body_mass"].params["mass_distribution_params"] == pytest.approx([0.8, 1.2])
+        assert m._terms["randomize_rigid_body_mass"].params[
+            "mass_distribution_params"
+        ] == pytest.approx([0.8, 1.2])
         assert cur._clamp_report is None
 
 
