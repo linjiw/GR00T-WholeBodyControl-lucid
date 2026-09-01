@@ -366,3 +366,78 @@ def test_consolidation_still_works_for_legacy_modes():
         enabled=True, mode="lucid", spread_strata=4, consolidation_fraction=0.3
     )
     assert callback.consolidation_fraction == pytest.approx(0.3)
+
+
+class TestObserverChaining:
+    """Two callbacks wrap env.step in the same run; both must still see it.
+
+    The gate arms run the practice observer (base command) and the survival
+    observer together. Each saves whatever env.step was at ITS install time, so
+    the wrappers chain rather than clobber. If they did clobber, the gate would
+    read no probe episodes, hold the frontier at 1.0 forever, and look exactly
+    like an honest "the probe never cleared threshold" result.
+    """
+
+    class SteppingEnv:
+        def __init__(self, num_envs=8):
+            self.termination_manager = object()
+            self.calls = 0
+            self.num_envs = num_envs
+
+        def step(self, actions, *a, **k):
+            self.calls += 1
+            dones = torch.zeros(self.num_envs, dtype=torch.bool)
+            dones[: self.num_envs // 2] = True
+            timed = torch.zeros(self.num_envs, dtype=torch.bool)
+            timed[: self.num_envs // 4] = True
+            return (None, None, dones, {"time_outs": timed})
+
+    def test_survival_observer_sees_steps_through_an_outer_wrapper(self):
+        env = self.SteppingEnv()
+        observer = SO.SurvivalObserverCallback(enabled=True, branch_id="chain")
+        observer._install(env)
+        mask = torch.ones(8, dtype=torch.bool)
+        observer.set_strata([mask], probe_index=0)
+
+        outer_seen = []
+        inner = env.step
+
+        def outer(actions, *a, **k):
+            result = inner(actions, *a, **k)
+            outer_seen.append(True)
+            return result
+
+        env.step = outer
+
+        for _ in range(3):
+            env.step(None)
+
+        observer.ensure_flushed(1)
+        record = observer.history[-1]
+        assert env.calls == 3
+        assert len(outer_seen) == 3
+        assert record["episodes_ended"] == 12
+        assert record["survival"] == pytest.approx(0.5)
+        assert record["errors"] == []
+
+    def test_survival_observer_sees_steps_as_the_outer_wrapper(self):
+        env = self.SteppingEnv()
+        inner_seen = []
+        original = env.step
+
+        def inner_wrapper(actions, *a, **k):
+            inner_seen.append(True)
+            return original(actions, *a, **k)
+
+        env.step = inner_wrapper
+        observer = SO.SurvivalObserverCallback(enabled=True, branch_id="chain2")
+        observer._install(env)
+        observer.set_strata([torch.ones(8, dtype=torch.bool)], probe_index=0)
+
+        for _ in range(2):
+            env.step(None)
+
+        observer.ensure_flushed(1)
+        assert len(inner_seen) == 2
+        assert observer.history[-1]["episodes_ended"] == 8
+        assert observer.current_probe() == (pytest.approx(0.5), 8)
