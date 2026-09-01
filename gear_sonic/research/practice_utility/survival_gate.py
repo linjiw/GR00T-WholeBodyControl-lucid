@@ -70,6 +70,21 @@ different reason: it is unbounded and its scale drifts across a run (roughly
 threshold has a stable meaning. A gate needs an absolute level to compare
 against, and only a bounded outcome rate supplies one.
 
+Anchoring is only half of it. A difficulty controller also needs its signal to
+have *authority*: the signal must respond to the actuator, and with the right
+sign. The latent gap fails this too, and worse than it fails anchoring. Over
+iterations 5,000-8,000 of the stratified collapse the correlation between
+applied lambda and the measured gap is r = -0.201 -- a controller needs r > 0.
+That is the mechanism of *totality*: an inverted signal would settle at some
+equilibrium, but a signal the actuator cannot move gives the integrator no
+restoring force at all, so lambda winds to the rail. It is why both collapses
+end near 0.01 rather than at a partial retreat.
+
+Probe survival has authority by construction. Raising the frontier raises the
+probe with it, which lowers probe survival, which withholds the next
+expansion. The actuator moves the signal, and in the direction that stops
+further movement.
+
 The caveat that remains, stated because it is the whole point of the module:
 the time-out rate is *difficulty-relative*, exactly as return is. The
 collapsed run reached 0.986, above every healthy fixed-DR arm, because it had
