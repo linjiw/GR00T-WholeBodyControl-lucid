@@ -342,3 +342,27 @@ def test_extrapolated_probe_params_are_physically_clamped():
     assert low >= 0.05
     assert high > low
     assert report
+
+
+def test_consolidation_is_refused_for_expansion_modes():
+    # Consolidation pins every cohort at lambda = 1.0 for the last stretch of
+    # training. For an arm whose frontier is above 1.0 that is a silent support
+    # contraction the gate never asked for and would not log as an incident.
+    for mode in ("gate", "ramp"):
+        with pytest.raises(ValueError, match="contract the support"):
+            LucidCurriculumCallback(
+                enabled=True,
+                mode=mode,
+                spread_strata=8,
+                allow_extrapolation=True,
+                gate_lambda_max=1.5,
+                ramp_end_lambda=1.5,
+                consolidation_fraction=0.3,
+            )
+
+
+def test_consolidation_still_works_for_legacy_modes():
+    callback = LucidCurriculumCallback(
+        enabled=True, mode="lucid", spread_strata=4, consolidation_fraction=0.3
+    )
+    assert callback.consolidation_fraction == pytest.approx(0.3)

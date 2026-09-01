@@ -293,6 +293,17 @@ class LucidCurriculumCallback(TrainerCallback):
                     f"mode {mode!r} needs spread_strata >= 2: a frontier stratum "
                     "and, for the gate, a probe stratum above it"
                 )
+            if self.consolidation_fraction > 0.0:
+                # Consolidation pins every cohort at lambda = 1.0 for the last
+                # stretch of training. For an arm whose frontier is above 1.0
+                # that is a support CONTRACTION -- applied silently, and
+                # invisible to the gate's own incident log, because the gate
+                # never asked for it. Refused before the run starts rather than
+                # discovered 5 GPU-hours in.
+                raise ValueError(
+                    f"consolidation pins lambda at 1.0 and would contract the "
+                    f"support of monotone mode {mode!r}; the two are incompatible"
+                )
             if mode == "ramp" and self.ramp_end_lambda < self.ramp_start_lambda:
                 raise ValueError(
                     "ramp_end_lambda must be >= ramp_start_lambda: the open-loop "
@@ -880,6 +891,14 @@ class LucidCurriculumCallback(TrainerCallback):
         """Final target-only phase: every cohort on the full envelope."""
         if self.consolidation_fraction <= 0.0:
             return False
+        if self.mode in ("gate", "ramp"):
+            # Backstop only: the constructor already refuses this combination,
+            # so reaching here means consolidation_fraction was mutated after
+            # construction. Raising is still correct -- see the constructor.
+            raise RuntimeError(
+                "consolidation pins lambda at 1.0 and would contract the support "
+                f"of monotone mode {self.mode!r}; the two are incompatible"
+            )
         if self._consolidating:
             return True
         total = None
