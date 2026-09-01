@@ -4,21 +4,26 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 import statistics
 import sys
-from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from gear_sonic.research.practice_utility import branch_capsule as BC  # noqa: E402
-from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
-from scripts.practice_utility import run_throughput_probe as TP
+from gear_sonic.research.practice_utility import (  # noqa: E402
+    branch_capsule as BC,
+    dr_scaling as DS,
+)
 from gear_sonic.research.practice_utility.paths import LUCID_ROOT  # noqa: E402
+from scripts.practice_utility import (  # noqa: E402
+    run_latency_ab as LA,
+    run_throughput_probe as TP,
+)
 
 OBSERVER = "gear_sonic.research.practice_utility.observer.PracticeObserverCallback"
 CURRICULUM = "gear_sonic.research.practice_utility.dr_curriculum.LucidCurriculumCallback"
@@ -141,6 +146,18 @@ ARMS.update({arm: ("fixed", 0.0, None) for arm in EXPAND_ARMS})
 ARM_SPREAD_STRATA.update({arm: 8 for arm in EXPAND_ARMS})
 ARM_FIXED_LAMBDA.update({"fixed_u150": 1.5})
 ARM_TOP_FRACTION: dict[str, float] = {arm: 0.75 for arm in EXPAND_ARMS}
+EXPAND_EXPECTED_CLAMPS: dict[str, list[str]] = {
+    "fixed_u": [],
+    "fixed_u150": ["physics_material"],
+}
+EXPECTED_SCALABLE_TERMS = {
+    "add_joint_default_pos",
+    "base_com",
+    "physics_material",
+    "push_robot",
+    "randomize_action_delay",
+    "randomize_rigid_body_mass",
+}
 #: Stage-A anti-collapse arm: the same unstratified latent-gap curriculum and
 #: relative return guard as ``lucid_rg``, but PI-law decreases are projected
 #: away. The return guard remains the only path that can lower lambda.
@@ -161,12 +178,207 @@ def expand_stratum_sizes(num_focus: int, num_strata: int, top_fraction: float) -
     lower = num_strata - 1
     if tail < lower:
         raise ValueError(
-            f"{num_focus} focus envs leave a {tail}-env tail, too thin for "
-            f"{lower} lower strata"
+            f"{num_focus} focus envs leave a {tail}-env tail, too thin for " f"{lower} lower strata"
         )
     base, extra = divmod(tail, lower)
     sizes = [base + (1 if index < extra else 0) for index in range(lower)]
     return sizes + [top]
+
+
+def expand_arm_contract(mode: str, num_envs: int) -> dict[str, Any]:
+    """Return the frozen manipulation contract for an expand-support arm."""
+    if mode not in EXPAND_ARMS:
+        raise ValueError(f"{mode!r} is not an expand-support arm")
+    num_strata = 8
+    fixed_lambda = 1.5 if mode == "fixed_u150" else 1.0
+    stratum_lambdas = [fixed_lambda * (index + 1) / num_strata for index in range(num_strata)]
+    return {
+        "curriculum_mode": "fixed",
+        "anchor_ratio": 0.0,
+        "num_anchor": 0,
+        "num_focus": num_envs,
+        "spread_strata": num_strata,
+        "stratum_sizes": expand_stratum_sizes(num_envs, num_strata, 0.75),
+        "stratum_lambdas": stratum_lambdas,
+        "fixed_lambda": fixed_lambda,
+        "allow_extrapolation": mode == "fixed_u150",
+        "physical_clamp": EXPAND_EXPECTED_CLAMPS[mode],
+        "max_delay_steps": int(fixed_lambda * 8),
+        "delay_stratum_ranges": [[0.0, 8.0 * value] for value in stratum_lambdas[:-1]] + [None],
+        "dispatch_terms": sorted(EXPECTED_SCALABLE_TERMS),
+    }
+
+
+def _float_sequence_matches(observed: Any, expected: list[float]) -> bool:
+    return (
+        isinstance(observed, list)
+        and len(observed) == len(expected)
+        and all(
+            isinstance(value, (int, float)) and abs(float(value) - target) <= 1e-9
+            for value, target in zip(observed, expected)
+        )
+    )
+
+
+def _nested_values_match(observed: Any, expected: Any) -> bool:
+    """Compare nested dispatcher parameters with a tight numeric tolerance."""
+    if isinstance(expected, (int, float)) and isinstance(observed, (int, float)):
+        return abs(float(observed) - float(expected)) <= 1e-9
+    if isinstance(expected, dict) and isinstance(observed, dict):
+        return observed.keys() == expected.keys() and all(
+            _nested_values_match(observed[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, (list, tuple)) and isinstance(observed, (list, tuple)):
+        return len(observed) == len(expected) and all(
+            _nested_values_match(left, right) for left, right in zip(observed, expected)
+        )
+    return observed == expected
+
+
+def validate_expand_arm_contract(
+    mode: str,
+    arm: dict[str, Any],
+    curriculum: list[dict[str, Any]],
+    *,
+    num_envs: int,
+    max_delay: int,
+) -> dict[str, Any]:
+    """Reconcile an expand arm's self-description against live TACE telemetry.
+
+    Expand arms deliberately have ``anchor_ratio == 0``. The legacy mechanics
+    gate only inspected TACE when that ratio was positive, so a run could omit
+    the mixture dispatcher entirely and still be marked verified. This check is
+    independent of the anchor gate and pins every manipulation-bearing field.
+    """
+    expected = expand_arm_contract(mode, num_envs)
+    spec = arm.get("arm_spec") or {}
+    tace = arm.get("tace_final") or {}
+    errors: list[str] = []
+
+    def exact(label: str, observed: Any, target: Any) -> None:
+        if observed != target:
+            errors.append(f"{label}: expected {target!r}, observed {observed!r}")
+
+    exact("arm_spec.curriculum_mode", spec.get("curriculum_mode"), "fixed")
+    exact("arm_spec.anchor_ratio", spec.get("anchor_ratio"), 0.0)
+    exact("arm_spec.anchor_seed", spec.get("anchor_seed"), arm.get("seed"))
+    exact("arm_spec.spread_strata", spec.get("spread_strata"), expected["spread_strata"])
+    exact("arm_spec.stratum_sizes", spec.get("stratum_sizes"), expected["stratum_sizes"])
+    if not _float_sequence_matches(spec.get("stratum_lambdas"), expected["stratum_lambdas"]):
+        errors.append(
+            "arm_spec.stratum_lambdas: expected "
+            f"{expected['stratum_lambdas']!r}, observed {spec.get('stratum_lambdas')!r}"
+        )
+    exact("arm_spec.top_fraction", spec.get("top_fraction"), 0.75)
+    exact("arm_spec.fixed_lambda", spec.get("fixed_lambda"), expected["fixed_lambda"])
+    exact(
+        "arm_spec.allow_extrapolation",
+        spec.get("allow_extrapolation"),
+        expected["allow_extrapolation"],
+    )
+    exact("arm_spec.physical_clamp", spec.get("physical_clamp") or [], expected["physical_clamp"])
+    exact("arm_spec.max_delay_steps", spec.get("max_delay_steps"), expected["max_delay_steps"])
+    exact("max_delay_steps", max_delay, expected["max_delay_steps"])
+
+    required_stratum_keys = {f"focus_s{index}" for index in range(expected["spread_strata"])}
+
+    def reconcile_tace(label: str, telemetry: Any, *, require_counts: bool) -> bool:
+        before = len(errors)
+        if not isinstance(telemetry, dict):
+            errors.append(f"{label}: expected a mapping, observed {telemetry!r}")
+            return False
+        exact(f"{label}.num_anchor", telemetry.get("num_anchor"), expected["num_anchor"])
+        exact(f"{label}.num_focus", telemetry.get("num_focus"), expected["num_focus"])
+        exact(f"{label}.anchor_ratio", telemetry.get("anchor_ratio"), expected["anchor_ratio"])
+        exact(f"{label}.num_strata", telemetry.get("num_strata"), expected["spread_strata"])
+        exact(f"{label}.stratum_sizes", telemetry.get("stratum_sizes"), expected["stratum_sizes"])
+        if not _float_sequence_matches(
+            telemetry.get("stratum_lambdas"), expected["stratum_lambdas"]
+        ):
+            errors.append(
+                f"{label}.stratum_lambdas: expected {expected['stratum_lambdas']!r}, "
+                f"observed {telemetry.get('stratum_lambdas')!r}"
+            )
+
+        dispatch = telemetry.get("dispatch")
+        if not isinstance(dispatch, dict):
+            errors.append(f"{label}.dispatch: expected a mapping, observed {dispatch!r}")
+            dispatch = {}
+        exact(f"{label}.dispatch terms", sorted(dispatch), expected["dispatch_terms"])
+        for term in expected["dispatch_terms"]:
+            term_telemetry = dispatch.get(term)
+            if not isinstance(term_telemetry, dict):
+                errors.append(f"{label}.dispatch.{term}: missing dispatcher telemetry")
+                continue
+            exact(f"{label}.dispatch.{term}.term", term_telemetry.get("term"), term)
+            exact(
+                f"{label}.dispatch.{term}.num_strata",
+                term_telemetry.get("num_strata"),
+                expected["spread_strata"],
+            )
+            params = term_telemetry.get("stratum_params")
+            baseline = term_telemetry.get("anchor_params")
+            if not isinstance(params, list) or len(params) != expected["spread_strata"]:
+                errors.append(
+                    f"{label}.dispatch.{term}.stratum_params: expected "
+                    f"{expected['spread_strata']} entries, observed {params!r}"
+                )
+            elif not isinstance(baseline, dict):
+                errors.append(f"{label}.dispatch.{term}.anchor_params: missing baseline mapping")
+            else:
+                for index, dose in enumerate(expected["stratum_lambdas"][:-1]):
+                    target = DS.scaled_term_params(baseline, dose, expected["allow_extrapolation"])
+                    if expected["allow_extrapolation"]:
+                        target, _ = DS.clamp_params_physical(target)
+                    if not _nested_values_match(params[index], target):
+                        errors.append(
+                            f"{label}.dispatch.{term}.stratum_params[{index}]: "
+                            f"expected {target!r}, observed {params[index]!r}"
+                        )
+                        break
+                if params[-1] is not None:
+                    errors.append(
+                        f"{label}.dispatch.{term}.stratum_params[-1]: expected "
+                        f"frontier passthrough, observed {params[-1]!r}"
+                    )
+            if require_counts:
+                counts = term_telemetry.get("env_counts")
+                if not isinstance(counts, dict) or not required_stratum_keys.issubset(counts):
+                    errors.append(
+                        f"{label}.dispatch.{term}.env_counts: missing one or more focus strata"
+                    )
+        return len(errors) == before
+
+    reconcile_tace("tace", tace, require_counts=True)
+
+    instrumented_rows = [row for row in curriculum if isinstance(row.get("tace"), dict)]
+    if not instrumented_rows:
+        errors.append("curriculum: no rows contain TACE telemetry")
+    for index, row in enumerate(instrumented_rows):
+        before = len(errors)
+        exact(
+            f"curriculum TACE row {index}.lambda",
+            row.get("lambda"),
+            expected["fixed_lambda"],
+        )
+        if row.get("allow_extrapolation", False) is not expected["allow_extrapolation"]:
+            errors.append(
+                f"curriculum TACE row {index}.allow_extrapolation: expected "
+                f"{expected['allow_extrapolation']!r}, observed "
+                f"{row.get('allow_extrapolation', False)!r}"
+            )
+        if (row.get("physical_clamp") or []) != expected["physical_clamp"]:
+            errors.append(
+                f"curriculum TACE row {index}.physical_clamp: expected "
+                f"{expected['physical_clamp']!r}, observed {row.get('physical_clamp')!r}"
+            )
+        reconcile_tace(f"curriculum TACE row {index}.tace", row.get("tace"), require_counts=False)
+        if len(errors) != before:
+            break
+
+    return {"passed": not errors, "expected": expected, "errors": errors}
+
+
 TRAINING_METRICS = ("Mean rewards", "Mean length", "Mean entropy")
 QUALITY_METRICS = (
     "latent_p90",
@@ -257,14 +469,30 @@ def parse_args(argv=None):
         default=0.5,
         help="cap arms: ceiling on the actuation-latency channel's share of lambda",
     )
-    parser.add_argument("--margin-horizon", type=int, default=12,
-                        help="margin arms: prefix length K of each episode the margin is averaged over")
-    parser.add_argument("--margin-band-lo", type=float, default=1.10,
-                        help="margin arms: below this focus/yardstick ratio the dose rises")
-    parser.add_argument("--margin-band-hi", type=float, default=1.30,
-                        help="margin arms: above this ratio the dose falls; between, it holds")
-    parser.add_argument("--yardstick-envs", type=int, default=64,
-                        help="margin arms: environments held at lambda=0 as the self-reference")
+    parser.add_argument(
+        "--margin-horizon",
+        type=int,
+        default=12,
+        help="margin arms: prefix length K of each episode the margin is averaged over",
+    )
+    parser.add_argument(
+        "--margin-band-lo",
+        type=float,
+        default=1.10,
+        help="margin arms: below this focus/yardstick ratio the dose rises",
+    )
+    parser.add_argument(
+        "--margin-band-hi",
+        type=float,
+        default=1.30,
+        help="margin arms: above this ratio the dose falls; between, it holds",
+    )
+    parser.add_argument(
+        "--yardstick-envs",
+        type=int,
+        default=64,
+        help="margin arms: environments held at lambda=0 as the self-reference",
+    )
     parser.add_argument(
         "--return-relative-drop",
         type=float,
@@ -329,9 +557,7 @@ def parse_args(argv=None):
         default=LUCID_ROOT / "artifacts/curriculum_comparison",
     )
     parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
-    parser.add_argument(
-        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
-    )
+    parser.add_argument("--receipt-dir", type=Path, default=LUCID_ROOT / "manifests")
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
@@ -420,6 +646,39 @@ def build_command(
     strata = ARM_SPREAD_STRATA.get(mode, 1)
     guard = ARM_RETURN_GUARD.get(mode, "absolute")
     fixed_lambda_value = ARM_FIXED_LAMBDA.get(mode, 1.0)
+    if mode in EXPAND_ARMS:
+        contract = expand_arm_contract(mode, args.num_envs)
+        static_fields = {
+            "curriculum_mode": curriculum_mode,
+            "anchor_ratio": anchor_ratio,
+            "spread_strata": strata,
+            "fixed_lambda": fixed_lambda_value,
+            "top_fraction": ARM_TOP_FRACTION.get(mode),
+            "allow_extrapolation": mode in ARM_FIXED_LAMBDA,
+        }
+        expected_fields = {
+            "curriculum_mode": contract["curriculum_mode"],
+            "anchor_ratio": contract["anchor_ratio"],
+            "spread_strata": contract["spread_strata"],
+            "fixed_lambda": contract["fixed_lambda"],
+            "top_fraction": 0.75,
+            "allow_extrapolation": contract["allow_extrapolation"],
+        }
+        if static_fields != expected_fields:
+            raise SystemExit(
+                f"{mode} launcher contract drifted: expected {expected_fields}, "
+                f"observed {static_fields}"
+            )
+        if args.max_delay != contract["max_delay_steps"]:
+            raise SystemExit(
+                f"{mode} requires exactly --max-delay {contract['max_delay_steps']} "
+                f"for its frozen delay contract; observed {args.max_delay}"
+            )
+        if float(getattr(args, "consolidation_fraction", 0.0) or 0.0) != 0.0:
+            raise SystemExit(
+                f"{mode} pins its frontier mixture for the full run; "
+                "--consolidation-fraction must be 0"
+            )
     extrapolation = (
         ["++callbacks.lucid_curriculum.allow_extrapolation=true"]
         if mode in ARM_FIXED_LAMBDA
@@ -457,11 +716,7 @@ def build_command(
         if guard != "absolute"
         else []
     )
-    ratchet = (
-        ["++callbacks.lucid_curriculum.monotonic=true"]
-        if mode in RATCHET_ARMS
-        else []
-    )
+    ratchet = ["++callbacks.lucid_curriculum.monotonic=true"] if mode in RATCHET_ARMS else []
     origin = [] if getattr(args, "from_scratch", False) else [f"checkpoint={args.checkpoint}"]
     horizons = [
         f"++callbacks.practice_capsule.horizons.h{h:04d}={h}"
@@ -656,11 +911,15 @@ def main(argv=None) -> int:
     stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     experiment_id = f"curriculum_comparison_ne{args.num_envs}_{stamp}"
     modes = list(dict.fromkeys(args.modes))
-    source_receipt = json.loads(args.yoked_source_receipt.read_text()) if args.yoked_source_receipt else None
+    source_receipt = (
+        json.loads(args.yoked_source_receipt.read_text()) if args.yoked_source_receipt else None
+    )
     for mode in modes:
         source = ARMS[mode][2]
         if source is not None and source not in modes and source_receipt is None:
-            raise SystemExit(f"arm {mode!r} requires its source arm {source!r} in --modes or --yoked-source-receipt")
+            raise SystemExit(
+                f"arm {mode!r} requires its source arm {source!r} in --modes or --yoked-source-receipt"
+            )
     run_specs = []
     for seed_index, seed in enumerate(args.seeds):
         ordered = arm_order(modes, seed_index)
@@ -685,10 +944,18 @@ def main(argv=None) -> int:
                     return Path(arm["curriculum_path"])
             raise SystemExit(f"no {source!r} seed {source_seed} in {args.yoked_source_receipt}")
         source_branch = f"{experiment_id}_s{source_seed}_{source}"
-        return args.artifact_root / experiment_id / f"seed_{source_seed}" / source / f"curriculum_{source_branch}.jsonl"
+        return (
+            args.artifact_root
+            / experiment_id
+            / f"seed_{source_seed}"
+            / source
+            / f"curriculum_{source_branch}.jsonl"
+        )
 
     commands = {
-        branch_id: build_command(args, mode, seed, branch_id, artifact_dir, schedule_for(seed, mode))
+        branch_id: build_command(
+            args, mode, seed, branch_id, artifact_dir, schedule_for(seed, mode)
+        )
         for seed, mode, branch_id, artifact_dir in run_specs
     }
     for seed, mode, branch_id, _ in run_specs:
@@ -728,11 +995,7 @@ def main(argv=None) -> int:
                 ),
                 "return_guard_trips": sum(bool(row.get("guard_tripped")) for row in curriculum),
                 **(
-                    {
-                        "ratchet_bind_rows": sum(
-                            bool(row.get("latch_active")) for row in curriculum
-                        )
-                    }
+                    {"ratchet_bind_rows": sum(bool(row.get("latch_active")) for row in curriculum)}
                     if mode in RATCHET_ARMS
                     else {}
                 ),
@@ -740,11 +1003,25 @@ def main(argv=None) -> int:
                 "arm_spec": {
                     "curriculum_mode": ARMS[mode][0],
                     "anchor_ratio": ARMS[mode][1],
+                    "anchor_seed": (
+                        seed if ARMS[mode][1] > 0.0 or ARM_SPREAD_STRATA.get(mode, 1) > 1 else None
+                    ),
                     "yoked_source": ARMS[mode][2],
                     "yoked_cross_seed": mode in CROSS_SEED_ARMS,
                     "term_lambda_overrides": ARM_TERM_OVERRIDES.get(mode, {}),
                     "run_dir": _logging_directory(log_path),
                     "spread_strata": ARM_SPREAD_STRATA.get(mode, 1),
+                    "stratum_sizes": (
+                        expand_arm_contract(mode, args.num_envs)["stratum_sizes"]
+                        if mode in EXPAND_ARMS
+                        else None
+                    ),
+                    "stratum_lambdas": (
+                        expand_arm_contract(mode, args.num_envs)["stratum_lambdas"]
+                        if mode in EXPAND_ARMS
+                        else None
+                    ),
+                    "top_fraction": ARM_TOP_FRACTION.get(mode),
                     "return_guard": ARM_RETURN_GUARD.get(mode, "absolute"),
                     **({"monotonic": True} if mode in RATCHET_ARMS else {}),
                     "fixed_lambda": ARM_FIXED_LAMBDA.get(mode, 1.0),
@@ -754,13 +1031,18 @@ def main(argv=None) -> int:
                     ),
                     "signal": "margin" if mode in MARGIN_ARMS else "gap",
                     "margin": (
-                        {"horizon": args.margin_horizon, "band": [args.margin_band_lo, args.margin_band_hi],
-                         "yardstick_envs": args.yardstick_envs}
-                        if mode in MARGIN_ARMS else None
+                        {
+                            "horizon": args.margin_horizon,
+                            "band": [args.margin_band_lo, args.margin_band_hi],
+                            "yardstick_envs": args.yardstick_envs,
+                        }
+                        if mode in MARGIN_ARMS
+                        else None
                     ),
                     "term_lambda_caps": (
                         {"randomize_action_delay": args.latency_cap} if mode in CAP_ARMS else {}
                     ),
+                    "max_delay_steps": args.max_delay,
                     "yoked_schedule_path": str(schedule_for(seed, mode)) if ARMS[mode][2] else None,
                 },
                 "tace_final": curriculum[-1].get("tace") if curriculum else None,
@@ -770,26 +1052,29 @@ def main(argv=None) -> int:
                 "checkpoint_exported": checkpoint.is_file(),
             }
         )
+        if mode in EXPAND_ARMS:
+            arm["expand_contract"] = validate_expand_arm_contract(
+                mode,
+                arm,
+                curriculum,
+                num_envs=args.num_envs,
+                max_delay=args.max_delay,
+            )
         arms[branch_id] = arm
         runtime[branch_id]["log_path"] = str(log_path)
         runtime[branch_id]["observer_path"] = str(observer_path)
 
     mode_summary = aggregate(arms, modes)
     comparison = comparisons(mode_summary)
-    expected_terms = {
-        "add_joint_default_pos",
-        "base_com",
-        "physics_material",
-        "push_robot",
-        "randomize_action_delay",
-        "randomize_rigid_body_mass",
-    }
     mechanics_ok = all(
         runtime[branch_id]["exit_code"] == 0
         and arm["complete"]
         and arm["actuator_groups_swapped"] == 5
         and arm["checkpoint_exported"]
-        and set(arm["scalable_terms"]) == expected_terms
+        and set(arm["scalable_terms"]) == EXPECTED_SCALABLE_TERMS
+        and (
+            arm["mode"] not in EXPAND_ARMS or bool((arm.get("expand_contract") or {}).get("passed"))
+        )
         for branch_id, arm in arms.items()
     )
     lucid_arms = [arm for arm in arms.values() if ARMS[arm["mode"]][0] == "lucid"]
@@ -811,9 +1096,7 @@ def main(argv=None) -> int:
         "git_status_short": TP.git_status(),
         "launcher_sha256": source_sha256(),
         "config": {
-            "checkpoint": (
-                None if args.from_scratch else str(Path(args.checkpoint).resolve())
-            ),
+            "checkpoint": (None if args.from_scratch else str(Path(args.checkpoint).resolve())),
             "num_envs": args.num_envs,
             "iterations": args.iterations,
             "warmup_iterations": args.warmup_iterations,

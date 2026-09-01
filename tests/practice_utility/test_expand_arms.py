@@ -7,12 +7,13 @@ at the frontier, and both observed anti-gate collapses cut lambda at peak
 competence with zero guard trips.
 """
 
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from gear_sonic.research.practice_utility import tace as TACE
+from gear_sonic.research.practice_utility import dr_scaling as DS, tace as TACE
 from gear_sonic.research.practice_utility.dr_controller import (
     LucidDRController,
     PIConfig,
@@ -145,6 +146,7 @@ def test_fixed_u_is_an_in_envelope_mixture_with_a_fat_frontier():
     assert "++callbacks.lucid_curriculum.fixed_lambda=1.0" in cmd
     assert "++callbacks.lucid_curriculum.spread_strata=8" in cmd
     assert "++callbacks.lucid_curriculum.stratum_sizes=[37,37,37,37,36,36,36,768]" in cmd
+    assert "++callbacks.lucid_curriculum.anchor_seed=8600" in cmd
     assert not any("allow_extrapolation" in part for part in cmd)
 
 
@@ -163,14 +165,155 @@ def test_fixed_u150_refuses_an_undersized_delay_buffer():
         R.build_command(args(), "fixed_u150", 8600, "b", Path("/tmp/artifact"))
 
 
+@pytest.mark.parametrize(("mode", "max_delay"), (("fixed_u", 12), ("fixed_u150", 13)))
+def test_expand_arms_require_the_exact_protocol_delay_capacity(mode, max_delay):
+    a = args()
+    a.max_delay = max_delay
+    with pytest.raises(SystemExit, match="requires exactly --max-delay"):
+        R.build_command(a, mode, 8600, "b", Path("/tmp/artifact"))
+
+
 def test_consolidation_reaches_unanchored_arms_and_never_off():
     a = args()
     a.consolidation_fraction = 0.1
-    for mode in ("lucid_s4_rg", "fixed_u", "fixed"):
+    for mode in ("lucid_s4_rg", "fixed"):
         cmd = R.build_command(a, mode, 8600, "b", Path("/tmp/artifact"))
         assert "++callbacks.lucid_curriculum.consolidation_fraction=0.1" in cmd, mode
     cmd = R.build_command(a, "off", 8600, "b", Path("/tmp/artifact"))
     assert not any("consolidation_fraction" in part for part in cmd)
+
+
+def test_expand_arm_refuses_consolidation_that_would_replace_its_mixture():
+    a = args()
+    a.consolidation_fraction = 0.1
+    with pytest.raises(SystemExit, match="consolidation-fraction must be 0"):
+        R.build_command(a, "fixed_u", 8600, "b", Path("/tmp/artifact"))
+
+
+def _expand_evidence(mode):
+    contract = R.expand_arm_contract(mode, 1024)
+    stratum_keys = {f"focus_s{index}": 1 for index in range(8)}
+    baselines = {
+        "add_joint_default_pos": {"pos_distribution_params": [-0.01, 0.01]},
+        "base_com": {"com_range": {"x": [-0.025, 0.025], "y": [-0.05, 0.05]}},
+        "physics_material": {
+            "static_friction_range": [0.3, 1.6],
+            "dynamic_friction_range": [0.3, 1.2],
+            "restitution_range": [0.0, 0.5],
+        },
+        "push_robot": {"velocity_range": {"x": [-0.5, 0.5], "yaw": [-0.78, 0.78]}},
+        "randomize_action_delay": {"delay_range": [0, 8]},
+        "randomize_rigid_body_mass": {"mass_distribution_params": [0.8, 1.5]},
+    }
+    dispatch = {}
+    for term in contract["dispatch_terms"]:
+        baseline = baselines[term]
+        params = []
+        for dose in contract["stratum_lambdas"][:-1]:
+            value = DS.scaled_term_params(baseline, dose, contract["allow_extrapolation"])
+            if contract["allow_extrapolation"]:
+                value, _ = DS.clamp_params_physical(value)
+            params.append(value)
+        params.append(None)
+        dispatch[term] = {
+            "term": term,
+            "num_strata": 8,
+            "stratum_params": params,
+            "env_counts": stratum_keys,
+            "anchor_params": baseline,
+        }
+    tace = {
+        "num_anchor": 0,
+        "num_focus": 1024,
+        "anchor_ratio": 0.0,
+        "num_strata": 8,
+        "stratum_sizes": contract["stratum_sizes"],
+        "stratum_lambdas": contract["stratum_lambdas"],
+        "dispatch": dispatch,
+    }
+    arm = {
+        "seed": 8600,
+        "arm_spec": {
+            "curriculum_mode": "fixed",
+            "anchor_ratio": 0.0,
+            "anchor_seed": 8600,
+            "spread_strata": 8,
+            "stratum_sizes": contract["stratum_sizes"],
+            "stratum_lambdas": contract["stratum_lambdas"],
+            "top_fraction": 0.75,
+            "fixed_lambda": contract["fixed_lambda"],
+            "allow_extrapolation": contract["allow_extrapolation"],
+            "physical_clamp": contract["physical_clamp"],
+            "max_delay_steps": contract["max_delay_steps"],
+        },
+        "tace_final": tace,
+    }
+    row = {"lambda": contract["fixed_lambda"], "tace": tace}
+    if contract["allow_extrapolation"]:
+        row.update(
+            {
+                "allow_extrapolation": True,
+                "physical_clamp": contract["physical_clamp"],
+            }
+        )
+    return arm, [row], contract
+
+
+@pytest.mark.parametrize("mode", R.EXPAND_ARMS)
+def test_expand_contract_reconciles_anchorless_live_telemetry(mode):
+    arm, curriculum, contract = _expand_evidence(mode)
+    result = R.validate_expand_arm_contract(
+        mode,
+        arm,
+        curriculum,
+        num_envs=1024,
+        max_delay=contract["max_delay_steps"],
+    )
+    assert result["passed"], result["errors"]
+
+
+def test_expand_contract_rejects_missing_dispatcher_even_with_no_anchor_cohort():
+    arm, curriculum, contract = _expand_evidence("fixed_u")
+    del arm["tace_final"]["dispatch"]["physics_material"]
+    result = R.validate_expand_arm_contract(
+        "fixed_u", arm, curriculum, num_envs=1024, max_delay=contract["max_delay_steps"]
+    )
+    assert not result["passed"]
+    assert any("dispatch terms" in error for error in result["errors"])
+
+
+def test_expand_contract_reconciles_every_instrumented_curriculum_row():
+    arm, curriculum, contract = _expand_evidence("fixed_u150")
+    curriculum.append(copy.deepcopy(curriculum[0]))
+    curriculum[1]["tace"]["stratum_sizes"][-1] -= 1
+    result = R.validate_expand_arm_contract(
+        "fixed_u150", arm, curriculum, num_envs=1024, max_delay=contract["max_delay_steps"]
+    )
+    assert not result["passed"]
+    assert any("curriculum TACE row 1.tace.stratum_sizes" in error for error in result["errors"])
+
+
+def test_expand_contract_rejects_lambda_clamp_and_delay_drift():
+    arm, curriculum, contract = _expand_evidence("fixed_u150")
+    arm = copy.deepcopy(arm)
+    curriculum = copy.deepcopy(curriculum)
+    arm["tace_final"]["stratum_lambdas"][-1] = 1.0
+    arm["tace_final"]["dispatch"]["randomize_action_delay"]["stratum_params"][0]["delay_range"] = [
+        0.0,
+        1.0,
+    ]
+    arm["tace_final"]["dispatch"]["physics_material"]["stratum_params"][6][
+        "static_friction_range"
+    ] = [-1.0, 2.0]
+    curriculum[0]["physical_clamp"] = []
+    result = R.validate_expand_arm_contract(
+        "fixed_u150", arm, curriculum, num_envs=1024, max_delay=contract["max_delay_steps"]
+    )
+    assert not result["passed"]
+    assert any("stratum_lambdas" in error for error in result["errors"])
+    assert any("randomize_action_delay" in error for error in result["errors"])
+    assert any("physics_material" in error for error in result["errors"])
+    assert any("physical_clamp" in error for error in result["errors"])
 
 
 def test_ratchet_arm_is_named_opt_in_and_keeps_the_relative_guard():

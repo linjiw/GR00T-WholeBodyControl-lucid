@@ -17,6 +17,25 @@ def test_ratchet_arm_is_selectable_for_the_matched_ladder():
     assert "lucid_ratchet_rg" in R.MODES
 
 
+def test_expand_arms_are_selectable_for_the_matched_ladder():
+    assert "fixed_u" in R.MODES
+    assert "fixed_u150" in R.MODES
+
+
+def test_protocol_metadata_names_only_the_actual_requested_presets():
+    metadata = R.requested_preset_metadata(["phys_125", "lat_50ms"])
+    assert set(metadata) == {"phys_125", "lat_50ms"}
+    assert metadata["phys_125"] == {
+        "event_preset": "tracking/lucid_curriculum",
+        "non_latency_dr_scale": 1.25,
+        "fixed_latency_steps": 0,
+    }
+    assert metadata["lat_50ms"] == {
+        "event_preset": "tracking/lucid_eval_clean",
+        "fixed_latency_steps": 10,
+    }
+
+
 def test_command_is_frozen_matched_evaluation():
     command = R.build_command(
         args(),

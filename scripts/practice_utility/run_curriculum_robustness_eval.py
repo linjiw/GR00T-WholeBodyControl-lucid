@@ -4,29 +4,53 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 import statistics
 import sys
-from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from scripts.practice_utility import run_latency_ab as LA  # noqa: E402
-from scripts.practice_utility import run_throughput_probe as TP
-from gear_sonic.research.practice_utility.paths import LUCID_ROOT, relocate  # noqa: E402
+from gear_sonic.research.practice_utility.paths import (  # noqa: E402
+    LUCID_ROOT,
+    relocate,
+)
+from scripts.practice_utility import (  # noqa: E402
+    run_latency_ab as LA,
+    run_throughput_probe as TP,
+)
 
 MODES = (
-    "lucid", "fixed", "off", "origin", "fixed_nolat", "fixed_latonly",
-    "ta_lucid_25", "ta_lucid_50", "ta_yoked_25", "ta_yoked_50",
-    "ta_yoked_25x", "ta_yoked_50x",
-    "lucid_s4", "lucid_rg", "lucid_s4_rg", "ta_lucid_50_s4_rg",
-    "lucid_latcap_s4_rg", "ta_lucid_50_latcap_s4_rg",
-    "lucid_latonly_s4_rg", "ta_lucid_50_latonly_s4_rg",
-    "lucid_s4_rg_h6000", "lucid_margin_s4_rg", "lucid_ratchet_rg", "fixed_150",
+    "lucid",
+    "fixed",
+    "off",
+    "origin",
+    "fixed_nolat",
+    "fixed_latonly",
+    "ta_lucid_25",
+    "ta_lucid_50",
+    "ta_yoked_25",
+    "ta_yoked_50",
+    "ta_yoked_25x",
+    "ta_yoked_50x",
+    "lucid_s4",
+    "lucid_rg",
+    "lucid_s4_rg",
+    "ta_lucid_50_s4_rg",
+    "lucid_latcap_s4_rg",
+    "ta_lucid_50_latcap_s4_rg",
+    "lucid_latonly_s4_rg",
+    "ta_lucid_50_latonly_s4_rg",
+    "lucid_s4_rg_h6000",
+    "lucid_margin_s4_rg",
+    "lucid_ratchet_rg",
+    "fixed_150",
+    "fixed_u",
+    "fixed_u150",
 )
 #: Deployment-latency ladder: nominal physics on every other channel, with
 #: actuation latency pinned at a fixed level. The stock ``latency_60ms`` cell
@@ -81,6 +105,30 @@ PRESET_DR_SCALE = {
     "dr_125": 1.25,
     "dr_150": 1.5,
 }
+
+
+def requested_preset_metadata(presets: list[str]) -> dict[str, dict[str, Any]]:
+    """Describe exactly the preset overrides requested for this evaluation."""
+    metadata: dict[str, dict[str, Any]] = {}
+    for preset in presets:
+        if preset not in PRESETS:
+            raise ValueError(f"unsupported preset {preset!r}")
+        row: dict[str, Any] = {"event_preset": PRESETS[preset]}
+        if preset in PRESET_PHYSICS_ONLY:
+            row.update(
+                {
+                    "non_latency_dr_scale": PRESET_PHYSICS_ONLY[preset],
+                    "fixed_latency_steps": 0,
+                }
+            )
+        elif preset in PRESET_DR_SCALE:
+            row["non_latency_dr_scale"] = PRESET_DR_SCALE[preset]
+        elif preset in PRESET_FIXED_LATENCY_STEPS:
+            row["fixed_latency_steps"] = PRESET_FIXED_LATENCY_STEPS[preset]
+        metadata[preset] = row
+    return metadata
+
+
 CALLBACK = "gear_sonic.research.practice_utility.eval_callback.PracticeRobustnessEvalCallback"
 SUMMARY_METRICS = (
     "success_rate",
@@ -120,7 +168,10 @@ def parse_args(argv=None):
         help="defaults to the arms present in the training receipt",
     )
     parser.add_argument(
-        "--presets", nargs="+", choices=tuple(PRESETS), default=["id_clean", "dr_full", "latency_60ms"]
+        "--presets",
+        nargs="+",
+        choices=tuple(PRESETS),
+        default=["id_clean", "dr_full", "latency_60ms"],
     )
     parser.add_argument("--eval-seed-base", type=int, default=8700)
     parser.add_argument("--max-delay", type=int, default=12)
@@ -165,9 +216,7 @@ def parse_args(argv=None):
         default=LUCID_ROOT / "artifacts/curriculum_robustness_eval",
     )
     parser.add_argument("--log-dir", type=Path, default=LUCID_ROOT / "outputs")
-    parser.add_argument(
-        "--receipt-dir", type=Path, default=LUCID_ROOT / "manifests"
-    )
+    parser.add_argument("--receipt-dir", type=Path, default=LUCID_ROOT / "manifests")
     parser.add_argument("--min-free-mib", type=int, default=6000)
     parser.add_argument("--execute", action="store_true")
     return parser.parse_args(argv)
@@ -251,9 +300,7 @@ def panel_suite(panel_receipt: Path) -> dict[str, Any]:
     return {
         "motion_file": str(motion_dir.resolve()),
         "motion_count": len(present),
-        "motion_keys_sha256": hashlib.sha256(
-            ("\n".join(present) + "\n").encode()
-        ).hexdigest(),
+        "motion_keys_sha256": hashlib.sha256(("\n".join(present) + "\n").encode()).hexdigest(),
         "pool_sha256": panel.get("pool_sha256"),
         "split_sha256": panel.get("split_sha256"),
         "split_linkage": "replicate-panel",
@@ -346,14 +393,18 @@ def build_command(
                 "++callbacks.practice_eval.fixed_latency_steps=0",
             ]
             if preset in PRESET_PHYSICS_ONLY
-            else [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
-            if preset in PRESET_DR_SCALE
-            else [
-                "++callbacks.practice_eval.fixed_latency_steps="
-                f"{PRESET_FIXED_LATENCY_STEPS[preset]}"
-            ]
-            if preset in PRESET_FIXED_LATENCY_STEPS
-            else []
+            else (
+                [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
+                if preset in PRESET_DR_SCALE
+                else (
+                    [
+                        "++callbacks.practice_eval.fixed_latency_steps="
+                        f"{PRESET_FIXED_LATENCY_STEPS[preset]}"
+                    ]
+                    if preset in PRESET_FIXED_LATENCY_STEPS
+                    else []
+                )
+            )
         ),
     ]
 
@@ -475,8 +526,12 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
 def main(argv=None) -> int:
     args = parse_args(argv)
     training_receipt = load_json(args.training_receipt)
-    suite = panel_suite(args.panel_receipt) if args.panel_receipt else materialize_suite(
-        args.pool_manifest, args.split_manifest, args.partition, args.suite_root
+    suite = (
+        panel_suite(args.panel_receipt)
+        if args.panel_receipt
+        else materialize_suite(
+            args.pool_manifest, args.split_manifest, args.partition, args.suite_root
+        )
     )
     checkpoints = checkpoint_index(training_receipt)
     receipt_modes = list(dict.fromkeys(arm["mode"] for arm in training_receipt["arms"].values()))
@@ -560,14 +615,7 @@ def main(argv=None) -> int:
                     str(seed): args.eval_seed_base + index for index, seed in enumerate(args.seeds)
                 },
                 "modes": modes,
-                "presets": {
-                    "id_clean": "six channels collapsed to LUCID lambda=0 nominal",
-                    "dr_full": "fresh draws from the complete six-channel training envelope",
-                    "latency_60ms": (
-                        "full five non-latency DR channels plus fixed 60 ms latency, "
-                        "beyond the 0-40 ms train range"
-                    ),
-                },
+                "presets": requested_preset_metadata(presets),
                 "max_delay_capacity_steps": args.max_delay,
                 "physics_step_ms": 5,
                 "suite": suite,
