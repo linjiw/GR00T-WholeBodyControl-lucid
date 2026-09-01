@@ -379,8 +379,14 @@ def write_amendment(
 @pytest.fixture(scope="module")
 def bundle(tmp_path_factory):
     root = tmp_path_factory.mktemp("ratchet_historical_bridge")
+    source_clip = root / "synthetic_motion.pkl"
+    source_clip.write_bytes(b"synthetic motion bytes")
     panel_tree = root / "panel_motion_tree"
     panel_tree.mkdir()
+    alias_names = [f"synthetic_motion__alias_{index:04d}" for index in range(512)]
+    alias_hash = hashlib.sha256(("\n".join(sorted(alias_names)) + "\n").encode()).hexdigest()
+    for alias_name in alias_names:
+        (panel_tree / f"{alias_name}.pkl").symlink_to(source_clip)
     panel = root / "panel.json"
     panel.write_text(
         json.dumps(
@@ -388,10 +394,11 @@ def bundle(tmp_path_factory):
                 "kind": "lucid_replicate_panel",
                 "schema_version": 1,
                 "motion_key": "synthetic_motion",
-                "source_clip_sha256": "1" * 64,
+                "source_clip": str(source_clip),
+                "source_clip_sha256": file_sha(source_clip),
                 "replicates": 512,
                 "motion_file": str(panel_tree),
-                "alias_keys_sha256": R.EXPECTED_PANEL_ALIAS_SHA256,
+                "alias_keys_sha256": alias_hash,
                 "pool_sha256": "2" * 64,
                 "split_sha256": "3" * 64,
                 "partition": "adaptation",
@@ -404,7 +411,9 @@ def bundle(tmp_path_factory):
     )
     panel_hash = file_sha(panel)
     original_panel_hash = R.EXPECTED_PANEL_SHA256
+    original_alias_hash = R.EXPECTED_PANEL_ALIAS_SHA256
     R.EXPECTED_PANEL_SHA256 = panel_hash
+    R.EXPECTED_PANEL_ALIAS_SHA256 = alias_hash
     try:
         h_r2_evals = []
         h_r2_trainings = []
@@ -538,10 +547,13 @@ def bundle(tmp_path_factory):
             )
     finally:
         R.EXPECTED_PANEL_SHA256 = original_panel_hash
+        R.EXPECTED_PANEL_ALIAS_SHA256 = original_alias_hash
 
     return SimpleNamespace(
         root=root,
+        panel=panel,
         panel_hash=panel_hash,
+        alias_hash=alias_hash,
         h_r2=h_r2_path,
         amendment=amendment,
         amendment_hash=file_sha(amendment),
@@ -556,6 +568,7 @@ def bundle(tmp_path_factory):
 @pytest.fixture
 def exact_hashes(monkeypatch, bundle):
     monkeypatch.setattr(R, "EXPECTED_PANEL_SHA256", bundle.panel_hash)
+    monkeypatch.setattr(R, "EXPECTED_PANEL_ALIAS_SHA256", bundle.alias_hash)
     monkeypatch.setattr(A, "EXPECTED_H_R2_AMENDMENT_SHA256", bundle.amendment_hash)
     monkeypatch.setattr(
         A, "EXPECTED_LUCID_CHECKPOINT_SHA256", bundle.historical_hashes["checkpoint"]
@@ -756,6 +769,24 @@ class TestFailClosed:
                 paths,
                 bundle.historical_bridges,
             )
+
+    def test_rejects_same_bytes_foreign_live_alias_target(self, bundle, exact_hashes, tmp_path):
+        panel_record = json.loads(bundle.panel.read_text())
+        source = Path(panel_record["source_clip"])
+        foreign = tmp_path / source.name
+        foreign.write_bytes(source.read_bytes())
+        copied_tree = tmp_path / "retargeted_panel"
+        copied_tree.mkdir()
+        original_entries = sorted(Path(panel_record["motion_file"]).iterdir())
+        for index, entry in enumerate(original_entries):
+            target = foreign if index == 0 else source
+            (copied_tree / entry.name).symlink_to(target)
+        panel_record["motion_file"] = str(copied_tree)
+        copied_panel = tmp_path / "retargeted_panel.json"
+        copied_panel.write_text(json.dumps(panel_record, indent=2, sort_keys=True) + "\n")
+
+        with pytest.raises(ValueError, match="frozen source clip"):
+            A._audit_panel_identity(copied_panel)
 
     @pytest.mark.parametrize(
         ("field", "value", "message"),

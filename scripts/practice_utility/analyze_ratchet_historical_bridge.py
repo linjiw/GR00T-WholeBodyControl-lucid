@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -235,10 +236,45 @@ def _audit_panel_identity(panel_path: Path) -> dict[str, Any]:
     motion_file = _resolve_recorded_path(panel.get("motion_file"), panel_path)
     if not motion_file.is_dir():
         raise ValueError(f"replicate-panel motion tree is missing: {motion_file}")
+    source_clip = _resolve_recorded_path(panel.get("source_clip"), panel_path)
+    _require_file_hash(
+        source_clip,
+        str(panel["source_clip_sha256"]),
+        "replicate-panel source clip",
+    )
+    if source_clip.stem != panel["motion_key"]:
+        raise ValueError("replicate-panel source clip does not match motion_key")
+
+    # The receipt bytes alone do not freeze the mutable alias directory.  Bind
+    # the live tree to the exact 512-key instrument every time the analysis is
+    # replayed, including canonical target identity (not merely equal bytes).
+    entries = sorted(motion_file.iterdir())
+    if len(entries) != ratchet.EXPECTED_NUM_ENVS:
+        raise ValueError(
+            "replicate-panel live alias count differs: "
+            f"{len(entries)} != {ratchet.EXPECTED_NUM_ENVS}"
+        )
+    if any(
+        entry.suffix != ".pkl" or not entry.is_symlink() or not entry.is_file() for entry in entries
+    ):
+        raise ValueError("replicate-panel tree must contain only 512 live .pkl symlinks")
+    alias_keys = [entry.stem for entry in entries]
+    live_alias_sha = hashlib.sha256(("\n".join(alias_keys) + "\n").encode()).hexdigest()
+    if live_alias_sha != panel["alias_keys_sha256"]:
+        raise ValueError(
+            "replicate-panel live alias stem digest differs: "
+            f"{live_alias_sha} != {panel['alias_keys_sha256']}"
+        )
+    canonical_targets = {entry.resolve() for entry in entries}
+    if canonical_targets != {source_clip}:
+        raise ValueError(
+            "replicate-panel live aliases do not resolve only to the frozen source clip"
+        )
     return {
         "path": str(panel_path),
         "sha256": sha256(panel_path),
         "motion_file": str(motion_file),
+        "source_clip": str(source_clip),
         **{field: panel[field] for field in fields},
         "replicates": panel["replicates"],
         "alias_keys_sha256": panel["alias_keys_sha256"],
