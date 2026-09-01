@@ -710,13 +710,22 @@ def run_for_preset(receipt, preset):
     return next(run for run in receipt["runs"].values() if run["preset"] == preset)
 
 
-def passing_profiles(fixed150_nominal, fixedu_nominal, frontier_delta=0.0):
+def passing_profiles(fixed150_nominal, fixedu_nominal, frontier_delta=0.0, held_out_delta=None):
+    if held_out_delta is None:
+        held_out_delta = frontier_delta
     profiles = {
-        "fixed_150": {"success_rate": {"nominal_phys_000": fixed150_nominal, "frontier_auc": 0.75}},
+        "fixed_150": {
+            "success_rate": {
+                "nominal_phys_000": fixed150_nominal,
+                "frontier_auc": 0.75,
+                "held_out_auc": 0.70,
+            }
+        },
         "fixed_u150": {
             "success_rate": {
                 "nominal_phys_000": fixedu_nominal,
                 "frontier_auc": 0.75 + frontier_delta,
+                "held_out_auc": 0.70 + held_out_delta,
             }
         },
     }
@@ -724,14 +733,55 @@ def passing_profiles(fixed150_nominal, fixedu_nominal, frontier_delta=0.0):
     return profiles, candidates
 
 
+def synthetic_values(success=0.70, progress=0.80, **per_preset):
+    """Flat ``{(metric, preset): rate}`` table with optional ``preset=(success, progress)``."""
+    values = {}
+    for preset in A.EXPECTED_PRESETS:
+        pair = per_preset.get(preset, (success, progress))
+        values[("success_rate", preset)] = pair[0]
+        values[("progress_rate", preset)] = pair[1]
+    return values
+
+
+def candidate_profiles(role="fixed_150", **candidate_overrides):
+    fresh = A.profile(synthetic_values(), role="fresh_fixed")
+    candidate = A.profile(synthetic_values(**candidate_overrides), role=role)
+    return {"fresh_fixed": fresh, role: candidate}
+
+
 def test_complete_screen_is_raw_evidence_bound_and_screening_only(tmp_path):
     kwargs, _ = build_evidence(tmp_path)
     receipt = A.analyze(**kwargs)
     assert receipt["instrument_audit"]["passed"] is True
     assert receipt["instrument_audit"]["unique_cells"] == 60
+    assert receipt["schema_version"] == 2
     assert receipt["decision"]["status"] == "screen_pass"
     assert receipt["decision"]["selected"] == "fixed_u150"
+    assert receipt["decision"]["primary_endpoint"] == "held_out_auc"
+    assert receipt["decision"]["void_candidates"] == []
     assert receipt["decision"]["screening_only"] is True
+    # fixed_150 gains 0.035 everywhere: clears the retired 0.02 frontier bar, fails the 0.05 one.
+    fixed150 = receipt["candidate_screens"]["fixed_150"]
+    assert fixed150["passed"] is False
+    assert fixed150["binding_checks"]["held_out_success_gain"] is False
+    assert fixed150["contaminated_checks_report_only"]["frontier_success_gain"] is True
+    assert "frontier_success_gain" not in fixed150["binding_checks"]
+    assert "H_X1_mean_hard_success_gain" not in fixed150["binding_checks"]
+    assert receipt["candidate_screens"]["fixed_u150"]["passed"] is True
+    assert receipt["decision"]["reason"] == "only_passing_candidate"
+    assert receipt["frozen_contract"]["frontier_grid_status"] == "contaminated_report_only"
+    assert receipt["frozen_contract"]["primary_endpoint"]["held_out_grid"] == {
+        "phys_175": 1.75,
+        "phys_200": 2.0,
+    }
+    labels = receipt["frozen_contract"]["secondary_b_in_support_manipulation_check"]["labels"]
+    assert labels["fixed_150"] == {"phys_125": "IN-SUPPORT", "phys_150": "IN-SUPPORT"}
+    assert labels["fresh_fixed"] == {"phys_125": "OUT-OF-SUPPORT", "phys_150": "OUT-OF-SUPPORT"}
+    for role in A.EVALUATION_ROLES:
+        assert receipt["profiles"][role]["in_support_frontier_labels"] == A.support_labels(role)
+        assert receipt["profiles"][role]["success_rate"]["frontier_auc_status"] == (
+            "contaminated_report_only"
+        )
     assert receipt["decision"]["superiority_claim_authorized"] is False
     assert receipt["inputs"]["training_receipts"]["fixed_u150"]["curriculum"]["tace_rows"] == 10
     assert receipt["instrument_audit"]["cross_role_live_dr"]["passed"] is True
@@ -785,12 +835,186 @@ def test_preference_accepts_direct_phys000_gain_over_one_point():
     profiles, candidates = passing_profiles(0.920, 0.935)
     decision = A.select_candidate(profiles, candidates)
     assert decision["selected"] == "fixed_u150"
-    assert decision["reason"] == "fixed_u150_phys_000_gain_gt_0.01_with_frontier_within_0.02"
+    assert decision["reason"] == "fixed_u150_phys_000_gain_gt_0.01_with_held_out_within_0.02"
 
 
 def test_preference_frontier_within_exact_boundary_passes():
     profiles, candidates = passing_profiles(0.92, 0.935, frontier_delta=-0.02)
     assert A.select_candidate(profiles, candidates)["selected"] == "fixed_u150"
+
+
+def test_preference_is_decided_on_held_out_band_not_contaminated_frontier():
+    profiles, candidates = passing_profiles(0.95, 0.95, frontier_delta=0.10, held_out_delta=0.0)
+    decision = A.select_candidate(profiles, candidates)
+    assert decision["selected"] == "fixed_150"
+    assert decision["reason"] == "default_preference_for_pure_support_extension"
+    evidence = decision["preference_evidence"]
+    assert evidence["fixed_u150_minus_fixed_150_frontier_success_auc"] == pytest.approx(0.10)
+    assert evidence["fixed_u150_minus_fixed_150_held_out_success_auc"] == pytest.approx(0.0)
+    assert evidence["frontier_status"] == "contaminated_report_only"
+
+    profiles, candidates = passing_profiles(0.95, 0.95, frontier_delta=0.0, held_out_delta=0.03)
+    decision = A.select_candidate(profiles, candidates)
+    assert decision["selected"] == "fixed_u150"
+    assert decision["reason"] == "fixed_u150_held_out_success_advantage_gt_0.02"
+
+
+def test_held_out_grid_weights_and_threshold_are_frozen():
+    assert A.HELD_OUT_GRID == (("phys_175", 1.75), ("phys_200", 2.0))
+    assert A.HELD_OUT_WEIGHTS == (0.5, 0.5)
+    assert A.trapezoid_weights(A.HELD_OUT_GRID) == pytest.approx([0.5, 0.5])
+    assert A.IN_SUPPORT_FRONTIER == ("phys_125", "phys_150")
+    assert A.CANDIDATE_HELD_OUT_SUCCESS_GAIN == 0.05
+    assert A.CANDIDATE_HELD_OUT_PROGRESS_FLOOR == -0.02
+    assert A.CANDIDATE_IN_ENVELOPE_FLOOR == -0.01
+    # SECONDARY_A weights are exactly the in-envelope trapezoid weights.
+    assert A.trapezoid_weights(A.IN_ENVELOPE_GRID) == pytest.approx(A.SAME_SUPPORT_WEIGHTS)
+    # The retired frontier endpoint put exactly half its weight on the IN-SUPPORT cells.
+    frontier = dict(
+        zip([preset for preset, _ in A.FRONTIER_GRID], A.trapezoid_weights(A.FRONTIER_GRID))
+    )
+    assert frontier == pytest.approx(
+        {"phys_125": 1 / 6, "phys_150": 1 / 3, "phys_175": 1 / 3, "phys_200": 1 / 6}
+    )
+    assert sum(frontier[preset] for preset in A.IN_SUPPORT_FRONTIER) == pytest.approx(0.5)
+
+
+def test_profile_held_out_auc_uses_only_phys_175_and_phys_200():
+    base = synthetic_values(phys_175=(0.60, 0.70), phys_200=(0.80, 0.90))
+    result = A.profile(base)
+    assert result["success_rate"]["held_out_auc"] == pytest.approx(0.70)
+    assert result["progress_rate"]["held_out_auc"] == pytest.approx(0.80)
+    assert result["success_rate"]["held_out_cells"] == {"phys_175": 0.60, "phys_200": 0.80}
+    assert result["success_rate"]["frontier_auc_status"] == "contaminated_report_only"
+    assert "role" not in result
+
+    # Moving the IN-SUPPORT cells changes the contaminated frontier AUC but not the primary.
+    shifted = A.profile(
+        synthetic_values(
+            phys_125=(1.0, 1.0), phys_150=(1.0, 1.0), phys_175=(0.60, 0.70), phys_200=(0.80, 0.90)
+        )
+    )
+    assert shifted["success_rate"]["held_out_auc"] == pytest.approx(0.70)
+    assert shifted["success_rate"]["frontier_auc"] > result["success_rate"]["frontier_auc"]
+    assert shifted["success_rate"]["in_support_frontier_cells"] == {
+        "phys_125": 1.0,
+        "phys_150": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "gain, expected",
+    [(0.049, False), (0.05, True), (0.02, False), (0.10, True)],
+)
+def test_primary_gate_requires_0_05_on_held_out_band(gain, expected):
+    profiles = candidate_profiles(
+        phys_150=(0.75, 0.80), phys_175=(0.70 + gain, 0.80), phys_200=(0.70 + gain, 0.80)
+    )
+    decision = A.candidate_decision("fixed_150", profiles)
+    assert decision["candidate_minus_fresh_fixed"]["held_out_success_auc"] == pytest.approx(gain)
+    assert decision["binding_checks"]["held_out_success_gain"] is expected
+    assert decision["binding_checks"]["held_out_progress_noninferiority"] is True
+    assert decision["void"] is False
+    assert decision["passed"] is expected
+    assert set(decision["binding_checks"]) == {
+        "held_out_success_gain",
+        "held_out_progress_noninferiority",
+        "in_envelope_success_noninferiority",
+        "in_envelope_progress_noninferiority",
+    }
+
+
+def test_held_out_progress_companion_noninferiority_gates():
+    profiles = candidate_profiles(
+        phys_150=(0.75, 0.80), phys_175=(0.80, 0.77), phys_200=(0.80, 0.77)
+    )
+    decision = A.candidate_decision("fixed_150", profiles)
+    assert decision["binding_checks"]["held_out_success_gain"] is True
+    assert decision["binding_checks"]["held_out_progress_noninferiority"] is False
+    assert decision["passed"] is False
+
+
+def test_candidate_winning_only_on_in_support_cells_does_not_pass():
+    profiles = candidate_profiles(phys_125=(1.0, 1.0), phys_150=(1.0, 1.0))
+    decision = A.candidate_decision("fixed_150", profiles)
+    deltas = decision["candidate_minus_fresh_fixed"]
+    assert deltas["held_out_success_auc"] == pytest.approx(0.0)
+    assert deltas["frontier_success_auc"] == pytest.approx(0.30 / 6 + 0.30 / 3)
+    assert deltas["mean_hard_success"] == pytest.approx(0.10)
+    # The retired checks would have passed this arm; they are reported but no longer gate.
+    report = decision["contaminated_checks_report_only"]
+    assert report["frontier_success_gain"] is True
+    assert report["H_X1_mean_hard_success_gain"] is True
+    assert report["H_X1_held_out_variant_pending_tier2_signoff"] is False
+    assert decision["binding_checks"]["held_out_success_gain"] is False
+    assert decision["void"] is False
+    assert decision["passed"] is False
+    cells = decision["in_support_frontier_cells_report_only"]
+    assert cells["phys_150"]["candidate_minus_fresh_fixed_success"] == pytest.approx(0.30)
+    assert cells["phys_150"]["label"] == {
+        "fixed_150": "IN-SUPPORT",
+        "fresh_fixed": "OUT-OF-SUPPORT",
+    }
+
+
+@pytest.mark.parametrize("role", ["fixed_150", "fixed_u150"])
+def test_manipulation_check_voids_arm_that_does_not_beat_fixed_at_phys_150(role):
+    # Big held-out win, but phys_150 (its own training marginal) only ties fresh_fixed.
+    profiles = candidate_profiles(role, phys_175=(0.85, 0.90), phys_200=(0.85, 0.90))
+    decision = A.candidate_decision(role, profiles)
+    assert decision["binding_checks"]["held_out_success_gain"] is True
+    assert all(decision["binding_checks"].values())
+    assert decision["manipulation_check"]["cell"] == "phys_150"
+    assert decision["manipulation_check"]["candidate_beats_fresh_fixed"] is False
+    assert decision["manipulation_check"]["use"] == "floor_not_result"
+    assert decision["manipulation_check"]["cell_label"] == {
+        role: "IN-SUPPORT",
+        "fresh_fixed": "OUT-OF-SUPPORT",
+    }
+    assert decision["void"] is True
+    assert decision["void_reason"] == "fixed_150_family_did_not_beat_fixed_at_phys_150"
+    assert decision["passed"] is False
+
+    # Strictly beating fixed at phys_150 lifts the void; it is a floor, not a gate contribution.
+    lifted = A.candidate_decision(
+        role,
+        candidate_profiles(
+            role, phys_150=(0.701, 0.80), phys_175=(0.85, 0.90), phys_200=(0.85, 0.90)
+        ),
+    )
+    assert lifted["void"] is False
+    assert lifted["void_reason"] is None
+    assert lifted["passed"] is True
+    assert lifted["binding_checks"] == decision["binding_checks"]
+
+
+def test_support_labels_follow_training_lambda_per_role():
+    in_support = {"phys_125": "IN-SUPPORT", "phys_150": "IN-SUPPORT"}
+    out_of_support = {"phys_125": "OUT-OF-SUPPORT", "phys_150": "OUT-OF-SUPPORT"}
+    assert A.support_labels("fixed_150") == in_support
+    assert A.support_labels("fixed_u150") == in_support
+    assert A.support_labels("fresh_fixed") == out_of_support
+    assert A.support_labels("historical_fixed") == out_of_support
+    with pytest.raises(ValueError):
+        A.support_labels("mix_150")
+    labelled = A.profile(synthetic_values(), role="fixed_u150")
+    assert labelled["role"] == "fixed_u150"
+    assert labelled["training_lambda"] == 1.5
+    assert labelled["in_support_frontier_labels"] == in_support
+
+
+def test_void_arm_is_excluded_end_to_end(tmp_path):
+    kwargs, _ = build_evidence(
+        tmp_path, {"fixed_u150": {"overrides": {"phys_150": {"success_rate": 0.70}}}}
+    )
+    receipt = A.analyze(**kwargs)
+    fixedu = receipt["candidate_screens"]["fixed_u150"]
+    assert fixedu["binding_checks"]["held_out_success_gain"] is True
+    assert fixedu["void"] is True
+    assert fixedu["passed"] is False
+    assert receipt["decision"]["void_candidates"] == ["fixed_u150"]
+    assert receipt["decision"]["status"] == "screen_fail"
+    assert receipt["decision"]["selected"] is None
 
 
 def test_failed_historical_bridge_blocks_selection(tmp_path):

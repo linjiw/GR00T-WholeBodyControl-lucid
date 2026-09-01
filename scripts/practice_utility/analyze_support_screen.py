@@ -10,6 +10,18 @@ merged by mode name.
 The result is deliberately screening-grade.  Passing a frozen threshold can
 select a candidate for confirmation; it cannot authorize a directional or
 superiority claim from one training seed.
+
+Endpoint contamination (frozen grid-v2 preregistration, 2026-09-01): for any arm
+trained at lambda=1.5 the ``phys_125`` and ``phys_150`` evaluation boxes are
+subsets of that arm's own training box (``phys_150`` is bit-for-bit its training
+marginal with latency pinned to zero).  Those two cells carry exactly half of the
+historical 4-cell frontier-AUC trapezoid weight, so the frontier AUC is now
+REPORTED for comparability with past receipts but never gates a decision.  The
+primary gated endpoint is the held-out band ``HELD_OUT_GRID`` (phys_175/phys_200,
+equal weights) with a 0.05 success-rate threshold; phys_125/phys_150 are labelled
+IN-SUPPORT for fixed_150/fixed_u150 and OUT-OF-SUPPORT for fixed wherever they
+appear, and their only directional use is the fixed_150-vs-fixed phys_150
+manipulation floor.
 """
 
 from __future__ import annotations
@@ -65,6 +77,26 @@ FRONTIER_GRID = (
     ("phys_175", 1.75),
     ("phys_200", 2.00),
 )
+# Frozen grid-v2 preregistration (2026-09-01) contamination split.  FRONTIER_GRID above is the
+# historical, CONTAMINATED endpoint: phys_125/phys_150 sit inside the lambda=1.5 training box
+# and carry 50% of its trapezoid weight.  It is computed and reported, never gated.
+HELD_OUT_GRID = (
+    ("phys_175", 1.75),
+    ("phys_200", 2.00),
+)
+HELD_OUT_WEIGHTS = (0.5, 0.5)
+IN_SUPPORT_FRONTIER = ("phys_125", "phys_150")
+SAME_SUPPORT_WEIGHTS = (0.125, 0.25, 0.25, 0.25, 0.125)
+MANIPULATION_CHECK_PRESET = "phys_150"
+FRONTIER_GRID_STATUS = "contaminated_report_only"
+ROLE_TRAINING_LAMBDA = {
+    "historical_fixed": 1.0,
+    "fresh_fixed": 1.0,
+    "fixed_150": 1.5,
+    "fixed_u150": 1.5,
+}
+IN_SUPPORT_LABEL = "IN-SUPPORT"
+OUT_OF_SUPPORT_LABEL = "OUT-OF-SUPPORT"
 LATENCY_STEPS = {
     "lat_10ms": 2,
     "lat_20ms": 4,
@@ -77,6 +109,10 @@ PHYSICS_LEVELS = dict((*IN_ENVELOPE_GRID, *FRONTIER_GRID))
 EXPECTED_PRESETS = tuple(PHYSICS_LEVELS) + tuple(LATENCY_STEPS)
 METRICS = ("success_rate", "progress_rate")
 HARD_SUCCESS_PRESETS = ("phys_150", "phys_175", "phys_200")
+# H_X1 as originally named averages phys_150 (IN-SUPPORT at lambda=1.5).  It is kept at its
+# original definition and REPORTED ONLY; a held-out-only variant is also reported.  Neither
+# gates: redefining the named hypothesis requires Tier-2 preregistration sign-off.
+HARD_SUCCESS_PRESETS_HELD_OUT = tuple(preset for preset, _ in HELD_OUT_GRID)
 
 EXPECTED_STRATUM_SIZES = [37, 37, 37, 37, 36, 36, 36, 768]
 EXPECTED_STRATUM_LAMBDAS = [0.1875, 0.375, 0.5625, 0.75, 0.9375, 1.125, 1.3125, 1.5]
@@ -110,8 +146,17 @@ REQUIRED_FROZEN_INPUTS = {
 BRIDGE_FRONTIER_TOLERANCE = 0.02
 BRIDGE_IN_ENVELOPE_TOLERANCE = 0.01
 BRIDGE_LAT50_TOLERANCE = 0.02
+# PRIMARY (gated): held-out band success_rate, candidate minus fresh_fixed.  The 0.02 threshold
+# written for the contaminated frontier AUC must NOT be carried across: the identical-exposure
+# noise cluster has SD 0.0221 on this band, so 0.05 is ~2.3 SD.
+CANDIDATE_HELD_OUT_SUCCESS_GAIN = 0.05
+CANDIDATE_HELD_OUT_PROGRESS_FLOOR = -0.02
+# Historical contaminated-frontier thresholds, retained so past receipts stay comparable.
+# They are computed and reported; they no longer gate.
 CANDIDATE_FRONTIER_SUCCESS_GAIN = 0.02
 CANDIDATE_FRONTIER_PROGRESS_FLOOR = -0.02
+# SECONDARY_A same-support safety (phys_000..phys_100, trapezoid weights == SAME_SUPPORT_WEIGHTS),
+# one-sided floor.  The only genuinely same-support comparison; a pass is weak evidence.
 CANDIDATE_IN_ENVELOPE_FLOOR = -0.01
 H_X1_HARD_SUCCESS_GAIN = 0.03
 LAT60_REPORTED_GAIN = 0.05
@@ -1603,12 +1648,59 @@ def normalized_auc(
     return area / width
 
 
-def profile(values: Mapping[tuple[str, str], float]) -> dict[str, Any]:
+def trapezoid_weights(grid: Sequence[tuple[str, float]]) -> tuple[float, ...]:
+    """Per-cell weights implied by ``normalized_auc`` on ``grid`` (they sum to one)."""
+    xs = [x for _, x in grid]
+    width = xs[-1] - xs[0]
+    _require(width > 0.0, "AUC grid has no width")
+    weights = [0.0] * len(xs)
+    for index in range(len(xs) - 1):
+        half = (xs[index + 1] - xs[index]) / 2.0 / width
+        weights[index] += half
+        weights[index + 1] += half
+    return tuple(weights)
+
+
+def weighted_endpoint(
+    values: Mapping[tuple[str, str], float],
+    metric: str,
+    grid: Sequence[tuple[str, float]],
+    weights: Sequence[float],
+) -> float:
+    _require(len(grid) == len(weights), "endpoint grid and weights differ in length")
+    _require(abs(sum(weights) - 1.0) <= FLOAT_TOLERANCE, "endpoint weights do not sum to one")
+    return sum(float(values[(metric, preset)]) * w for (preset, _), w in zip(grid, weights))
+
+
+def support_labels(role: str) -> dict[str, str]:
+    """IN-SUPPORT / OUT-OF-SUPPORT label of each phys_125/phys_150 cell for ``role``."""
+    _require(role in ROLE_TRAINING_LAMBDA, f"unknown role {role!r} for support labelling")
+    training_lambda = ROLE_TRAINING_LAMBDA[role]
+    return {
+        preset: (
+            IN_SUPPORT_LABEL
+            if PHYSICS_LEVELS[preset] <= training_lambda + FLOAT_TOLERANCE
+            else OUT_OF_SUPPORT_LABEL
+        )
+        for preset in IN_SUPPORT_FRONTIER
+    }
+
+
+def profile(values: Mapping[tuple[str, str], float], role: str | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for metric in METRICS:
         result[metric] = {
             "in_envelope_auc": normalized_auc(values, metric, IN_ENVELOPE_GRID),
+            # Contaminated 4-cell frontier AUC: reported for comparability, never gated.
             "frontier_auc": normalized_auc(values, metric, FRONTIER_GRID),
+            "frontier_auc_status": FRONTIER_GRID_STATUS,
+            # PRIMARY endpoint: held-out band, strictly above every arm's training support.
+            "held_out_auc": weighted_endpoint(values, metric, HELD_OUT_GRID, HELD_OUT_WEIGHTS),
+            "held_out_cells": {preset: values[(metric, preset)] for preset, _ in HELD_OUT_GRID},
+            # SECONDARY_B cells: report only, never gate.
+            "in_support_frontier_cells": {
+                preset: values[(metric, preset)] for preset in IN_SUPPORT_FRONTIER
+            },
             "nominal_phys_000": values[(metric, "phys_000")],
             "lat_50ms": values[(metric, "lat_50ms")],
             "lat_60ms": values[(metric, "lat_60ms")],
@@ -1616,6 +1708,13 @@ def profile(values: Mapping[tuple[str, str], float]) -> dict[str, Any]:
     result["mean_hard_success"] = sum(
         values[("success_rate", preset)] for preset in HARD_SUCCESS_PRESETS
     ) / len(HARD_SUCCESS_PRESETS)
+    result["mean_hard_success_held_out"] = sum(
+        values[("success_rate", preset)] for preset in HARD_SUCCESS_PRESETS_HELD_OUT
+    ) / len(HARD_SUCCESS_PRESETS_HELD_OUT)
+    if role is not None:
+        result["role"] = role
+        result["training_lambda"] = ROLE_TRAINING_LAMBDA[role]
+        result["in_support_frontier_labels"] = support_labels(role)
     return result
 
 
@@ -1634,6 +1733,9 @@ def bridge_decision(profiles: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]
         "in_envelope_success_auc": _delta(fresh, historical, "success_rate", "in_envelope_auc"),
         "in_envelope_progress_auc": _delta(fresh, historical, "progress_rate", "in_envelope_auc"),
         "lat_50ms_success": _delta(fresh, historical, "success_rate", "lat_50ms"),
+        # Reported only: both bridge arms are lambda=1, so the tolerances above are unchanged.
+        "held_out_success_auc": _delta(fresh, historical, "success_rate", "held_out_auc"),
+        "held_out_progress_auc": _delta(fresh, historical, "progress_rate", "held_out_auc"),
     }
     limits = {
         "frontier_success_auc": BRIDGE_FRONTIER_TOLERANCE,
@@ -1651,37 +1753,110 @@ def bridge_decision(profiles: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]
     }
 
 
+def manipulation_check(role: str, profiles: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """SECONDARY_B one-directional floor: the candidate must beat fresh_fixed at phys_150.
+
+    phys_150 is bit-for-bit the lambda=1.5 arm's own training marginal with latency pinned to
+    zero.  Failing to beat the lambda=1 control there means the manipulation did not take and
+    the arm is void.  Passing is a floor, not a result, and never contributes to a gate.
+    """
+    preset = MANIPULATION_CHECK_PRESET
+    candidate_success = float(profiles[role]["success_rate"]["in_support_frontier_cells"][preset])
+    fresh_success = float(
+        profiles["fresh_fixed"]["success_rate"]["in_support_frontier_cells"][preset]
+    )
+    beats = candidate_success > fresh_success + FLOAT_TOLERANCE
+    return {
+        "cell": preset,
+        "cell_label": {
+            role: support_labels(role)[preset],
+            "fresh_fixed": support_labels("fresh_fixed")[preset],
+        },
+        "candidate_success": candidate_success,
+        "fresh_fixed_success": fresh_success,
+        "candidate_minus_fresh_fixed": candidate_success - fresh_success,
+        "candidate_beats_fresh_fixed": beats,
+        "void": not beats,
+        "use": "floor_not_result",
+    }
+
+
 def candidate_decision(role: str, profiles: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     candidate = profiles[role]
     fresh = profiles["fresh_fixed"]
     deltas = {
+        # Contaminated endpoints (phys_125/phys_150 IN-SUPPORT for the candidate): report only.
         "frontier_success_auc": _delta(candidate, fresh, "success_rate", "frontier_auc"),
         "frontier_progress_auc": _delta(candidate, fresh, "progress_rate", "frontier_auc"),
+        # PRIMARY held-out band.
+        "held_out_success_auc": _delta(candidate, fresh, "success_rate", "held_out_auc"),
+        "held_out_progress_auc": _delta(candidate, fresh, "progress_rate", "held_out_auc"),
+        # SECONDARY_A same-support safety.
         "in_envelope_success_auc": _delta(candidate, fresh, "success_rate", "in_envelope_auc"),
         "in_envelope_progress_auc": _delta(candidate, fresh, "progress_rate", "in_envelope_auc"),
         "mean_hard_success": float(candidate["mean_hard_success"])
         - float(fresh["mean_hard_success"]),
+        "mean_hard_success_held_out": float(candidate["mean_hard_success_held_out"])
+        - float(fresh["mean_hard_success_held_out"]),
         "lat_60ms_success": _delta(candidate, fresh, "success_rate", "lat_60ms"),
     }
+    in_support_cells = {
+        preset: {
+            "label": {
+                role: support_labels(role)[preset],
+                "fresh_fixed": support_labels("fresh_fixed")[preset],
+            },
+            "candidate_success": float(
+                candidate["success_rate"]["in_support_frontier_cells"][preset]
+            ),
+            "fresh_fixed_success": float(
+                fresh["success_rate"]["in_support_frontier_cells"][preset]
+            ),
+            "candidate_minus_fresh_fixed_success": float(
+                candidate["success_rate"]["in_support_frontier_cells"][preset]
+            )
+            - float(fresh["success_rate"]["in_support_frontier_cells"][preset]),
+        }
+        for preset in IN_SUPPORT_FRONTIER
+    }
     checks = {
-        "frontier_success_gain": deltas["frontier_success_auc"] + FLOAT_TOLERANCE
-        >= CANDIDATE_FRONTIER_SUCCESS_GAIN,
-        "frontier_progress_noninferiority": deltas["frontier_progress_auc"] + FLOAT_TOLERANCE
-        >= CANDIDATE_FRONTIER_PROGRESS_FLOOR,
+        "held_out_success_gain": deltas["held_out_success_auc"] + FLOAT_TOLERANCE
+        >= CANDIDATE_HELD_OUT_SUCCESS_GAIN,
+        "held_out_progress_noninferiority": deltas["held_out_progress_auc"] + FLOAT_TOLERANCE
+        >= CANDIDATE_HELD_OUT_PROGRESS_FLOOR,
         "in_envelope_success_noninferiority": deltas["in_envelope_success_auc"] + FLOAT_TOLERANCE
         >= CANDIDATE_IN_ENVELOPE_FLOOR,
         "in_envelope_progress_noninferiority": deltas["in_envelope_progress_auc"] + FLOAT_TOLERANCE
         >= CANDIDATE_IN_ENVELOPE_FLOOR,
+    }
+    # Historical checks at their original definitions and thresholds, so past receipts remain
+    # comparable.  They are contaminated by phys_125/phys_150 and never gate.
+    report_only = {
+        "frontier_success_gain": deltas["frontier_success_auc"] + FLOAT_TOLERANCE
+        >= CANDIDATE_FRONTIER_SUCCESS_GAIN,
+        "frontier_progress_noninferiority": deltas["frontier_progress_auc"] + FLOAT_TOLERANCE
+        >= CANDIDATE_FRONTIER_PROGRESS_FLOOR,
         "H_X1_mean_hard_success_gain": deltas["mean_hard_success"] + FLOAT_TOLERANCE
         >= H_X1_HARD_SUCCESS_GAIN,
+        "H_X1_held_out_variant_pending_tier2_signoff": deltas["mean_hard_success_held_out"]
+        + FLOAT_TOLERANCE
+        >= H_X1_HARD_SUCCESS_GAIN,
     }
+    manipulation = manipulation_check(role, profiles)
     return {
         "candidate": role,
         "candidate_minus_fresh_fixed": deltas,
         "binding_checks": checks,
+        "contaminated_checks_report_only": report_only,
+        "in_support_frontier_cells_report_only": in_support_cells,
+        "manipulation_check": manipulation,
+        "void": manipulation["void"],
+        "void_reason": (
+            "fixed_150_family_did_not_beat_fixed_at_phys_150" if manipulation["void"] else None
+        ),
         "lat_60ms_plus_0.05_nonbinding": deltas["lat_60ms_success"] + FLOAT_TOLERANCE
         >= LAT60_REPORTED_GAIN,
-        "passed": all(checks.values()),
+        "passed": all(checks.values()) and not manipulation["void"],
     }
 
 
@@ -1698,24 +1873,32 @@ def select_candidate(
             "passing_candidates": passing,
         }
 
+    # Preference is decided on the held-out band; the contaminated frontier delta is reported.
+    held_out_delta = _delta(
+        profiles["fixed_u150"], profiles["fixed_150"], "success_rate", "held_out_auc"
+    )
     frontier_delta = _delta(
         profiles["fixed_u150"], profiles["fixed_150"], "success_rate", "frontier_auc"
     )
     nominal_recovery = _delta(
         profiles["fixed_u150"], profiles["fixed_150"], "success_rate", "nominal_phys_000"
     )
+    fixedu_held_out_within = held_out_delta + FLOAT_TOLERANCE >= -PREFERENCE_FRONTIER_GAIN
     fixedu_frontier_within = frontier_delta + FLOAT_TOLERANCE >= -PREFERENCE_FRONTIER_GAIN
     preference_evidence = {
-        "fixed_u150_minus_fixed_150_frontier_success_auc": frontier_delta,
+        "fixed_u150_minus_fixed_150_held_out_success_auc": held_out_delta,
+        "fixed_u150_held_out_within_0.02": fixedu_held_out_within,
         "fixed_u150_minus_fixed_150_phys_000_success": nominal_recovery,
+        "fixed_u150_minus_fixed_150_frontier_success_auc": frontier_delta,
         "fixed_u150_frontier_within_0.02": fixedu_frontier_within,
+        "frontier_status": FRONTIER_GRID_STATUS,
     }
-    if frontier_delta > PREFERENCE_FRONTIER_GAIN + FLOAT_TOLERANCE:
+    if held_out_delta > PREFERENCE_FRONTIER_GAIN + FLOAT_TOLERANCE:
         selected = "fixed_u150"
-        reason = "fixed_u150_frontier_success_advantage_gt_0.02"
-    elif nominal_recovery > PREFERENCE_NOMINAL_LOSS + FLOAT_TOLERANCE and fixedu_frontier_within:
+        reason = "fixed_u150_held_out_success_advantage_gt_0.02"
+    elif nominal_recovery > PREFERENCE_NOMINAL_LOSS + FLOAT_TOLERANCE and fixedu_held_out_within:
         selected = "fixed_u150"
-        reason = "fixed_u150_phys_000_gain_gt_0.01_with_frontier_within_0.02"
+        reason = "fixed_u150_phys_000_gain_gt_0.01_with_held_out_within_0.02"
     else:
         selected = "fixed_150"
         reason = "default_preference_for_pure_support_extension"
@@ -1842,7 +2025,9 @@ def analyze(
     all_cells = set().union(*(evaluation["cells"] for evaluation in evaluations.values()))
     _require_exact(len(all_cells), 60, "combined unique evaluation cells")
 
-    profiles = {role: profile(evaluation["values"]) for role, evaluation in evaluations.items()}
+    profiles = {
+        role: profile(evaluation["values"], role=role) for role, evaluation in evaluations.items()
+    }
     bridge = bridge_decision(profiles)
     candidates = {role: candidate_decision(role, profiles) for role in ("fixed_150", "fixed_u150")}
     selection = (
@@ -1864,7 +2049,7 @@ def analyze(
 
     return {
         "kind": "lucid_tier2_support_screen_analysis",
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now().astimezone().isoformat(),
         "git_sha": _git(("rev-parse", "HEAD")),
         "git_status_short": _git(("status", "--short")),
@@ -1910,24 +2095,63 @@ def analyze(
         "frozen_contract": {
             "in_envelope_grid": dict(IN_ENVELOPE_GRID),
             "frontier_grid": dict(FRONTIER_GRID),
+            "frontier_grid_status": FRONTIER_GRID_STATUS,
+            "frontier_grid_weights": list(trapezoid_weights(FRONTIER_GRID)),
+            "primary_endpoint": {
+                "held_out_grid": dict(HELD_OUT_GRID),
+                "weights": list(HELD_OUT_WEIGHTS),
+                "metric": "success_rate",
+                "candidate_minus_fresh_fixed_minimum_gain": CANDIDATE_HELD_OUT_SUCCESS_GAIN,
+                "companion_progress_minimum_delta": CANDIDATE_HELD_OUT_PROGRESS_FLOOR,
+            },
+            "secondary_a_same_support_safety": {
+                "cells": [preset for preset, _ in IN_ENVELOPE_GRID],
+                "weights": list(SAME_SUPPORT_WEIGHTS),
+                "floor": CANDIDATE_IN_ENVELOPE_FLOOR,
+                "one_sided": True,
+            },
+            "secondary_b_in_support_manipulation_check": {
+                "cells": list(IN_SUPPORT_FRONTIER),
+                "use": "REPORT ONLY, NEVER GATE",
+                "labels": {role: support_labels(role) for role in EVALUATION_ROLES},
+                "void_condition": (
+                    f"candidate does not beat fresh_fixed at {MANIPULATION_CHECK_PRESET}"
+                ),
+            },
             "hard_success_presets": list(HARD_SUCCESS_PRESETS),
+            "hard_success_presets_status": FRONTIER_GRID_STATUS,
+            "hard_success_presets_held_out": list(HARD_SUCCESS_PRESETS_HELD_OUT),
             "bridge": {
                 "frontier_success_progress_absolute": BRIDGE_FRONTIER_TOLERANCE,
                 "in_envelope_success_progress_absolute": BRIDGE_IN_ENVELOPE_TOLERANCE,
                 "lat_50ms_success_absolute": BRIDGE_LAT50_TOLERANCE,
             },
             "candidate_vs_fresh_fixed": {
+                "held_out_success_minimum_gain": CANDIDATE_HELD_OUT_SUCCESS_GAIN,
+                "held_out_progress_minimum_delta": CANDIDATE_HELD_OUT_PROGRESS_FLOOR,
+                "in_envelope_success_progress_minimum_delta": CANDIDATE_IN_ENVELOPE_FLOOR,
+                "binding_checks": [
+                    "held_out_success_gain",
+                    "held_out_progress_noninferiority",
+                    "in_envelope_success_noninferiority",
+                    "in_envelope_progress_noninferiority",
+                    "manipulation_check_not_void",
+                ],
                 "frontier_success_minimum_gain": CANDIDATE_FRONTIER_SUCCESS_GAIN,
                 "frontier_progress_minimum_delta": CANDIDATE_FRONTIER_PROGRESS_FLOOR,
-                "in_envelope_success_progress_minimum_delta": CANDIDATE_IN_ENVELOPE_FLOOR,
                 "H_X1_mean_hard_success_minimum_gain": H_X1_HARD_SUCCESS_GAIN,
+                "frontier_and_H_X1_status": FRONTIER_GRID_STATUS,
                 "lat_60ms_success_minimum_gain_nonbinding": LAT60_REPORTED_GAIN,
             },
             "preference": {
                 "default": "fixed_150",
-                "fixed_u150_frontier_success_advantage_strictly_greater_than": PREFERENCE_FRONTIER_GAIN,
+                "endpoint": "held_out_auc",
+                "fixed_u150_held_out_success_advantage_strictly_greater_than": PREFERENCE_FRONTIER_GAIN,
                 "fixed_u150_minus_fixed_150_phys_000_success_strictly_greater_than": PREFERENCE_NOMINAL_LOSS,
+                "fixed_u150_held_out_success_minimum_delta_vs_fixed_150": -PREFERENCE_FRONTIER_GAIN,
+                "fixed_u150_frontier_success_advantage_strictly_greater_than": PREFERENCE_FRONTIER_GAIN,
                 "fixed_u150_frontier_success_minimum_delta_vs_fixed_150": -PREFERENCE_FRONTIER_GAIN,
+                "frontier_status": FRONTIER_GRID_STATUS,
             },
         },
         "profiles": profiles,
@@ -1936,6 +2160,8 @@ def analyze(
         "decision": {
             "status": status,
             **selection,
+            "void_candidates": [role for role, decision in candidates.items() if decision["void"]],
+            "primary_endpoint": "held_out_auc",
             "screening_only": True,
             "directional_claim_authorized": False,
             "superiority_claim_authorized": False,
@@ -1948,6 +2174,7 @@ def analyze(
             "three full 8000-row curricula independently establish the intended manipulation",
             "fixed_u150 carried exact recomputed lower-stratum parameters in 7990 TACE rows",
             "the SHA-pinned preregistration, H_R2 gate, panel, and four freeze bundles passed",
+            "the primary endpoint (phys_175/phys_200) lies outside every arm's training support",
         ],
         "not_yet_verified": [
             "training-procedure variability beyond seed 8600",
