@@ -823,7 +823,10 @@ def build_command(
         # Gated on the arm's effective lambda ceiling rather than on membership
         # of the fixed-lambda table: an expansion arm reaches 1.5 too, and
         # gating on the table would have let it through silently.
-        reach = ceiling + (EXPANSION_STEP if mode in EXPANSION_ARMS else 0.0)
+        # Expansion arms cap the probe at the frontier ceiling, so their
+        # maximum applied intensity is the ceiling itself, exactly as for an
+        # open-loop arm at the same lambda.
+        reach = ceiling
         needed = reach * 8
         needed = int(needed) if float(needed).is_integer() else int(needed) + 1
         if args.max_delay < needed:
@@ -857,6 +860,12 @@ def build_command(
             f"++callbacks.survival_observer.output_dir={artifact_dir}",
             f"++callbacks.lucid_curriculum.survival_branch_id={branch_id}",
             f"++callbacks.lucid_curriculum.gate_probe_offset={EXPANSION_STEP}",
+            # Probe capped at the frontier ceiling, so this arm's maximum
+            # applied intensity equals every other 1.5 arm's. A probe above the
+            # ceiling would give the expansion arms strictly more support than
+            # fixed_150 and fixed_u150, confounding "the gate helped" with "the
+            # gate trained harder".
+            f"++callbacks.lucid_curriculum.gate_probe_max={ARM_FRONTIER_MAX[mode]}",
         ]
         if mode == "gate_150":
             expansion += [

@@ -261,6 +261,15 @@ class LucidCurriculumCallback(TrainerCallback):
         # control is how the frontier moves, which is the comparison the ratchet
         # result showed the programme was missing.
         self.gate_probe_offset = float(gate_probe_offset)
+        # Ceiling on the probe itself. Setting it equal to the frontier ceiling
+        # makes the arm's MAXIMUM applied intensity equal to its frontier
+        # ceiling, so an expansion arm and an open-loop arm at the same nominal
+        # lambda train on the same maximum support. Without that, the probe
+        # would carry a gate arm one step past every arm it is compared with,
+        # and a frontier difference would be confounded with a support
+        # difference. It also means the probe only ever explores levels the
+        # frontier could actually reach.
+        self.gate_probe_max = float(gate_probe_max)
         self.gate_tail_fraction = float(gate_tail_fraction)
         self.ramp_start_lambda = float(ramp_start_lambda)
         self.ramp_end_lambda = float(ramp_end_lambda)
@@ -645,13 +654,12 @@ class LucidCurriculumCallback(TrainerCallback):
         if probe_index is None:
             return tuple(frontier * w for w in TACE.stratum_weights(count))
         # The probe is derived from the frontier actually being applied, never
-        # from the gate's own copy of it: the two can differ during warm-up, a
-        # resume, or consolidation, and taking the gate's copy there would place
-        # the probe *below* the frontier and quietly delete the stratum that the
-        # whole design depends on. The gate contributes only its ceiling.
-        probe = frontier + self.gate_probe_offset
-        if self.gate is not None:
-            probe = min(probe, float(self.gate.config.probe_max))
+        # from the gate's own copy of it: the two can differ during warm-up or a
+        # resume, and taking the gate's copy there would place the probe *below*
+        # the frontier and quietly delete the stratum the whole design depends
+        # on. Capped at gate_probe_max, which both modes share so that a gate
+        # arm and its open-loop control have identical maximum support.
+        probe = min(frontier + self.gate_probe_offset, self.gate_probe_max)
         probe = max(float(probe), float(frontier))
         # Strata 0 .. count-3 span the retained tail, stratum count-2 is the
         # frontier itself, stratum count-1 is the probe.

@@ -441,3 +441,41 @@ class TestObserverChaining:
         assert len(inner_seen) == 2
         assert observer.history[-1]["episodes_ended"] == 8
         assert observer.current_probe() == (pytest.approx(0.5), 8)
+
+
+class TestProbeCeiling:
+    """The probe must not carry an expansion arm past the support it is
+    compared against.
+
+    fixed_150 and fixed_u150 top out at lambda 1.5. If a gate arm's probe sat
+    at 1.625, the gate would train on strictly more support than the arms it is
+    measured against, and "the gate helped" would be confounded with "the gate
+    trained harder". Capping the probe at the frontier ceiling makes the
+    maximum applied intensity identical across all four 1.5 arms.
+    """
+
+    def test_probe_is_capped_at_the_frontier_ceiling(self):
+        env, callback = build("gate", gate_lambda_max=1.5, gate_probe_max=1.5)
+        callback.on_train_begin(None, None, None, env=env)
+        callback._apply(1.5)
+        lambdas = callback._stratum_lambdas_absolute
+        assert max(lambdas) == pytest.approx(1.5)
+        assert lambdas[-1] == pytest.approx(1.5)
+
+    def test_probe_still_leads_below_the_ceiling(self):
+        env, callback = build("gate", gate_lambda_max=1.5, gate_probe_max=1.5)
+        callback.on_train_begin(None, None, None, env=env)
+        callback._apply(1.25)
+        lambdas = callback._stratum_lambdas_absolute
+        assert lambdas[-1] == pytest.approx(1.375)
+        assert lambdas[-2] == pytest.approx(1.25)
+
+    def test_gate_and_ramp_share_the_cap(self):
+        env_a, gate = build("gate", gate_lambda_max=1.5, gate_probe_max=1.5)
+        env_b, ramp = build("ramp", gate_probe_max=1.5)
+        gate.on_train_begin(None, None, None, env=env_a)
+        ramp.on_train_begin(None, None, None, env=env_b)
+        gate._apply(1.5)
+        ramp._apply(1.5)
+        assert max(gate._stratum_lambdas_absolute) == pytest.approx(1.5)
+        assert gate._stratum_lambdas_absolute == pytest.approx(ramp._stratum_lambdas_absolute)
