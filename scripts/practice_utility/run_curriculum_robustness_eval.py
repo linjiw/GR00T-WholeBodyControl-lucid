@@ -62,6 +62,13 @@ MODES = (
     "gate_300",
     "fixed_300",
     "box_fast_300",
+    # Practice-allocation arms: the lambda = 1 envelope with a fixed 25% share
+    # of the same environments reallocated to one practised condition. They ask
+    # where extra training is productive, before any scheduler exists.
+    "prac_null",
+    "prac_easy",
+    "prac_push",
+    "prac_pushfric",
 )
 #: Deployment-latency ladder: nominal physics on every other channel, with
 #: actuation latency pinned at a fixed level. The stock ``latency_60ms`` cell
@@ -132,7 +139,22 @@ PRESET_CHANNEL: dict[str, dict[str, float]] = {
     "ch_joint_300": {"add_joint_default_pos": 3.0},
     "ch_push_200": {"push_robot": 2.0},
     "ch_push_300": {"push_robot": 3.0},
+    # Above every level any arm practises, so it stays a held-out cell for the
+    # push-practice arm as well as for its controls.
+    "ch_push_350": {"push_robot": 3.5},
 }
+#: Pairwise cells: TWO terms widened together, the rest at 1.0. The scalar
+#: ladder moves five channels at once and the marginals move one, so neither can
+#: say whether a pair costs more than its parts. These are the smallest cells
+#: that can: the contact-mechanics account of the measured interaction residual
+#: predicts push and friction specifically, and predicts a loss larger than the
+#: sum of the two marginals at the same intensities.
+PRESET_PAIR: dict[str, dict[str, float]] = {
+    "ch_push_fric_200_150": {"push_robot": 2.0, "physics_material": 1.5},
+    "ch_push_fric_300_150": {"push_robot": 3.0, "physics_material": 1.5},
+}
+#: Every cell that scales named channels, marginal or pairwise.
+PRESET_SCALED: dict[str, dict[str, float]] = {**PRESET_CHANNEL, **PRESET_PAIR}
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
@@ -148,7 +170,7 @@ PRESETS = {
     "dr_150": "tracking/lucid_curriculum",
     **{name: "tracking/lucid_eval_clean" for name in PRESET_FIXED_LATENCY_STEPS},
     **{name: "tracking/lucid_curriculum" for name in PRESET_PHYSICS_ONLY},
-    **{name: "tracking/lucid_curriculum" for name in PRESET_CHANNEL},
+    **{name: "tracking/lucid_curriculum" for name in PRESET_SCALED},
 }
 PRESET_DR_SCALE = {
     "dr_025": 0.25,
@@ -173,11 +195,11 @@ def requested_preset_metadata(presets: list[str]) -> dict[str, dict[str, Any]]:
                     "fixed_latency_steps": 0,
                 }
             )
-        elif preset in PRESET_CHANNEL:
+        elif preset in PRESET_SCALED:
             row.update(
                 {
                     "non_latency_dr_scale": 1.0,
-                    "channel_dr_scales": dict(PRESET_CHANNEL[preset]),
+                    "channel_dr_scales": dict(PRESET_SCALED[preset]),
                     "fixed_latency_steps": 0,
                 }
             )
@@ -452,8 +474,12 @@ def rotated(items: list[str], offset: int) -> list[str]:
 
 
 def channel_override(preset: str) -> str:
-    """Hydra dict override for a single-channel cell, e.g. ``{physics_material:1.5}``."""
-    scales = PRESET_CHANNEL[preset]
+    """Hydra dict override for a scaled cell, e.g. ``{physics_material:1.5}``.
+
+    Marginal cells name one term and pairwise cells name two; the override is
+    written the same way for both.
+    """
+    scales = PRESET_SCALED[preset]
     body = ",".join(f"{name}:{value}" for name, value in sorted(scales.items()))
     return f"++callbacks.practice_eval.channel_dr_scales={{{body}}}"
 
@@ -504,7 +530,7 @@ def build_command(
                 channel_override(preset),
                 "++callbacks.practice_eval.fixed_latency_steps=0",
             ]
-            if preset in PRESET_CHANNEL
+            if preset in PRESET_SCALED
             else (
                 [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
                 if preset in PRESET_DR_SCALE
@@ -622,7 +648,7 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
             and delay.get("action_delay_max_steps") == 8
             and delay.get("action_delay_nonzero_fraction", 0) > 0
         )
-    if preset in PRESET_PHYSICS_ONLY or preset in PRESET_CHANNEL:
+    if preset in PRESET_PHYSICS_ONLY or preset in PRESET_SCALED:
         # Latency is pinned to zero, so every live lag must read zero.
         return delay.get("action_delay_max_steps") == 0
     if preset in PRESET_FIXED_LATENCY_STEPS:

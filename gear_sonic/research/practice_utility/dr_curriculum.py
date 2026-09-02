@@ -137,6 +137,16 @@ class LucidCurriculumCallback(TrainerCallback):
         #: what lets an asymmetric arm widen the channels the attribution
         #: sweep found cheap while holding the binding one.
         box_lambda_max: dict[str, float] | None = None,
+        #: Practice allocation (no feedback): an explicit per-stratum vector of
+        #: channel intensities, as a JSON list of objects, one per stratum, low
+        #: stratum first. A channel absent from a stratum's object trains at the
+        #: arm's own ``fixed_lambda``. This is the open-loop instrument for the
+        #: question "where is extra practice productive?": it reallocates a
+        #: fixed share of the SAME environment budget to one condition and
+        #: changes nothing else, so a difference against the matched null arm
+        #: is attributable to what those environments practised. It never moves
+        #: during a run, reads no signal, and cannot contract anything.
+        practice_vectors_json: str | None = None,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked", "gate", "ramp", "box"):
             raise ValueError(
@@ -144,6 +154,28 @@ class LucidCurriculumCallback(TrainerCallback):
             )
         if not 0.0 <= float(anchor_ratio) <= 1.0:
             raise ValueError(f"anchor_ratio must be in [0, 1], got {anchor_ratio}")
+        self.practice_vectors: tuple[dict[str, float], ...] | None = None
+        if practice_vectors_json:
+            import json as _json
+
+            parsed = _json.loads(practice_vectors_json)
+            if not isinstance(parsed, list) or not parsed:
+                raise ValueError("practice_vectors_json must be a non-empty JSON list of objects")
+            vectors: list[dict[str, float]] = []
+            for entry in parsed:
+                if not isinstance(entry, dict):
+                    raise ValueError(f"practice_vectors_json entries must be objects, got {entry!r}")
+                vectors.append({str(k): float(v) for k, v in entry.items()})
+            for vector in vectors:
+                for name, value in vector.items():
+                    if value < 0.0:
+                        raise ValueError(f"practice intensity {name}={value} must be >= 0")
+            if int(spread_strata) != len(vectors):
+                raise ValueError(
+                    f"practice_vectors_json has {len(vectors)} strata but "
+                    f"spread_strata={spread_strata}"
+                )
+            self.practice_vectors = tuple(vectors)
         if not 0.0 <= float(consolidation_fraction) < 1.0:
             raise ValueError(
                 f"consolidation_fraction must be in [0, 1), got {consolidation_fraction}"
@@ -523,6 +555,8 @@ class LucidCurriculumCallback(TrainerCallback):
             if self.allow_extrapolation:
                 record["allow_extrapolation"] = True
                 record["physical_clamp"] = sorted((self._clamp_report or {}).get("clamped", {}))
+            if self.practice_vectors is not None:
+                record["practice_vectors"] = [dict(v) for v in self.practice_vectors]
         elif self.mode == "off":
             record = {"global_step": step, "mode": "off", "lambda": 0.0, "gap_quantile": None}
             self._apply(0.0)
@@ -1074,7 +1108,15 @@ class LucidCurriculumCallback(TrainerCallback):
             # region (friction went negative at 1.5x before the eval-side clamp
             # existed); clamp the live config and keep the report for the record.
             self._clamp_report = DS.clamp_physical(self._event_manager)
-        if self.mode == "box" and self.spread_strata > 1 and self.box is not None:
+        if self.practice_vectors is not None and self.spread_strata > 1:
+            # Fixed allocation: each stratum's vector is absolute, so a channel
+            # a stratum practises sits above the arm's lambda while every other
+            # channel stays exactly where the control arm has it.
+            self._stratum_lambdas_absolute = tuple(
+                {**{name: float(lambda_value) for name in self.baseline}, **vector}
+                for vector in self.practice_vectors
+            )
+        elif self.mode == "box" and self.spread_strata > 1 and self.box is not None:
             self._stratum_lambdas_absolute = self._box_stratum_vectors()
         elif self.mode in ("gate", "ramp", "box") and self.spread_strata > 1:
             self._stratum_lambdas_absolute = self._expansion_stratum_lambdas(float(lambda_value))

@@ -336,16 +336,80 @@ ARM_BOX_CEILINGS: dict[str, dict[str, float]] = {
 GATE_ARMS = ("gate_150", "box_150", "box_asym", "gate_300", "box_fast_300")
 BOX_ARMS = ("box_150", "box_asym", "box_fast_300")
 
+#: ---------------------------------------------------------------------------
+#: Practice-allocation arms (screen, 2026-09-02). These answer a question that
+#: comes BEFORE any scheduler: where is extra training actually productive?
+#:
+#: Every arm keeps the lambda = 1 envelope, the architecture, the reward, the
+#: motion, the origin checkpoint and the iteration budget. The only difference
+#: is what a fixed 25% share of the SAME 1,024 environments practises. Nothing
+#: is added: the share is taken from the lambda = 1 cohort, so a targeted arm
+#: trains on fewer standard-mixture episodes, not on more episodes.
+#:
+#:   prac_null      the matched control: the practice share trains at lambda 1
+#:                  like everything else, so the dispatcher is active and only
+#:                  the practice CONTENT differs from the arms below
+#:   prac_easy      the placebo: the share practises the three channels the
+#:                  attribution sweep found nearly free (mass, CoM, joint at
+#:                  3x, where the origin already scores 0.949/0.988/0.990)
+#:   prac_push      the bottleneck: the share practises push at 3x, where the
+#:                  origin scores 0.746 -- difficult, and far from the floor
+#:   prac_pushfric  the interaction: push 2x together with friction 1.5x, each
+#:                  cheap alone (0.912 and 0.973) and untested in combination
+#:
+#: The levels are read off the measured single-channel sweep rather than chosen,
+#: so "difficult" means a measured success level, not an intuition. The plain
+#: ``fixed`` arm at one stratum is the second control and answers how much comes
+#: from simply continuing to train.
+PRACTICE_ARMS = ("prac_null", "prac_easy", "prac_push", "prac_pushfric")
+#: Share of the focus cohort reallocated to the practice stratum. Identical for
+#: every arm, so the arms differ only in what that share practises.
+PRACTICE_FRACTION = 0.25
+PRACTICE_CHANNELS: dict[str, dict[str, float]] = {
+    "prac_null": {},
+    "prac_easy": {
+        "randomize_rigid_body_mass": 3.0,
+        "base_com": 3.0,
+        "add_joint_default_pos": 3.0,
+    },
+    "prac_push": {"push_robot": 3.0},
+    "prac_pushfric": {"push_robot": 2.0, "physics_material": 1.5},
+}
+ARMS.update({arm: ("fixed", 0.0, None) for arm in PRACTICE_ARMS})
+ARM_SPREAD_STRATA.update({arm: 2 for arm in PRACTICE_ARMS})
+ARM_TOP_FRACTION.update({arm: PRACTICE_FRACTION for arm in PRACTICE_ARMS})
+#: The arm's maximum applied intensity on ANY channel; drives the extrapolation
+#: flag and the delay-buffer check.
+ARM_PRACTICE_MAX: dict[str, float] = {
+    arm: max([1.0, *PRACTICE_CHANNELS[arm].values()]) for arm in PRACTICE_ARMS
+}
+
+
+def practice_vectors(mode: str) -> list[dict[str, float]]:
+    """Per-stratum channel intensities for a practice arm, low stratum first.
+
+    Stratum 0 is the retained lambda = 1 mixture and carries no entries, so
+    every channel there trains exactly where the control arm has it. Stratum 1
+    is the practice share and names only the channels it practises.
+    """
+    if mode not in PRACTICE_ARMS:
+        raise ValueError(f"{mode!r} is not a practice-allocation arm")
+    return [{}, dict(PRACTICE_CHANNELS[mode])]
+
+
 #: Every arm whose applied lambda can exceed the lambda = 1 envelope, and the
 #: ceiling it can reach. The delay-buffer capacity check reads THIS, not the
 #: fixed-lambda table: an expansion arm launched at the default --max-delay
 #: would silently train latency at 1.0x while its telemetry claimed 1.5x.
-ARM_LAMBDA_CEILING: dict[str, float] = {**ARM_FIXED_LAMBDA, **ARM_FRONTIER_MAX}
+ARM_LAMBDA_CEILING: dict[str, float] = {**ARM_FIXED_LAMBDA, **ARM_FRONTIER_MAX, **ARM_PRACTICE_MAX}
 #: Per-arm ceiling on the LATENCY channel specifically, for the delay-buffer
 #: check: an asymmetric arm reaches 2.0 on mass but holds latency at 1.5.
 ARM_DELAY_CEILING: dict[str, float] = {
     **{arm: ASYM_CEILINGS["randomize_action_delay"] for arm in ASYM_ARMS},
     **{arm: WIDE_CAPS["randomize_action_delay"] for arm in WIDE_ARMS},
+    # No practice arm widens latency, so the standard buffer is enough however
+    # far the practised physics channels reach.
+    **{arm: 1.0 for arm in PRACTICE_ARMS},
 }
 MODES = tuple(ARMS)
 
@@ -958,6 +1022,13 @@ def build_command(
             "++callbacks.lucid_curriculum.stratum_sizes="
             "[" + ",".join(str(size) for size in sizes) + "]"
         )
+    if mode in PRACTICE_ARMS:
+        # One frozen JSON literal per stratum. Hydra sees a quoted string, the
+        # callback parses it, and the realized vectors land in the run's own
+        # TACE telemetry, so the receipt states the exposure rather than the
+        # intent.
+        vectors = json.dumps(practice_vectors(mode), separators=(",", ":"))
+        spread.append(f"++callbacks.lucid_curriculum.practice_vectors_json='{vectors}'")
     expansion: list[str] = []
     if mode in EXPANSION_ARMS:
         sizes = expansion_stratum_sizes(args.num_envs, strata)
