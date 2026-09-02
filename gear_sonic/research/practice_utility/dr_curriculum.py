@@ -651,11 +651,31 @@ class LucidCurriculumCallback(TrainerCallback):
     # ------------------------------------------------- support expansion --
 
     def _survival_observer(self):
+        """The survival observer for this branch, with its strata guaranteed.
+
+        Binding the strata cannot be left to ``_bind``. Callback order is dict
+        order in the Hydra config, and the curriculum's ``on_train_begin`` runs
+        before the observer's, so at bind time the observer has not yet
+        registered itself and the lookup returns None. The strata would then
+        never be handed over: the observer would record only population
+        survival, ``current_probe`` would return no evidence forever, and the
+        gate would hold its frontier for the whole run while looking exactly
+        like a gate that honestly decided not to expand.
+
+        Observed live on 2026-09-01: the curriculum reported
+        ``survival_observer_present: True`` with correct 8-stratum TACE
+        telemetry while the observer's own rows carried ``probe_index: null``
+        and no per-stratum entry. So the binding is done here, lazily, the
+        first time the observer is actually reachable.
+        """
         if self.mode not in ("gate", "ramp"):
             return None
         from gear_sonic.research.practice_utility import survival_observer as SO
 
-        return SO.get_active_survival_observer(self.survival_branch_id or self.branch_id)
+        observer = SO.get_active_survival_observer(self.survival_branch_id or self.branch_id)
+        if observer is not None and observer.probe_index is None and self.assignment is not None:
+            observer.set_strata(self.assignment.stratum_masks(), self._probe_stratum_index())
+        return observer
 
     def _probe_stratum_index(self) -> int | None:
         """The stratum held above the frontier: always the top one.

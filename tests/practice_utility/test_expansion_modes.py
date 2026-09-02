@@ -523,3 +523,61 @@ class TestDeadSignalPath:
         for step in range(1, 60):
             callback.on_step_end(None, State(step, mean_reward=10.0), None, env=env)
         assert callback._frontier_lambda > 1.0
+
+
+class TestLateObserverRegistration:
+    """The observer may register AFTER the curriculum binds.
+
+    Callback order is dict order in the Hydra config, so the curriculum's
+    on_train_begin can run first. At that moment the survival observer has not
+    registered itself and the lookup returns None, so _bind cannot hand over the
+    strata. If nothing rebinds them later, the observer records only population
+    survival, current_probe returns no evidence forever, and the gate holds its
+    frontier for the entire run while looking exactly like a gate that honestly
+    declined to expand.
+
+    This happened live on 2026-09-01: the curriculum logged
+    survival_observer_present: True with correct 8-stratum TACE telemetry while
+    the observer's rows carried probe_index: null and no per-stratum entry.
+    """
+
+    def test_strata_bind_when_the_observer_appears_late(self):
+        env, callback = build("gate")
+        # Curriculum binds with NO observer registered yet.
+        callback.on_train_begin(None, None, None, env=env)
+        observer = SO.SurvivalObserverCallback(enabled=True, branch_id="exp")
+        assert observer.probe_index is None
+        SO._ACTIVE["exp"] = observer
+
+        found = callback._survival_observer()
+
+        assert found is observer
+        assert observer.probe_index == callback.spread_strata - 1
+        assert len(observer.stratum_masks) == callback.spread_strata
+        assert sum(int(m.sum()) for m in observer.stratum_masks) == 32
+
+    def test_late_bound_observer_reports_probe_evidence(self):
+        env, callback = build("gate")
+        callback.on_train_begin(None, None, None, env=env)
+        observer = SO.SurvivalObserverCallback(enabled=True, branch_id="exp")
+        SO._ACTIVE["exp"] = observer
+        callback._survival_observer()
+
+        probe = observer.stratum_masks[observer.probe_index]
+        dones = probe.clone()
+        timed = probe.clone()
+        observer._after((None, None, dones, {"time_outs": timed}))
+        observer.ensure_flushed(1)
+
+        survival, episodes = observer.current_probe()
+        assert episodes == int(probe.sum())
+        assert survival == pytest.approx(1.0)
+
+    def test_binding_is_not_repeated_once_done(self):
+        env, callback = build("gate")
+        observer = SO.SurvivalObserverCallback(enabled=True, branch_id="exp")
+        SO._ACTIVE["exp"] = observer
+        callback.on_train_begin(None, None, None, env=env)
+        first = observer.stratum_masks
+        callback._survival_observer()
+        assert observer.stratum_masks is first
