@@ -183,3 +183,52 @@ def test_box_150_refuses_an_undersized_delay_buffer():
     a.gate_guard_action, a.box_channel_budget = "freeze", 0
     with pytest.raises(SystemExit, match="max-delay 12"):
         R.build_command(a, "box_150", 8600, "b", Path("/tmp/artifact"))
+
+
+def _asym_args():
+    a = args()
+    a.max_delay = 12
+    a.gate_threshold, a.gate_window, a.gate_dwell, a.gate_min_episodes = 0.8, 100, 50, 200
+    a.gate_guard_action, a.box_channel_budget = "freeze", 300
+    a.ramp_begin_iteration, a.ramp_end_iteration = 0, 1500
+    a.num_envs = 1024
+    return a
+
+
+def test_asymmetric_arms_widen_cheap_channels_and_hold_the_binding_ones():
+    a = _asym_args()
+    box = R.build_command(a, "box_asym", 8600, "b", Path("/tmp/artifact"))
+    ramp = R.build_command(a, "ramp_asym", 8600, "b", Path("/tmp/artifact"))
+    fixed = R.build_command(a, "fixed_asym", 8600, "b", Path("/tmp/artifact"))
+    # Box: per-channel ceilings, scalar ceiling at the max.
+    assert "++callbacks.lucid_curriculum.mode=box" in box
+    assert "++callbacks.lucid_curriculum.gate_lambda_max=2.0" in box
+    assert "++callbacks.lucid_curriculum.box_lambda_max.push_robot=1.5" in box
+    assert "++callbacks.lucid_curriculum.box_lambda_max.randomize_rigid_body_mass=2.0" in box
+    assert "++callbacks.lucid_curriculum.box_lambda_max.randomize_action_delay=1.5" in box
+    # Ramp and fixed: scalar to 2.0, binding channels capped at 1.5.
+    assert "++callbacks.lucid_curriculum.ramp_end_lambda=2.0" in ramp
+    assert "++callbacks.lucid_curriculum.fixed_lambda=2.0" in fixed
+    for cmd in (ramp, fixed):
+        assert "++callbacks.lucid_curriculum.term_lambda_caps.push_robot=1.5" in cmd
+        assert "++callbacks.lucid_curriculum.term_lambda_caps.physics_material=1.5" in cmd
+        assert "++callbacks.lucid_curriculum.term_lambda_caps.randomize_action_delay=1.5" in cmd
+        assert not any("term_lambda_caps.randomize_rigid_body_mass" in part for part in cmd)
+        assert "++callbacks.lucid_curriculum.allow_extrapolation=true" in cmd
+    # Same strata and probe geometry as the 1.5 expansion arms.
+    for cmd in (box, ramp):
+        assert "++callbacks.lucid_curriculum.spread_strata=8" in cmd
+        assert "++callbacks.lucid_curriculum.stratum_sizes=[43,43,43,43,42,42,640,128]" in cmd
+        assert "++callbacks.survival_observer.enabled=true" in cmd
+    assert R.ARM_LAMBDA_CEILING["box_asym"] == 2.0 and R.ARM_DELAY_CEILING["box_asym"] == 1.5
+
+
+def test_asymmetric_arms_size_the_delay_buffer_from_the_latency_ceiling():
+    # Latency is held at 1.5 (12 steps) even though mass reaches 2.0, so
+    # --max-delay 12 is enough and 8 is not.
+    a = _asym_args()
+    for mode in ("box_asym", "ramp_asym", "fixed_asym"):
+        R.build_command(a, mode, 8600, "b", Path("/tmp/artifact"))
+    a.max_delay = 8
+    with pytest.raises(SystemExit, match="max-delay 12"):
+        R.build_command(a, "ramp_asym", 8600, "b", Path("/tmp/artifact"))

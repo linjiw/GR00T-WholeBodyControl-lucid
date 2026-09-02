@@ -132,6 +132,11 @@ class LucidCurriculumCallback(TrainerCallback):
         #: Box mode: iterations one channel may hold the probe without a
         #: decision before the probe moves on. Zero disables the timeout.
         box_channel_budget: int = 0,
+        #: Box mode: per-channel frontier ceilings. A channel absent from the
+        #: dict gets ``gate_lambda_max``; every value must be <= it. This is
+        #: what lets an asymmetric arm widen the channels the attribution
+        #: sweep found cheap while holding the binding one.
+        box_lambda_max: dict[str, float] | None = None,
     ) -> None:
         if mode not in ("lucid", "fixed", "off", "yoked", "gate", "ramp", "box"):
             raise ValueError(
@@ -296,7 +301,16 @@ class LucidCurriculumCallback(TrainerCallback):
         self.box: Any = None
         self._box_channels = tuple(box_channels) if box_channels else None
         self._box_channel_budget = max(0, int(box_channel_budget))
-        self._box_lambda_max = float(gate_lambda_max)
+        self._box_lambda_max: float | dict[str, float] = float(gate_lambda_max)
+        self._box_default_ceiling = float(gate_lambda_max)
+        if box_lambda_max:
+            ceilings = {str(k): float(v) for k, v in dict(box_lambda_max).items()}
+            for name, value in ceilings.items():
+                if not 0.0 < value <= float(gate_lambda_max):
+                    raise ValueError(
+                        f"box_lambda_max[{name!r}]={value} must be in (0, gate_lambda_max={gate_lambda_max}]"
+                    )
+            self._box_lambda_max = ceilings
         self._box_initial = float(min(gate_initial_frontier, gate_lambda_max))
         self._box_gate_kwargs = dict(
             threshold=float(gate_threshold),
@@ -840,15 +854,29 @@ class LucidCurriculumCallback(TrainerCallback):
         channels = tuple(name for name in channels if name in self.baseline and name not in pinned)
         if not channels:
             raise RuntimeError("box mode found no scalable channel to gate")
+        if isinstance(self._box_lambda_max, dict):
+            ceilings = {
+                name: float(self._box_lambda_max.get(name, self._box_default_ceiling))
+                for name in channels
+            }
+            # The probe may never exceed a channel's own ceiling: an asymmetric
+            # arm's maximum applied intensity per channel is that ceiling, and
+            # a probe above it would give the arm support its ceiling denies.
+            probe_max = {name: min(float(self.gate_probe_max), ceilings[name]) for name in channels}
+            initial = {name: min(self._box_initial, ceilings[name]) for name in channels}
+        else:
+            ceilings = self._box_lambda_max
+            probe_max = self.gate_probe_max
+            initial = self._box_initial
         self.box = BG.BoxGateController(
             BG.BoxGateConfig(
                 channels=channels,
-                lambda_max=self._box_lambda_max,
-                probe_max=self.gate_probe_max,
+                lambda_max=ceilings,
+                probe_max=probe_max,
                 channel_budget=self._box_channel_budget,
                 **self._box_gate_kwargs,
             ),
-            initial_lambda=self._box_initial,
+            initial_lambda=initial,
         )
         if self._pending_box_state is not None:
             self.box.load_state_dict(self._pending_box_state)

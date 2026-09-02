@@ -258,11 +258,52 @@ def expansion_stratum_sizes(
     return sizes + [frontier, probe]
 
 
+#: Asymmetric-support arms, from the single-channel attribution sweep of
+#: 2026-09-02: for trained policies mass, CoM and joint offsets are nearly free
+#: to three times their range while push disturbance is the binding channel
+#: (0.71-0.77 success at 3x) and friction is clamped past ~1.385. A uniform
+#: 1.5 ceiling therefore withholds width where it is free and spends it where
+#: it is not. These arms let the cheap channels reach 2.0 and hold push,
+#: friction and latency at 1.5:
+#:   box_asym    the box gate with per-channel ceilings (discovers the order online)
+#:   ramp_asym   the open-loop control: scalar frontier 1.0 -> 2.0 with the three
+#:               binding channels capped at 1.5 (M5: same terminal support)
+#:   fixed_asym  the width control: the asymmetric box from iteration 0
+#: Their terminal support exceeds the 1.5 arms' on three channels, so the
+#: scalar phys_175/phys_200 cells are IN SUPPORT for them on those channels
+#: and must be labelled; the per-channel 3x cells stay outside every ceiling.
+ASYM_CEILINGS: dict[str, float] = {
+    "randomize_rigid_body_mass": 2.0,
+    "base_com": 2.0,
+    "add_joint_default_pos": 2.0,
+    "physics_material": 1.5,
+    "push_robot": 1.5,
+    "randomize_action_delay": 1.5,
+}
+ASYM_MAX = max(ASYM_CEILINGS.values())
+ASYM_ARMS = ("box_asym", "ramp_asym", "fixed_asym")
+ARMS.update(
+    {"box_asym": ("box", 0.0, None), "ramp_asym": ("ramp", 0.0, None), "fixed_asym": ("fixed", 0.0, None)}
+)
+EXPANSION_ARMS = (*EXPANSION_ARMS, "box_asym", "ramp_asym")
+ARM_SPREAD_STRATA.update({"box_asym": 8, "ramp_asym": 8})
+ARM_RETURN_GUARD.update({arm: "relative" for arm in ASYM_ARMS})
+ARM_FRONTIER_MAX.update({"box_asym": ASYM_MAX, "ramp_asym": ASYM_MAX})
+ARM_FIXED_LAMBDA.update({"fixed_asym": ASYM_MAX})
+#: Caps that turn a scalar frontier/fixed lambda into the asymmetric box: the
+#: scalar reaches ASYM_MAX and each capped channel stops at its own ceiling.
+ASYM_CAPS: dict[str, float] = {name: cap for name, cap in ASYM_CEILINGS.items() if cap < ASYM_MAX}
+
 #: Every arm whose applied lambda can exceed the lambda = 1 envelope, and the
 #: ceiling it can reach. The delay-buffer capacity check reads THIS, not the
 #: fixed-lambda table: an expansion arm launched at the default --max-delay
 #: would silently train latency at 1.0x while its telemetry claimed 1.5x.
 ARM_LAMBDA_CEILING: dict[str, float] = {**ARM_FIXED_LAMBDA, **ARM_FRONTIER_MAX}
+#: Per-arm ceiling on the LATENCY channel specifically, for the delay-buffer
+#: check: an asymmetric arm reaches 2.0 on mass but holds latency at 1.5.
+ARM_DELAY_CEILING: dict[str, float] = {
+    arm: ASYM_CEILINGS["randomize_action_delay"] for arm in ASYM_ARMS
+}
 MODES = tuple(ARMS)
 
 
@@ -780,6 +821,14 @@ def build_command(
         if mode in CAP_ARMS
         else []
     )
+    if mode in ("ramp_asym", "fixed_asym"):
+        # The scalar frontier climbs to ASYM_MAX; the binding channels stop at
+        # their own ceilings, per stratum, through the same cap path the
+        # latency-cap arms use.
+        caps += [
+            f"++callbacks.lucid_curriculum.term_lambda_caps.{term}={cap}"
+            for term, cap in sorted(ASYM_CAPS.items())
+        ]
     margin = (
         [
             f"++callbacks.margin_observer._target_={MARGIN_OBSERVER}",
@@ -846,7 +895,7 @@ def build_command(
         # Expansion arms cap the probe at the frontier ceiling, so their
         # maximum applied intensity is the ceiling itself, exactly as for an
         # open-loop arm at the same lambda.
-        reach = ceiling
+        reach = min(ceiling, ARM_DELAY_CEILING.get(mode, ceiling))
         needed = reach * 8
         needed = int(needed) if float(needed).is_integer() else int(needed) + 1
         if args.max_delay < needed:
@@ -887,7 +936,7 @@ def build_command(
             # gate trained harder".
             f"++callbacks.lucid_curriculum.gate_probe_max={ARM_FRONTIER_MAX[mode]}",
         ]
-        if mode in ("gate_150", "box_150"):
+        if mode in ("gate_150", "box_150", "box_asym"):
             expansion += [
                 f"++callbacks.lucid_curriculum.gate_threshold={args.gate_threshold}",
                 f"++callbacks.lucid_curriculum.gate_window={args.gate_window}",
@@ -897,10 +946,15 @@ def build_command(
                 f"++callbacks.lucid_curriculum.gate_lambda_max={ARM_FRONTIER_MAX[mode]}",
                 f"++callbacks.lucid_curriculum.gate_guard_action={args.gate_guard_action}",
             ]
-            if mode == "box_150":
+            if mode in ("box_150", "box_asym"):
                 expansion.append(
                     f"++callbacks.lucid_curriculum.box_channel_budget={args.box_channel_budget}"
                 )
+            if mode == "box_asym":
+                expansion += [
+                    f"++callbacks.lucid_curriculum.box_lambda_max.{term}={ceiling_value}"
+                    for term, ceiling_value in sorted(ASYM_CEILINGS.items())
+                ]
         else:
             expansion += [
                 "++callbacks.lucid_curriculum.ramp_start_lambda=1.0",
@@ -1258,7 +1312,8 @@ def main(argv=None) -> int:
                             "probe_fraction": EXPANSION_PROBE_FRACTION,
                             "frontier_fraction": EXPANSION_FRONTIER_FRACTION,
                             "monotone_by_construction": True,
-                            "signal": "survival" if mode in ("gate_150", "box_150") else "none",
+                            "signal": "survival" if mode in ("gate_150", "box_150", "box_asym") else "none",
+                            "channel_ceilings": dict(ASYM_CEILINGS) if mode in ASYM_ARMS else None,
                             "gate": (
                                 {
                                     "threshold": args.gate_threshold,
@@ -1267,7 +1322,7 @@ def main(argv=None) -> int:
                                     "min_episodes": args.gate_min_episodes,
                                     "guard_action": args.gate_guard_action,
                                 }
-                                if mode in ("gate_150", "box_150")
+                                if mode in ("gate_150", "box_150", "box_asym")
                                 else None
                             ),
                             "box": (
@@ -1280,7 +1335,7 @@ def main(argv=None) -> int:
                                         curriculum[-1].get("channel_expansions") if curriculum else None
                                     ),
                                 }
-                                if mode == "box_150"
+                                if mode in ("box_150", "box_asym")
                                 else None
                             ),
                             "ramp": (
@@ -1290,7 +1345,7 @@ def main(argv=None) -> int:
                                     "begin_iteration": args.ramp_begin_iteration,
                                     "end_iteration": args.ramp_end_iteration,
                                 }
-                                if mode == "ramp_150"
+                                if mode in ("ramp_150", "ramp_asym")
                                 else None
                             ),
                         }
@@ -1316,7 +1371,9 @@ def main(argv=None) -> int:
                         else None
                     ),
                     "term_lambda_caps": (
-                        {"randomize_action_delay": args.latency_cap} if mode in CAP_ARMS else {}
+                        {"randomize_action_delay": args.latency_cap}
+                        if mode in CAP_ARMS
+                        else (dict(ASYM_CAPS) if mode in ("ramp_asym", "fixed_asym") else {})
                     ),
                     "max_delay_steps": args.max_delay,
                     "yoked_schedule_path": str(schedule_for(seed, mode)) if ARMS[mode][2] else None,

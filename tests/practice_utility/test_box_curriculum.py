@@ -232,3 +232,30 @@ def test_dead_signal_path_aborts_instead_of_holding():
     with pytest.raises(RuntimeError, match="no probe episode"):
         for step in range(1, 6):
             cb.on_step_end(None, State(step), None, env=env)
+
+
+def test_per_channel_ceilings_bound_probe_and_frontier_per_channel():
+    SO.register_survival_observer(StubSurvival(survival=0.95))
+    env = FakeEnv()
+    cb = box(
+        gate_lambda_max=2.0,
+        gate_probe_max=2.0,
+        box_lambda_max={"push_robot": 1.25},  # mass absent -> default 2.0
+    )
+    cb.on_train_begin(None, State(0), None, env=env)
+    assert cb.box.config.ceiling("push_robot") == 1.25
+    assert cb.box.config.ceiling("randomize_rigid_body_mass") == 2.0
+    # The probe never exceeds a channel's own ceiling.
+    assert cb.box.config.probe_ceiling("push_robot") == 1.25
+    for step in range(1, 16):
+        cb.on_step_end(None, State(step), None, env=env)
+    final = cb.history[-1]["frontier_vector"]
+    assert final["push_robot"] == pytest.approx(1.25)
+    assert final["randomize_rigid_body_mass"] == pytest.approx(2.0)
+    probes = [row["probe_vector"]["push_robot"] for row in cb.history]
+    assert max(probes) <= 1.25 + 1e-9
+
+
+def test_box_ceiling_above_gate_lambda_max_is_refused():
+    with pytest.raises(ValueError, match="box_lambda_max"):
+        box(gate_lambda_max=1.5, box_lambda_max={"push_robot": 2.0})
