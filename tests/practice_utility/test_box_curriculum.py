@@ -259,3 +259,26 @@ def test_per_channel_ceilings_bound_probe_and_frontier_per_channel():
 def test_box_ceiling_above_gate_lambda_max_is_refused():
     with pytest.raises(ValueError, match="box_lambda_max"):
         box(gate_lambda_max=1.5, box_lambda_max={"push_robot": 2.0})
+
+
+def test_channel_caps_above_one_need_the_extrapolation_flag():
+    # An asymmetric arm caps its binding channels at 1.5 while the scalar
+    # frontier climbs to 2.0. Refused inside the envelope, admitted with the
+    # support-extension flag, and bounded by the evaluator's ceiling.
+    with pytest.raises(ValueError, match="term_lambda_caps"):
+        LucidCurriculumCallback(enabled=True, mode="fixed", term_lambda_caps={"push_robot": 1.5})
+    cb = LucidCurriculumCallback(
+        enabled=True, mode="fixed", fixed_lambda=2.0, allow_extrapolation=True,
+        term_lambda_caps={"push_robot": 1.5},
+    )
+    env = FakeEnv()
+    cb.on_train_begin(None, State(0), None, env=env)
+    terms = env.event_manager._terms
+    # Scalar at 2.0 -> mass [0.6, 1.4]; push capped at 1.5 -> [-0.75, 0.75].
+    assert terms["randomize_rigid_body_mass"].params["mass_distribution_params"] == pytest.approx([0.6, 1.4])
+    assert terms["push_robot"].params["velocity_range"]["x"] == pytest.approx([-0.75, 0.75])
+    with pytest.raises(ValueError, match="term_lambda_caps"):
+        LucidCurriculumCallback(
+            enabled=True, mode="fixed", fixed_lambda=2.0, allow_extrapolation=True,
+            term_lambda_caps={"push_robot": DS.MAX_EXTRAPOLATION + 1},
+        )

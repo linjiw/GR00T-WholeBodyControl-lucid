@@ -202,9 +202,18 @@ class LucidCurriculumCallback(TrainerCallback):
             str(k): float(v)
             for k, v in (dict(term_lambda_overrides) if term_lambda_overrides else {}).items()
         }
+        # Per-channel intensities live in the same space as lambda: inside the
+        # envelope unless the arm has declared a support extension, in which
+        # case they may reach the evaluator's extrapolation ceiling. An
+        # asymmetric arm caps its binding channels at 1.5 while the scalar
+        # frontier climbs to 2.0; a cap bounded at 1 would refuse it at
+        # construction (observed live: ramp_asym, 2026-09-02).
+        channel_ceiling = DS.MAX_EXTRAPOLATION if allow_extrapolation else 1.0
         for name, value in self.term_lambda_overrides.items():
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"term_lambda_overrides[{name!r}] must be in [0, 1], got {value}")
+            if not 0.0 <= value <= channel_ceiling:
+                raise ValueError(
+                    f"term_lambda_overrides[{name!r}] must be in [0, {channel_ceiling}], got {value}"
+                )
         # A *cap* is the per-channel ceiling the scalar curriculum cannot
         # express: the channel follows lambda up to its own limit and no
         # further. An override pins a channel at a constant regardless of
@@ -216,8 +225,10 @@ class LucidCurriculumCallback(TrainerCallback):
             for k, v in (dict(term_lambda_caps) if term_lambda_caps else {}).items()
         }
         for name, value in self.term_lambda_caps.items():
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"term_lambda_caps[{name!r}] must be in [0, 1], got {value}")
+            if not 0.0 <= value <= channel_ceiling:
+                raise ValueError(
+                    f"term_lambda_caps[{name!r}] must be in [0, {channel_ceiling}], got {value}"
+                )
             if name in self.term_lambda_overrides:
                 raise ValueError(
                     f"term {name!r} has both an override and a cap; pick one -- an override "
