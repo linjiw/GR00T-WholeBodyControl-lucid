@@ -133,7 +133,10 @@ def test_existing_latency_ladder_values_are_unchanged():
         "lat_50ms": 10,
         "lat_60ms": 12,
     }
-    assert R.PRESET_PHYSICS_ONLY == {
+    # The nine historical rungs are byte-pinned by every ladder ever scored;
+    # the wide corner (2.5, 3.0) was added for the 3.0-ceiling arms and must
+    # not have moved any of them.
+    historical = {
         "phys_000": 0.0,
         "phys_025": 0.25,
         "phys_050": 0.5,
@@ -143,6 +146,11 @@ def test_existing_latency_ladder_values_are_unchanged():
         "phys_150": 1.5,
         "phys_175": 1.75,
         "phys_200": 2.0,
+    }
+    assert {k: v for k, v in R.PRESET_PHYSICS_ONLY.items() if k in historical} == historical
+    assert {k: v for k, v in R.PRESET_PHYSICS_ONLY.items() if k not in historical} == {
+        "phys_250": 2.5,
+        "phys_300": 3.0,
     }
 
 
@@ -251,3 +259,11 @@ def test_expansion_and_asymmetric_arms_are_selectable_for_the_ladder():
 
     for mode in ("gate_150", "ramp_150", "box_150", "box_asym", "ramp_asym", "fixed_asym"):
         assert mode in C.MODES and mode in R.MODES
+
+
+def test_wide_corner_cells_exist_and_pin_latency_to_zero():
+    metadata = R.requested_preset_metadata(["phys_250", "phys_300"])
+    assert metadata["phys_250"] == {"event_preset": "tracking/lucid_curriculum", "non_latency_dr_scale": 2.5, "fixed_latency_steps": 0}
+    assert metadata["phys_300"]["non_latency_dr_scale"] == 3.0
+    for mode in ("gate_300", "fixed_300", "box_fast_300"):
+        assert mode in R.MODES

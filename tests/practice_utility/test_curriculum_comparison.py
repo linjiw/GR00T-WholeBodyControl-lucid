@@ -232,3 +232,25 @@ def test_asymmetric_arms_size_the_delay_buffer_from_the_latency_ceiling():
     a.max_delay = 8
     with pytest.raises(SystemExit, match="max-delay 12"):
         R.build_command(a, "ramp_asym", 8600, "b", Path("/tmp/artifact"))
+
+
+def test_wide_arms_hold_latency_and_reach_three():
+    a = _asym_args()
+    gate = R.build_command(a, "gate_300", 8600, "b", Path("/tmp/artifact"))
+    fixed = R.build_command(a, "fixed_300", 8600, "b", Path("/tmp/artifact"))
+    box = R.build_command(a, "box_fast_300", 8600, "b", Path("/tmp/artifact"))
+    assert "++callbacks.lucid_curriculum.gate_lambda_max=3.0" in gate
+    assert "++callbacks.lucid_curriculum.term_lambda_caps.randomize_action_delay=1.5" in gate
+    assert "++callbacks.lucid_curriculum.fixed_lambda=3.0" in fixed
+    assert "++callbacks.lucid_curriculum.term_lambda_caps.randomize_action_delay=1.5" in fixed
+    assert "++callbacks.lucid_curriculum.mode=box" in box
+    assert "++callbacks.lucid_curriculum.box_lambda_max.push_robot=3.0" in box
+    assert "++callbacks.lucid_curriculum.box_lambda_max.randomize_action_delay=1.5" in box
+    assert "++callbacks.lucid_curriculum.gate_lambda_max=3.0" in box
+    for cmd in (gate, fixed, box):
+        assert "++callbacks.lucid_curriculum.allow_extrapolation=true" in cmd
+    # Latency held at 1.5 -> the 12-step buffer is exact; 8 is refused.
+    a.max_delay = 8
+    with pytest.raises(SystemExit, match="max-delay 12"):
+        R.build_command(a, "gate_300", 8600, "b", Path("/tmp/artifact"))
+    assert R.ARM_DELAY_CEILING["gate_300"] == 1.5 and R.ARM_LAMBDA_CEILING["fixed_300"] == 3.0

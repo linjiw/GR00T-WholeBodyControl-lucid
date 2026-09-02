@@ -59,6 +59,9 @@ MODES = (
     "box_asym",
     "ramp_asym",
     "fixed_asym",
+    "gate_300",
+    "fixed_300",
+    "box_fast_300",
 )
 #: Deployment-latency ladder: nominal physics on every other channel, with
 #: actuation latency pinned at a fixed level. The stock ``latency_60ms`` cell
@@ -95,6 +98,11 @@ PRESET_PHYSICS_ONLY = {
     "phys_150": 1.5,
     "phys_175": 1.75,
     "phys_200": 2.0,
+    # The wide corner, for arms whose ceiling is 3.0: outside the support of
+    # every arm capped at 2.0 or below, inside for the 3.0 arms on the
+    # channels they actually reached (label from the arm's realized frontier).
+    "phys_250": 2.5,
+    "phys_300": 3.0,
 }
 #: Single-channel attribution cells: ONE event term widened past its training
 #: envelope while the other four physics channels sit at their full (1.0)
