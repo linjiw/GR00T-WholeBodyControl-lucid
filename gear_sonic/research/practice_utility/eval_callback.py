@@ -33,6 +33,7 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         step_dt: float = 0.02,
         non_latency_dr_scale: float | None = None,
         fixed_latency_steps: int | None = None,
+        channel_dr_scales: dict[str, float] | None = None,
     ) -> None:
         super().__init__(
             eval_frequency=eval_frequency,
@@ -69,6 +70,25 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
             raise ValueError("fixed_latency_steps must be >= 0")
         self._latency_report: dict[str, Any] | None = None
         self._dr_scale_report: dict[str, Any] | None = None
+        # Per-channel intensities, applied AFTER the scalar scale and only to
+        # the named event terms. The scalar ladder moves every channel together,
+        # so a drop at phys_150 says nothing about which physics broke the
+        # policy; a cell that widens one term while holding the others at their
+        # training envelope is the only way to attribute a failure to a channel.
+        # Each value is the same affine intensity ``dr_scaling.scale_range``
+        # uses, so ``{"physics_material": 1.5}`` is the friction/restitution
+        # marginal of phys_150 with mass, CoM, joint offsets and pushes at 1.0.
+        self.channel_dr_scales: dict[str, float] | None = None
+        if channel_dr_scales:
+            resolved: dict[str, float] = {}
+            for name, value in dict(channel_dr_scales).items():
+                scale = float(value)
+                if not 0.0 <= scale <= DS.MAX_EXTRAPOLATION:
+                    raise ValueError(
+                        f"channel_dr_scales[{name!r}] must be in [0, {DS.MAX_EXTRAPOLATION}], got {scale}"
+                    )
+                resolved[str(name)] = scale
+            self.channel_dr_scales = resolved
 
     def _pre_evaluate_policy(self, reset_env: bool = True) -> None:
         self.quality.reset()
@@ -85,6 +105,36 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
             self._dr_scale_report = report.to_dict()
             if self.non_latency_dr_scale > 1.0:
                 self._dr_scale_report["physical_clamp"] = DS.clamp_physical(event_manager)
+        if self.channel_dr_scales:
+            baseline = DS.capture_baseline(event_manager) if self.non_latency_dr_scale is None else baseline
+            missing = sorted(name for name in self.channel_dr_scales if name not in baseline)
+            if missing:
+                # Fail closed: a cell that claims to widen a channel the live
+                # event manager does not expose would be reported as a
+                # measurement of physics that never ran.
+                raise ValueError(
+                    f"channel_dr_scales names terms with no scalable range: {missing}; "
+                    f"available: {sorted(baseline)}"
+                )
+            channels: dict[str, Any] = {}
+            for name, scale in self.channel_dr_scales.items():
+                report = DS.apply_lambda(
+                    event_manager,
+                    {name: baseline[name]},
+                    scale,
+                    allow_extrapolation=True,
+                )
+                channels[name] = report.to_dict()
+                if name not in report.scaled_terms:
+                    raise ValueError(
+                        f"channel_dr_scales[{name!r}] was requested but the term was not scaled: "
+                        f"{report.to_dict()}"
+                    )
+            if self._dr_scale_report is None:
+                self._dr_scale_report = {}
+            self._dr_scale_report["channels"] = channels
+            if any(scale > 1.0 for scale in self.channel_dr_scales.values()):
+                self._dr_scale_report["physical_clamp_channels"] = DS.clamp_physical(event_manager)
         if self.fixed_latency_steps is not None:
             self._latency_report = _pin_action_delay(
                 event_manager, float(self.fixed_latency_steps)
@@ -105,6 +155,7 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         metrics["eval/protocol/branch_id"] = self.branch_id
         metrics["eval/protocol/non_latency_dr_scale"] = self.non_latency_dr_scale
         metrics["eval/protocol/dr_scale_report"] = self._dr_scale_report
+        metrics["eval/protocol/channel_dr_scales"] = self.channel_dr_scales
         metrics["eval/protocol/fixed_latency_steps"] = self.fixed_latency_steps
         metrics["eval/protocol/fixed_latency_report"] = self._latency_report
         event_manager = _event_manager(self.env)

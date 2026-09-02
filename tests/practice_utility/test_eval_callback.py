@@ -169,3 +169,56 @@ def test_an_in_envelope_range_is_untouched():
     report = DS.clamp_physical(mgr)
     assert report["clamped"] == {}
     assert mgr._term_cfgs[0].params["static_friction_range"] == [0.3, 1.6]
+
+
+class _ChannelCfg:
+    def __init__(self, params, mode="reset"):
+        self.params = params
+        self.mode = mode
+        self.func = None
+
+
+def _manager(**terms):
+    return SimpleNamespace(
+        active_terms=list(terms), _term_cfgs=[_ChannelCfg(params) for params in terms.values()]
+    )
+
+
+def test_channel_scales_widen_only_the_named_term():
+    # The scalar scale puts every channel at its envelope; the channel scale
+    # then widens ONE term from its baseline. Every other range must still be
+    # exactly the training envelope, or the cell is not a marginal.
+    manager = _manager(
+        randomize_rigid_body_mass={"mass_distribution_params": [0.8, 1.5]},
+        push_robot={"velocity_range": {"x": [-0.5, 0.5]}},
+    )
+    callback = PracticeRobustnessEvalCallback(
+        non_latency_dr_scale=1.0, channel_dr_scales={"randomize_rigid_body_mass": 2.0}
+    )
+    callback.env = SimpleNamespace(event_manager=manager)
+    callback.quality.reset = lambda: None
+    PracticeRobustnessEvalCallback.__mro__[1]._pre_evaluate_policy = lambda self, reset_env=True: None
+    callback._pre_evaluate_policy()
+    mass, push = manager._term_cfgs
+    assert mass.params["mass_distribution_params"] == pytest.approx([0.6, 2.0])
+    assert push.params["velocity_range"]["x"] == pytest.approx([-0.5, 0.5])
+    assert callback._dr_scale_report["channels"]["randomize_rigid_body_mass"]["scaled_terms"] == [
+        "randomize_rigid_body_mass"
+    ]
+    assert "physical_clamp_channels" in callback._dr_scale_report
+
+
+def test_channel_scales_refuse_an_unknown_term():
+    manager = _manager(push_robot={"velocity_range": {"x": [-0.5, 0.5]}})
+    callback = PracticeRobustnessEvalCallback(channel_dr_scales={"randomize_rigid_body_mass": 2.0})
+    callback.env = SimpleNamespace(event_manager=manager)
+    callback.quality.reset = lambda: None
+    with pytest.raises(ValueError, match="no scalable range"):
+        callback._pre_evaluate_policy()
+
+
+def test_channel_scales_are_validated_at_construction():
+    with pytest.raises(ValueError, match="channel_dr_scales"):
+        PracticeRobustnessEvalCallback(channel_dr_scales={"push_robot": DS.MAX_EXTRAPOLATION + 0.5})
+    assert PracticeRobustnessEvalCallback(channel_dr_scales=None).channel_dr_scales is None
+    assert PracticeRobustnessEvalCallback(channel_dr_scales={}).channel_dr_scales is None

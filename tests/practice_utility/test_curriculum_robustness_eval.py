@@ -207,3 +207,37 @@ def test_main_fails_closed_before_touching_any_input(tmp_path):
     # A physics-only run at the default capacity is not gated at all.
     with pytest.raises(FileNotFoundError):
         R.main(["--presets", "phys_125", "--training-receipt", str(missing)])
+
+
+def test_channel_presets_are_single_term_marginals():
+    # Every channel cell names exactly one of the five physics terms and
+    # holds the rest at the training envelope with latency pinned to zero.
+    assert set(R.CHANNEL_TERMS.values()) <= R.EXPECTED_DR_TERMS - {"randomize_action_delay"}
+    for preset, scales in R.PRESET_CHANNEL.items():
+        assert preset in R.PRESETS
+        assert R.PRESETS[preset] == "tracking/lucid_curriculum"
+        assert len(scales) == 1
+        (term,) = scales
+        assert term in R.CHANNEL_TERMS.values()
+    metadata = R.requested_preset_metadata(["ch_mass_200"])
+    assert metadata["ch_mass_200"] == {
+        "event_preset": "tracking/lucid_curriculum",
+        "non_latency_dr_scale": 1.0,
+        "channel_dr_scales": {"randomize_rigid_body_mass": 2.0},
+        "fixed_latency_steps": 0,
+    }
+
+
+def test_channel_command_pins_latency_and_scales_one_term():
+    command = R.build_command(
+        args(), Path("/tmp/model.pt"), "fixed", "ch_fric_150", 8700, "b", Path("/tmp/o"), "/tmp/m"
+    )
+    assert "++callbacks.practice_eval.non_latency_dr_scale=1.0" in command
+    assert "++callbacks.practice_eval.channel_dr_scales={physics_material:1.5}" in command
+    assert "++callbacks.practice_eval.fixed_latency_steps=0" in command
+    assert R.delay_matches("ch_fric_150", {"delay": {"action_delay_actuator_groups": 5, "action_delay_max_steps": 0}})
+    assert not R.delay_matches("ch_fric_150", {"delay": {"action_delay_actuator_groups": 5, "action_delay_max_steps": 8}})
+
+
+def test_channel_cells_ignore_latency_capacity():
+    R.assert_latency_within_capacity(list(R.PRESET_CHANNEL), max_delay=0)

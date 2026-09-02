@@ -88,6 +88,35 @@ PRESET_PHYSICS_ONLY = {
     "phys_175": 1.75,
     "phys_200": 2.0,
 }
+#: Single-channel attribution cells: ONE event term widened past its training
+#: envelope while the other four physics channels sit at their full (1.0)
+#: envelope and actuation latency is pinned to zero. The scalar ladder above
+#: moves all five channels together, so a drop at phys_150 cannot say which
+#: physics broke the policy -- and the friction floor clamps at lambda ~1.385,
+#: so past that the scalar ladder is silently a mass/CoM/push ladder. These
+#: cells are the per-channel marginals: the same affine intensity, applied to
+#: one term. Friction is stepped finely because its physical clamp makes 1.5
+#: and 2.0 differ only in the (benign) high bound.
+CHANNEL_TERMS = {
+    "fric": "physics_material",
+    "mass": "randomize_rigid_body_mass",
+    "com": "base_com",
+    "joint": "add_joint_default_pos",
+    "push": "push_robot",
+}
+PRESET_CHANNEL: dict[str, dict[str, float]] = {
+    "ch_fric_125": {"physics_material": 1.25},
+    "ch_fric_150": {"physics_material": 1.5},
+    "ch_fric_200": {"physics_material": 2.0},
+    "ch_mass_200": {"randomize_rigid_body_mass": 2.0},
+    "ch_mass_300": {"randomize_rigid_body_mass": 3.0},
+    "ch_com_200": {"base_com": 2.0},
+    "ch_com_300": {"base_com": 3.0},
+    "ch_joint_200": {"add_joint_default_pos": 2.0},
+    "ch_joint_300": {"add_joint_default_pos": 3.0},
+    "ch_push_200": {"push_robot": 2.0},
+    "ch_push_300": {"push_robot": 3.0},
+}
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
@@ -103,6 +132,7 @@ PRESETS = {
     "dr_150": "tracking/lucid_curriculum",
     **{name: "tracking/lucid_eval_clean" for name in PRESET_FIXED_LATENCY_STEPS},
     **{name: "tracking/lucid_curriculum" for name in PRESET_PHYSICS_ONLY},
+    **{name: "tracking/lucid_curriculum" for name in PRESET_CHANNEL},
 }
 PRESET_DR_SCALE = {
     "dr_025": 0.25,
@@ -124,6 +154,14 @@ def requested_preset_metadata(presets: list[str]) -> dict[str, dict[str, Any]]:
             row.update(
                 {
                     "non_latency_dr_scale": PRESET_PHYSICS_ONLY[preset],
+                    "fixed_latency_steps": 0,
+                }
+            )
+        elif preset in PRESET_CHANNEL:
+            row.update(
+                {
+                    "non_latency_dr_scale": 1.0,
+                    "channel_dr_scales": dict(PRESET_CHANNEL[preset]),
                     "fixed_latency_steps": 0,
                 }
             )
@@ -397,6 +435,13 @@ def rotated(items: list[str], offset: int) -> list[str]:
     return items[offset:] + items[:offset]
 
 
+def channel_override(preset: str) -> str:
+    """Hydra dict override for a single-channel cell, e.g. ``{physics_material:1.5}``."""
+    scales = PRESET_CHANNEL[preset]
+    body = ",".join(f"{name}:{value}" for name, value in sorted(scales.items()))
+    return f"++callbacks.practice_eval.channel_dr_scales={{{body}}}"
+
+
 def build_command(
     args: argparse.Namespace,
     checkpoint: Path,
@@ -438,6 +483,12 @@ def build_command(
                 "++callbacks.practice_eval.fixed_latency_steps=0",
             ]
             if preset in PRESET_PHYSICS_ONLY
+            else [
+                "++callbacks.practice_eval.non_latency_dr_scale=1.0",
+                channel_override(preset),
+                "++callbacks.practice_eval.fixed_latency_steps=0",
+            ]
+            if preset in PRESET_CHANNEL
             else (
                 [f"++callbacks.practice_eval.non_latency_dr_scale={PRESET_DR_SCALE[preset]}"]
                 if preset in PRESET_DR_SCALE
@@ -471,6 +522,7 @@ def summarize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         "undesired_contact_rate": scalar(metrics.get("eval/quality/undesired_contact_rate")),
         "torque_saturation": scalar(metrics.get("eval/quality/torque_saturation")),
         "energy_proxy": scalar(metrics.get("eval/quality/energy_proxy")),
+        "channel_dr_scales": metrics.get("eval/protocol/channel_dr_scales"),
         "quality_missing_signals": metrics.get("eval/quality/missing_signals", []),
         "active_dr_terms": metrics.get("eval/protocol/active_dr_terms", []),
         "dr_ranges": metrics.get("eval/protocol/dr_ranges", {}),
@@ -554,7 +606,7 @@ def delay_matches(preset: str, summary: dict[str, Any]) -> bool:
             and delay.get("action_delay_max_steps") == 8
             and delay.get("action_delay_nonzero_fraction", 0) > 0
         )
-    if preset in PRESET_PHYSICS_ONLY:
+    if preset in PRESET_PHYSICS_ONLY or preset in PRESET_CHANNEL:
         # Latency is pinned to zero, so every live lag must read zero.
         return delay.get("action_delay_max_steps") == 0
     if preset in PRESET_FIXED_LATENCY_STEPS:
