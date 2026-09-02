@@ -271,6 +271,19 @@ class SurvivalGateController:
     def at_ceiling(self) -> bool:
         return self.frontier >= self.config.lambda_max - 1e-12
 
+    def clear_window(self) -> None:
+        """Discard trailing probe evidence.
+
+        Used by a multi-channel gate when it moves its single probe away from
+        this channel: evidence gathered on an earlier visit must not be
+        re-judged on the next one, so each visit earns a fresh window.
+        """
+        self._window.clear()
+
+    @property
+    def window_length(self) -> int:
+        return len(self._window.rates)
+
     # ---------------------------------------------------------------- guard --
 
     def _observe_return(self, mean_return: float | None) -> float | None:

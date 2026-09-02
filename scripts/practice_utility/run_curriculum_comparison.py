@@ -172,11 +172,22 @@ ARM_RETURN_GUARD.update({arm: "relative" for arm in RATCHET_ARMS})
 #: comparison that the ratchet arm, being distributionally identical to fixed
 #: DR, could not make. Both are monotone by construction, so neither can
 #: evacuate difficulty the way the unconstrained controller did in 2 of 6 cells.
-EXPANSION_ARMS = ("gate_150", "ramp_150")
+#: ``box_150`` is the gate with a VECTOR frontier: one entry per randomization
+#: channel, each raised on its own probe evidence, the single probe stratum
+#: visiting the channels in rotation (box_gate.py). Same strata, same probe
+#: size, same per-channel ceiling as gate_150, so it can only differ in which
+#: channels widen and when -- never by training on more support.
+EXPANSION_ARMS = ("gate_150", "ramp_150", "box_150")
 SURVIVAL_OBSERVER = (
     "gear_sonic.research.practice_utility.survival_observer.SurvivalObserverCallback"
 )
-ARMS.update({"gate_150": ("gate", 0.0, None), "ramp_150": ("ramp", 0.0, None)})
+ARMS.update(
+    {
+        "gate_150": ("gate", 0.0, None),
+        "ramp_150": ("ramp", 0.0, None),
+        "box_150": ("box", 0.0, None),
+    }
+)
 ARM_SPREAD_STRATA.update({arm: 8 for arm in EXPANSION_ARMS})
 ARM_RETURN_GUARD.update({arm: "relative" for arm in EXPANSION_ARMS})
 #: Frontier ceiling per expansion arm. Kept separate from ARM_FIXED_LAMBDA
@@ -627,6 +638,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--box-channel-budget",
+        type=int,
+        default=0,
+        help=(
+            "box arm: iterations one channel may hold the probe without a decision "
+            "before the probe moves on; 0 disables the timeout"
+        ),
+    )
+    parser.add_argument(
         "--ramp-begin-iteration",
         type=int,
         default=1000,
@@ -867,7 +887,7 @@ def build_command(
             # gate trained harder".
             f"++callbacks.lucid_curriculum.gate_probe_max={ARM_FRONTIER_MAX[mode]}",
         ]
-        if mode == "gate_150":
+        if mode in ("gate_150", "box_150"):
             expansion += [
                 f"++callbacks.lucid_curriculum.gate_threshold={args.gate_threshold}",
                 f"++callbacks.lucid_curriculum.gate_window={args.gate_window}",
@@ -877,6 +897,10 @@ def build_command(
                 f"++callbacks.lucid_curriculum.gate_lambda_max={ARM_FRONTIER_MAX[mode]}",
                 f"++callbacks.lucid_curriculum.gate_guard_action={args.gate_guard_action}",
             ]
+            if mode == "box_150":
+                expansion.append(
+                    f"++callbacks.lucid_curriculum.box_channel_budget={args.box_channel_budget}"
+                )
         else:
             expansion += [
                 "++callbacks.lucid_curriculum.ramp_start_lambda=1.0",
@@ -1234,7 +1258,7 @@ def main(argv=None) -> int:
                             "probe_fraction": EXPANSION_PROBE_FRACTION,
                             "frontier_fraction": EXPANSION_FRONTIER_FRACTION,
                             "monotone_by_construction": True,
-                            "signal": "survival" if mode == "gate_150" else "none",
+                            "signal": "survival" if mode in ("gate_150", "box_150") else "none",
                             "gate": (
                                 {
                                     "threshold": args.gate_threshold,
@@ -1243,7 +1267,20 @@ def main(argv=None) -> int:
                                     "min_episodes": args.gate_min_episodes,
                                     "guard_action": args.gate_guard_action,
                                 }
-                                if mode == "gate_150"
+                                if mode in ("gate_150", "box_150")
+                                else None
+                            ),
+                            "box": (
+                                {
+                                    "channel_budget": args.box_channel_budget,
+                                    "frontier_vector_final": (
+                                        curriculum[-1].get("frontier_vector") if curriculum else None
+                                    ),
+                                    "channel_expansions": (
+                                        curriculum[-1].get("channel_expansions") if curriculum else None
+                                    ),
+                                }
+                                if mode == "box_150"
                                 else None
                             ),
                             "ramp": (

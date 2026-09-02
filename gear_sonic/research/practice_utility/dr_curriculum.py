@@ -126,8 +126,14 @@ class LucidCurriculumCallback(TrainerCallback):
         ramp_end_lambda: float = 1.5,
         ramp_begin_iteration: int = 1000,
         ramp_end_iteration: int = 5000,
+        #: Box mode: which event terms get their own frontier. None means every
+        #: runtime-scalable term the event manager exposes, resolved at bind.
+        box_channels: tuple[str, ...] | list[str] | None = None,
+        #: Box mode: iterations one channel may hold the probe without a
+        #: decision before the probe moves on. Zero disables the timeout.
+        box_channel_budget: int = 0,
     ) -> None:
-        if mode not in ("lucid", "fixed", "off", "yoked", "gate", "ramp"):
+        if mode not in ("lucid", "fixed", "off", "yoked", "gate", "ramp", "box"):
             raise ValueError(
                 f"unknown curriculum mode {mode!r}; expected " "lucid/fixed/off/yoked/gate/ramp"
             )
@@ -232,7 +238,7 @@ class LucidCurriculumCallback(TrainerCallback):
         # admitted because both are monotone by construction (see
         # survival_gate.py) and neither can lower applied support by its own
         # decision rule.
-        if self.allow_extrapolation and mode not in ("fixed", "gate", "ramp"):
+        if self.allow_extrapolation and mode not in ("fixed", "gate", "ramp", "box"):
             raise ValueError(
                 "allow_extrapolation is a support extension for the monotone "
                 f"modes fixed/gate/ramp; mode {mode!r} stays hard-capped at lambda = 1"
@@ -285,18 +291,37 @@ class LucidCurriculumCallback(TrainerCallback):
         self.ramp_end_iteration = int(ramp_end_iteration)
         self.survival_branch_id = survival_branch_id
         self.gate: Any = None
+        #: Box mode: the per-channel gate, built at bind time once the event
+        #: manager has named its scalable terms. See box_gate.py.
+        self.box: Any = None
+        self._box_channels = tuple(box_channels) if box_channels else None
+        self._box_channel_budget = max(0, int(box_channel_budget))
+        self._box_lambda_max = float(gate_lambda_max)
+        self._box_initial = float(min(gate_initial_frontier, gate_lambda_max))
+        self._box_gate_kwargs = dict(
+            threshold=float(gate_threshold),
+            window=int(gate_window),
+            step_size=float(gate_step),
+            probe_offset=self.gate_probe_offset,
+            dwell=int(gate_dwell),
+            min_episodes=int(gate_min_episodes),
+            return_relative_drop=float(return_relative_drop),
+            return_window=int(return_window),
+            guard_action=str(gate_guard_action),
+        )
+        self._pending_box_state: dict[str, Any] | None = None
         self._frontier_lambda: float | None = None
         #: Absolute per-stratum intensities for the current iteration, low
         #: first. When set, ``_apply_strata`` uses these instead of scaling the
         #: frontier by the TACE weights, which is what lets one stratum sit
         #: *above* the frontier.
         self._stratum_lambdas_absolute: tuple[float, ...] | None = None
-        if mode in ("gate", "ramp"):
+        if mode in ("gate", "ramp", "box"):
             if not 0.0 <= self.gate_tail_fraction < 1.0:
                 raise ValueError(f"gate_tail_fraction must be in [0, 1), got {gate_tail_fraction}")
             ceiling = (
                 gate_lambda_max
-                if mode == "gate"
+                if mode in ("gate", "box")
                 else max(self.ramp_start_lambda, self.ramp_end_lambda)
             )
             if ceiling > 1.0 and not self.allow_extrapolation:
@@ -348,10 +373,14 @@ class LucidCurriculumCallback(TrainerCallback):
             self._frontier_lambda = self.gate.frontier
         elif mode == "ramp":
             self._frontier_lambda = self.ramp_start_lambda
+        elif mode == "box":
+            # The scalar view of a vector frontier is its mean; the vector
+            # itself is written every iteration as ``frontier_vector``.
+            self._frontier_lambda = self._box_initial
 
         if mode == "lucid":
             starting_lambda = initial_lambda
-        elif mode in ("gate", "ramp"):
+        elif mode in ("gate", "ramp", "box"):
             # The PI controller is inert in these modes; keep its config
             # envelope-bound so no controller path can follow the frontier
             # above 1, exactly as fixed mode does.
@@ -523,6 +552,82 @@ class LucidCurriculumCallback(TrainerCallback):
                 "physical_clamp": sorted((self._clamp_report or {}).get("clamped", {})),
                 **outcome.to_dict(),
             }
+        elif self.mode == "box":
+            from gear_sonic.research.practice_utility import box_gate as BG
+
+            self._ensure_box()
+            observer = self._survival_observer()
+            mean_return = self._mean_return(state)
+            probe_survival, probe_episodes = (None, 0)
+            if observer is not None:
+                observer.ensure_flushed(step)
+                probe_survival, probe_episodes = observer.current_probe()
+                if probe_episodes > 0:
+                    self._probe_evidence_seen = True
+            elapsed = step - (self._start_step or 0)
+            if (
+                not self._probe_evidence_seen
+                and elapsed > self.warmup_iterations + self.gate_evidence_grace
+            ):
+                raise RuntimeError(
+                    f"box gate has received no probe episode in {elapsed} "
+                    f"iterations (observer present: {observer is not None}). The "
+                    "gate cannot expand without evidence and a silent hold would "
+                    "read as a decision rather than a fault."
+                )
+            outcome = self.box.update(
+                probe_survival=probe_survival,
+                probe_episodes=probe_episodes,
+                mean_return=mean_return,
+            )
+            mean_frontier = float(BG.mean_frontier(outcome.frontier_after) or 0.0)
+            self._frontier_lambda = mean_frontier
+            self._apply(mean_frontier)
+            channel_step = outcome.channel_step or {}
+            record = {
+                "global_step": step,
+                "mode": "box",
+                "signal": "survival",
+                # ``lambda`` / ``frontier_lambda`` keep their scalar meaning for
+                # every reader that already parses them; for a vector frontier
+                # that scalar is the channel mean, and it is monotone because
+                # every channel is.
+                "lambda": mean_frontier,
+                "gap_quantile": None,
+                "frontier_lambda": mean_frontier,
+                "frontier_vector": outcome.frontier_after,
+                "probe_vector": outcome.probe,
+                "active_channel": outcome.active_channel,
+                "channels": list(self.box.config.channels),
+                "channel_expansions": dict(self.box.expansions),
+                "channel_visits": dict(self.box.visits),
+                "population_survival": (
+                    observer.current_population() if observer is not None else None
+                ),
+                "survival_observer_present": observer is not None,
+                "allow_extrapolation": self.allow_extrapolation,
+                "physical_clamp": sorted((self._clamp_report or {}).get("clamped", {})),
+                # Flattened gate-style fields so the gate's readers work unchanged.
+                "probe_lambda": (
+                    outcome.probe.get(outcome.active_channel)
+                    if outcome.active_channel is not None
+                    else None
+                ),
+                "probe_survival": probe_survival,
+                "probe_episodes": int(probe_episodes),
+                "window_mean": channel_step.get("window_mean"),
+                "window_episodes": channel_step.get("window_episodes", 0),
+                "window_full": channel_step.get("window_full", False),
+                "fired": outcome.fired,
+                "withheld": outcome.withheld,
+                "mean_return": mean_return,
+                "return_reference": channel_step.get("return_reference"),
+                "guard_tripped": outcome.guard_tripped,
+                "frozen_until": channel_step.get("frozen_until", 0),
+                "applied_decrease": outcome.applied_decrease,
+                "at_ceiling": outcome.all_at_ceiling,
+                "box": outcome.to_dict(),
+            }
         elif self.mode == "ramp":
             from gear_sonic.research.practice_utility import survival_gate as SG
 
@@ -668,7 +773,7 @@ class LucidCurriculumCallback(TrainerCallback):
         and no per-stratum entry. So the binding is done here, lazily, the
         first time the observer is actually reachable.
         """
-        if self.mode not in ("gate", "ramp"):
+        if self.mode not in ("gate", "ramp", "box"):
             return None
         from gear_sonic.research.practice_utility import survival_observer as SO
 
@@ -684,7 +789,7 @@ class LucidCurriculumCallback(TrainerCallback):
         identically. In ramp mode it is measured and logged but gates nothing,
         which is what makes the pair a clean attribution control.
         """
-        if self.mode not in ("gate", "ramp") or self.spread_strata < 2:
+        if self.mode not in ("gate", "ramp", "box") or self.spread_strata < 2:
             return None
         return self.spread_strata - 1
 
@@ -721,6 +826,56 @@ class LucidCurriculumCallback(TrainerCallback):
         lambdas.append(float(probe))
         return tuple(lambdas)
 
+    def _ensure_box(self) -> None:
+        """Build the per-channel gate once the scalable terms are known."""
+        if self.mode != "box" or self.box is not None or self.baseline is None:
+            return
+        from gear_sonic.research.practice_utility import box_gate as BG
+
+        # Default to the terms a runtime curriculum can actually move. A
+        # startup-mode term has captured ranges but is never re-applied, so
+        # probing it would gate on physics that never changes.
+        channels = self._box_channels or tuple(name for name in self.scalable if name in self.baseline)
+        pinned = set(self.term_lambda_overrides) | set(self.term_lambda_caps)
+        channels = tuple(name for name in channels if name in self.baseline and name not in pinned)
+        if not channels:
+            raise RuntimeError("box mode found no scalable channel to gate")
+        self.box = BG.BoxGateController(
+            BG.BoxGateConfig(
+                channels=channels,
+                lambda_max=self._box_lambda_max,
+                probe_max=self.gate_probe_max,
+                channel_budget=self._box_channel_budget,
+                **self._box_gate_kwargs,
+            ),
+            initial_lambda=self._box_initial,
+        )
+        if self._pending_box_state is not None:
+            self.box.load_state_dict(self._pending_box_state)
+            self._pending_box_state = None
+        self._frontier_lambda = float(BG.mean_frontier(self.box.frontier) or self._box_initial)
+
+    def _box_stratum_vectors(self) -> tuple[dict[str, float], ...]:
+        """Per-stratum intensity VECTORS: retained tail, frontier, probe.
+
+        The same layout as the scalar expansion strata, taken channel by
+        channel: tail strata are fractions of the frontier vector, the frontier
+        stratum is the vector itself, and the probe is the frontier with the
+        active channel raised one step.
+        """
+        assert self.box is not None
+        frontier = self.box.frontier
+        probe = self.box.probe
+        count = self.spread_strata
+        tail = count - 2
+        vectors: list[dict[str, float]] = []
+        for index in range(tail):
+            share = float(index + 1) / float(tail + 1)
+            vectors.append({name: value * share for name, value in frontier.items()})
+        vectors.append(dict(frontier))
+        vectors.append(dict(probe))
+        return tuple(vectors)
+
     def _bind(self, env: Any) -> None:
         manager = _event_manager_of(env)
         if manager is None:
@@ -729,6 +884,7 @@ class LucidCurriculumCallback(TrainerCallback):
         self.baseline = DS.capture_baseline(manager)
         self.scalable = DS.scalable_terms(manager)
         self._env = env
+        self._ensure_box()
         if (
             self.anchor_ratio > 0.0 or self.spread_strata > 1 or self.yardstick_envs > 0
         ) and self.assignment is None:
@@ -845,13 +1001,27 @@ class LucidCurriculumCallback(TrainerCallback):
         if self._event_manager is None or self.baseline is None:
             return
         per_term = tuple(self.term_lambda_overrides) + tuple(self.term_lambda_caps)
-        DS.apply_lambda(
-            self._event_manager,
-            self.baseline,
-            lambda_value,
-            exclude_terms=per_term,
-            allow_extrapolation=self.allow_extrapolation,
-        )
+        vector = self.box.frontier if (self.mode == "box" and self.box is not None) else None
+        if vector is None:
+            DS.apply_lambda(
+                self._event_manager,
+                self.baseline,
+                lambda_value,
+                exclude_terms=per_term,
+                allow_extrapolation=self.allow_extrapolation,
+            )
+        else:
+            # A vector frontier: every channel at its own intensity, applied
+            # from the captured baseline exactly as the scalar path does.
+            for name in self.baseline:
+                if name in per_term:
+                    continue
+                DS.apply_lambda(
+                    self._event_manager,
+                    {name: self.baseline[name]},
+                    float(vector.get(name, lambda_value)),
+                    allow_extrapolation=self.allow_extrapolation,
+                )
         for name in per_term:
             if name in self.baseline:
                 DS.apply_lambda(
@@ -865,7 +1035,9 @@ class LucidCurriculumCallback(TrainerCallback):
             # region (friction went negative at 1.5x before the eval-side clamp
             # existed); clamp the live config and keep the report for the record.
             self._clamp_report = DS.clamp_physical(self._event_manager)
-        if self.mode in ("gate", "ramp") and self.spread_strata > 1:
+        if self.mode == "box" and self.spread_strata > 1 and self.box is not None:
+            self._stratum_lambdas_absolute = self._box_stratum_vectors()
+        elif self.mode in ("gate", "ramp", "box") and self.spread_strata > 1:
             self._stratum_lambdas_absolute = self._expansion_stratum_lambdas(float(lambda_value))
         self._apply_strata(lambda_value)
 
@@ -902,7 +1074,11 @@ class LucidCurriculumCallback(TrainerCallback):
                     # A stratum may sit above the frontier, so the intensity is
                     # absolute rather than a fraction of it. Channel caps and
                     # overrides still apply, per channel, at that intensity.
-                    stratum_lambda = self._channel_lambda(name, float(absolute[index]))
+                    # Box mode records a vector per stratum; take this term's entry.
+                    level = absolute[index]
+                    if isinstance(level, dict):
+                        level = level.get(name, lambda_value)
+                    stratum_lambda = self._channel_lambda(name, float(level))
                 else:
                     stratum_lambda = channel_lambda * weight
                 params = DS.scaled_term_params(base, stratum_lambda, self.allow_extrapolation)
@@ -947,7 +1123,7 @@ class LucidCurriculumCallback(TrainerCallback):
         """Final target-only phase: every cohort on the full envelope."""
         if self.consolidation_fraction <= 0.0:
             return False
-        if self.mode in ("gate", "ramp"):
+        if self.mode in ("gate", "ramp", "box"):
             # Backstop only: the constructor already refuses this combination,
             # so reaching here means consolidation_fraction was mutated after
             # construction. Raising is still correct -- see the constructor.
@@ -1022,6 +1198,7 @@ class LucidCurriculumCallback(TrainerCallback):
             "yardstick_envs": self.yardstick_envs,
             "controller": self.controller.state_dict(),
             "gate": self.gate.state_dict() if self.gate is not None else None,
+            "box": self.box.state_dict() if self.box is not None else None,
             "frontier_lambda": self._frontier_lambda,
             "scalable_terms": self.scalable,
             "term_lambda_overrides": self.term_lambda_overrides,
@@ -1052,6 +1229,19 @@ class LucidCurriculumCallback(TrainerCallback):
             }
         elif state.get("frontier_lambda") is not None and self.mode == "ramp":
             self._frontier_lambda = float(state["frontier_lambda"])
+        box_state = state.get("box")
+        if box_state and self.mode == "box":
+            if self.box is not None:
+                from gear_sonic.research.practice_utility import box_gate as BG
+
+                self.box.load_state_dict(box_state)
+                self._frontier_lambda = float(BG.mean_frontier(self.box.frontier) or 0.0)
+            else:
+                self._pending_box_state = dict(box_state)
+            self._resumed_from = {
+                "frontier_vector": {k: v.get("frontier") for k, v in box_state.get("gates", {}).items()},
+                "iteration": box_state.get("iteration"),
+            }
         controller_state = state.get("controller")
         if not controller_state:
             return

@@ -138,3 +138,48 @@ def test_ordinary_arms_keep_the_envelope_and_no_flag():
     cmd = R.build_command(args(), "fixed", 8600, "b", Path("/tmp/artifact"))
     assert "++callbacks.lucid_curriculum.fixed_lambda=1.0" in cmd
     assert not any("allow_extrapolation" in part for part in cmd)
+
+
+def test_box_150_is_the_gate_with_a_vector_frontier_and_the_same_support():
+    a = args()
+    a.max_delay = 12
+    a.gate_threshold = 0.8
+    a.gate_window = 100
+    a.gate_dwell = 50
+    a.gate_min_episodes = 200
+    a.gate_guard_action = "freeze"
+    a.box_channel_budget = 300
+    a.ramp_begin_iteration = 0
+    a.ramp_end_iteration = 1500
+    a.num_envs = 1024
+    box = R.build_command(a, "box_150", 8600, "b", Path("/tmp/artifact"))
+    gate = R.build_command(a, "gate_150", 8600, "b", Path("/tmp/artifact"))
+    assert "++callbacks.lucid_curriculum.mode=box" in box
+    assert "++callbacks.lucid_curriculum.box_channel_budget=300" in box
+    assert "++callbacks.lucid_curriculum.allow_extrapolation=true" in box
+    # Identical strata, probe geometry, ceiling, gate law and survival observer.
+    shared = (
+        "++callbacks.lucid_curriculum.spread_strata=8",
+        "++callbacks.lucid_curriculum.stratum_sizes=[43,43,43,43,42,42,640,128]",
+        "++callbacks.lucid_curriculum.gate_probe_offset=0.125",
+        "++callbacks.lucid_curriculum.gate_probe_max=1.5",
+        "++callbacks.lucid_curriculum.gate_lambda_max=1.5",
+        "++callbacks.lucid_curriculum.gate_threshold=0.8",
+        "++callbacks.lucid_curriculum.gate_window=100",
+        "++callbacks.lucid_curriculum.gate_dwell=50",
+        "++callbacks.lucid_curriculum.return_guard=relative",
+        "++callbacks.survival_observer.enabled=true",
+    )
+    for part in shared:
+        assert part in box and part in gate
+    assert not any("box_channel_budget" in part for part in gate)
+    assert "box_150" in R.MODES and "box_150" in R.EXPANSION_ARMS
+    assert R.ARM_LAMBDA_CEILING["box_150"] == 1.5
+
+
+def test_box_150_refuses_an_undersized_delay_buffer():
+    a = args()
+    a.gate_threshold, a.gate_window, a.gate_dwell, a.gate_min_episodes = 0.8, 200, 200, 200
+    a.gate_guard_action, a.box_channel_budget = "freeze", 0
+    with pytest.raises(SystemExit, match="max-delay 12"):
+        R.build_command(a, "box_150", 8600, "b", Path("/tmp/artifact"))
