@@ -51,6 +51,14 @@ MODES = (
     "fixed_150",
     "fixed_u",
     "fixed_u150",
+    # Monotone support-expansion arms (scalar gate / ramp, per-channel box)
+    # and the asymmetric-support arms from the channel attribution.
+    "gate_150",
+    "ramp_150",
+    "box_150",
+    "box_asym",
+    "ramp_asym",
+    "fixed_asym",
 )
 #: Deployment-latency ladder: nominal physics on every other channel, with
 #: actuation latency pinned at a fixed level. The stock ``latency_60ms`` cell

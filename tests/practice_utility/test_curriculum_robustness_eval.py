@@ -241,3 +241,13 @@ def test_channel_command_pins_latency_and_scales_one_term():
 
 def test_channel_cells_ignore_latency_capacity():
     R.assert_latency_within_capacity(list(R.PRESET_CHANNEL), max_delay=0)
+
+
+def test_expansion_and_asymmetric_arms_are_selectable_for_the_ladder():
+    # The comparison driver can train these; the evaluator must be able to
+    # score them, or a finished arm sits unscored (observed live: box_150,
+    # 2026-09-02, and Phase 2's gate_150 would have hit the same wall).
+    from scripts.practice_utility import run_curriculum_comparison as C
+
+    for mode in ("gate_150", "ramp_150", "box_150", "box_asym", "ramp_asym", "fixed_asym"):
+        assert mode in C.MODES and mode in R.MODES
