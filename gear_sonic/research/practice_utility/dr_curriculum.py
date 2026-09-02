@@ -118,6 +118,10 @@ class LucidCurriculumCallback(TrainerCallback):
         #: DR is an expansion rather than a warm-up. Read instead of
         #: ``initial_lambda``, which every launcher passes as 0.0.
         gate_initial_frontier: float = 1.0,
+        #: Iterations past warm-up the gate will tolerate with zero probe
+        #: episodes before declaring the signal path dead. Sized so a run aborts
+        #: in minutes rather than after a full 8,000-iteration cell.
+        gate_evidence_grace: int = 200,
         ramp_start_lambda: float = 1.0,
         ramp_end_lambda: float = 1.5,
         ramp_begin_iteration: int = 1000,
@@ -270,6 +274,10 @@ class LucidCurriculumCallback(TrainerCallback):
         # difference. It also means the probe only ever explores levels the
         # frontier could actually reach.
         self.gate_probe_max = float(gate_probe_max)
+        self.gate_evidence_grace = max(0, int(gate_evidence_grace))
+        #: Set the first time any probe episode is reported. Until it is true,
+        #: a held frontier is a fault rather than a decision.
+        self._probe_evidence_seen = False
         self.gate_tail_fraction = float(gate_tail_fraction)
         self.ramp_start_lambda = float(ramp_start_lambda)
         self.ramp_end_lambda = float(ramp_end_lambda)
@@ -471,6 +479,26 @@ class LucidCurriculumCallback(TrainerCallback):
             if observer is not None:
                 observer.ensure_flushed(step)
                 probe_survival, probe_episodes = observer.current_probe()
+                if probe_episodes > 0:
+                    self._probe_evidence_seen = True
+            # Fail fast on a dead signal path. A gate that never receives probe
+            # evidence holds its frontier forever and is indistinguishable, in
+            # the applied-lambda trace, from a gate that honestly decided not to
+            # expand -- the most expensive possible false negative, and one that
+            # would otherwise only surface after the full 8,000 iterations when
+            # the mechanism gate on probe row count fails. Abort while the run is
+            # minutes old instead.
+            elapsed = step - (self._start_step or 0)
+            if (
+                not self._probe_evidence_seen
+                and elapsed > self.warmup_iterations + self.gate_evidence_grace
+            ):
+                raise RuntimeError(
+                    f"survival gate has received no probe episode in {elapsed} "
+                    f"iterations (observer present: {observer is not None}). The "
+                    "gate cannot expand without evidence and a silent hold would "
+                    "read as a decision rather than a fault."
+                )
             outcome = self.gate.update(
                 probe_survival=probe_survival,
                 probe_episodes=probe_episodes,

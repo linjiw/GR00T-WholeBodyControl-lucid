@@ -479,3 +479,47 @@ class TestProbeCeiling:
         ramp._apply(1.5)
         assert max(gate._stratum_lambdas_absolute) == pytest.approx(1.5)
         assert gate._stratum_lambdas_absolute == pytest.approx(ramp._stratum_lambdas_absolute)
+
+
+class TestDeadSignalPath:
+    """A gate with no probe evidence must abort, not hold quietly.
+
+    A held frontier and an honest "the probe never cleared threshold" produce
+    the same applied-lambda trace. Without this guard the difference only
+    surfaces after 8,000 iterations, when the probe-row mechanism gate fails.
+    """
+
+    def test_missing_observer_aborts_after_the_grace_period(self):
+        env, callback = build("gate", gate_evidence_grace=5)
+        callback.on_train_begin(None, None, None, env=env)
+        with pytest.raises(RuntimeError, match="no probe episode"):
+            for step in range(1, 40):
+                callback.on_step_end(None, State(step, mean_reward=10.0), None, env=env)
+
+    def test_observer_reporting_zero_episodes_also_aborts(self):
+        env, callback = build("gate", gate_evidence_grace=5)
+        SO._ACTIVE["exp"] = StubSurvival(None, episodes=0)
+        callback.on_train_begin(None, None, None, env=env)
+        with pytest.raises(RuntimeError, match="no probe episode"):
+            for step in range(1, 40):
+                callback.on_step_end(None, State(step, mean_reward=10.0), None, env=env)
+
+    def test_a_single_probe_episode_satisfies_the_guard_forever(self):
+        # Sparse evidence is legitimate: episodes end when they end.
+        env, callback = build("gate", gate_evidence_grace=5)
+        stub = StubSurvival(0.9, episodes=3)
+        SO._ACTIVE["exp"] = stub
+        callback.on_train_begin(None, None, None, env=env)
+        callback.on_step_end(None, State(1, mean_reward=10.0), None, env=env)
+        stub._survival, stub._episodes = None, 0
+        for step in range(2, 60):
+            callback.on_step_end(None, State(step, mean_reward=10.0), None, env=env)
+        assert callback._probe_evidence_seen is True
+
+    def test_ramp_does_not_abort_without_probe_evidence(self):
+        # The open-loop control reads nothing, so a silent probe is not a fault.
+        env, callback = build("ramp")
+        callback.on_train_begin(None, None, None, env=env)
+        for step in range(1, 60):
+            callback.on_step_end(None, State(step, mean_reward=10.0), None, env=env)
+        assert callback._frontier_lambda > 1.0
