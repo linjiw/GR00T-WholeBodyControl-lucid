@@ -158,8 +158,46 @@ PRESET_PAIR: dict[str, dict[str, float]] = {
     # Above the corner the combination arm practises, so it stays held out for it too.
     "ch_push_fric_350_150": {"push_robot": 3.5, "physics_material": 1.5},
 }
-#: Every cell that scales named channels, marginal or pairwise.
-PRESET_SCALED: dict[str, dict[str, float]] = {**PRESET_CHANNEL, **PRESET_PAIR}
+#: Actuator-side cells. These do NOT scale an event-term range around a nominal in
+#: the same sense as the physics channels: the four actuator terms live only in the
+#: ``tracking/lucid_actuator`` event preset, so a cell naming one of them also
+#: selects that preset. Scaling a channel to 0.0 collapses its range to a point at
+#: the nominal, which is how ``act_off`` turns every actuator channel off while
+#: keeping the same preset, and is the within-preset baseline these cells are read
+#: against. The six inherited channels sit at their envelope throughout, exactly as
+#: they do for the physics cells.
+ACTUATOR_TERMS = (
+    "randomize_joint_effort_limit",
+    "randomize_joint_friction",
+    "randomize_joint_armature",
+    "randomize_joint_velocity_limit",
+)
+PRESET_ACTUATOR: dict[str, dict[str, float]] = {
+    # Every actuator channel collapsed to its nominal: the reference for the rest.
+    "act_off": {name: 0.0 for name in ACTUATOR_TERMS},
+    # Peak torque. At scale s the range is [1 - 0.5s, 1] of the rating, so 1.5
+    # reaches a quarter of peak on the worst-drawn environment.
+    **{f"act_effort_{int(s * 100):03d}": {**{n: 0.0 for n in ACTUATOR_TERMS},
+                                          "randomize_joint_effort_limit": s}
+       for s in (0.5, 1.0, 1.5)},
+    # Gearbox friction, in N.m added. The asset declares none, so this is the
+    # channel that adds physics rather than perturbing it.
+    **{f"act_friction_{int(s * 100):03d}": {**{n: 0.0 for n in ACTUATOR_TERMS},
+                                            "randomize_joint_friction": s}
+       for s in (0.5, 1.0, 2.0, 3.0)},
+    # Reflected inertia; expected to behave like the smooth channels.
+    **{f"act_armature_{int(s * 100):03d}": {**{n: 0.0 for n in ACTUATOR_TERMS},
+                                            "randomize_joint_armature": s}
+       for s in (1.0, 2.0)},
+    # Speed ceiling. Read with care: below what the clip demands this makes the
+    # reference untrackable rather than hard, which is not a barrier.
+    **{f"act_velocity_{int(s * 100):03d}": {**{n: 0.0 for n in ACTUATOR_TERMS},
+                                            "randomize_joint_velocity_limit": s}
+       for s in (0.5, 1.0, 1.5)},
+}
+
+#: Every cell that scales named channels, marginal, pairwise or actuator.
+PRESET_SCALED: dict[str, dict[str, float]] = {**PRESET_CHANNEL, **PRESET_PAIR, **PRESET_ACTUATOR}
 PRESETS = {
     "id_clean": "tracking/lucid_eval_clean",
     "dr_full": "tracking/lucid_curriculum",
@@ -176,6 +214,9 @@ PRESETS = {
     **{name: "tracking/lucid_eval_clean" for name in PRESET_FIXED_LATENCY_STEPS},
     **{name: "tracking/lucid_curriculum" for name in PRESET_PHYSICS_ONLY},
     **{name: "tracking/lucid_curriculum" for name in PRESET_SCALED},
+    # The actuator terms exist only in this preset, so a cell that names one must
+    # select it. Every other cell keeps the preset it always had.
+    **{name: "tracking/lucid_actuator" for name in PRESET_ACTUATOR},
 }
 PRESET_DR_SCALE = {
     "dr_025": 0.25,

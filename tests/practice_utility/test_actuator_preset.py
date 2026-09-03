@@ -172,3 +172,88 @@ def test_the_actuator_cells_reach_the_evaluator_as_channel_overrides():
     assert row["channel_dr_scales"]["randomize_joint_effort_limit"] == 1.5
     override = R.channel_override("act_effort_150")
     assert "randomize_joint_effort_limit:1.5" in override
+
+
+# ------------------------------------------------- the point-versus-range arms
+
+def _train_module():
+    from scripts.practice_utility import run_curriculum_comparison as T
+    return T
+
+
+def _args(**over):
+    from types import SimpleNamespace
+    base = dict(checkpoint="/tmp/m.pt", num_envs=1024, iterations=1500, warmup_iterations=10,
+                max_delay=12, delta_target=0.778, kp=1.0, ki=0.02, alpha=0.05, integral_max=1.0,
+                return_floor=8.0, exp="e", encoder="/tmp/e.pt", motion_file="m",
+                smpl_motion_file="s", consolidation_fraction=0.0, spread_strata=1,
+                latency_cap=0.5, return_guard="absolute", return_relative_drop=0.25,
+                return_window=8, margin_horizon=12, margin_band_lo=1.1, margin_band_hi=1.3,
+                yardstick_envs=64, actuator_channel="effort_limit", actuator_target=0.5,
+                gate_threshold=0.80, gate_window=100, gate_dwell=50, gate_min_episodes=200,
+                gate_guard_action="freeze", box_channel_budget=300,
+                ramp_begin_iteration=0, ramp_end_iteration=1500)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _command(mode, **over):
+    from pathlib import Path
+    T = _train_module()
+    return " ".join(T.build_command(_args(**over), mode=mode, seed=8600,
+                                    branch_id="b", artifact_dir=Path("/tmp/a")))
+
+
+def test_only_the_actuator_arms_switch_event_preset():
+    T = _train_module()
+    for mode in T.ACTUATOR_ARMS:
+        assert "manager_env/events=tracking/lucid_actuator" in _command(mode), mode
+    for mode in ("fixed", "off", "gate_150", "prac_push"):
+        assert "manager_env/events=tracking/lucid_curriculum" in _command(mode), mode
+
+
+def test_the_point_arm_trains_every_environment_at_the_target():
+    """The whole claim rests on this: a point target has no easy episodes in it."""
+    assert "effort_limit_scale_range=[0.5,0.5]" in _command("act_point")
+
+
+def test_the_range_arm_keeps_the_easy_end_that_makes_it_self_curricularizing():
+    assert "effort_limit_scale_range=[0.5,1.0]" in _command("act_range")
+
+
+def test_the_scheduled_arms_end_where_the_point_arm_sits():
+    """Otherwise staging would be compared against a different final distribution."""
+    for mode in ("act_ramp", "act_gate"):
+        assert "effort_limit_scale_range=[0.5,0.5]" in _command(mode), mode
+
+
+def test_the_control_arm_leaves_every_actuator_channel_at_its_nominal():
+    T = _train_module()
+    command = _command("act_off")
+    for _term, param, nominal in T.ACTUATOR_RANGE_PARAM.values():
+        assert f"{param}=[{nominal},{nominal}]" in command
+
+
+def test_every_arm_holds_the_channels_it_is_not_testing_at_nominal():
+    """A difference between arms must be attributable to one channel."""
+    T = _train_module()
+    command = _command("act_point")
+    for name, (_term, param, nominal) in T.ACTUATOR_RANGE_PARAM.items():
+        if name == "effort_limit":
+            continue
+        assert f"{param}=[{nominal},{nominal}]" in command, name
+
+
+def test_the_target_channel_is_a_launch_argument_not_a_constant():
+    """Which channel is worth training on is decided by the frozen-policy screen."""
+    command = _command("act_point", actuator_channel="joint_friction", actuator_target=6.0)
+    assert "joint_friction_range=[6.0,6.0]" in command
+    assert "effort_limit_scale_range=[1.0,1.0]" in command
+
+
+def test_an_unknown_channel_or_arm_is_refused():
+    T = _train_module()
+    with pytest.raises(ValueError, match="not an actuator-barrier arm"):
+        T.actuator_overrides("fixed", "effort_limit", 0.5)
+    with pytest.raises(ValueError, match="unknown actuator channel"):
+        T.actuator_overrides("act_point", "nonsense", 0.5)

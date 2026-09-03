@@ -436,6 +436,80 @@ def practice_vectors(mode: str) -> list[dict[str, float]]:
     return [{}, dict(PRACTICE_CHANNELS[mode])]
 
 
+#: ---------------------------------------------------------------------------
+#: Actuator-barrier arms (2026-09-03). These exist to test one structural claim.
+#:
+#: Fixed randomization here is ALREADY a curriculum. dr_scaling.scale_range
+#: shrinks every range toward its nominal, so the support at any intensity is
+#: strictly nested inside the support at the maximum, and every term is reset
+#: mode, so all 1024 environments redraw independently every episode. A batch at
+#: full intensity therefore contains near-nominal episodes, and staging cannot
+#: withhold what fixed randomization keeps supplying. That is the simplest
+#: explanation for every curriculum result in this project tying fixed DR, and
+#: the scale function's own docstring says as much.
+#:
+#: The prediction is that a curriculum can only help when the target is
+#: CONCENTRATED, so that easy episodes are genuinely absent. These arms test it by
+#: changing one thing: whether the target actuator range is a range or a point.
+#:
+#:   act_off      the actuator channels at nominal; what the budget buys with none
+#:   act_range    the target as a RANGE, which is self-curricularizing
+#:   act_point    the same target as a POINT: every environment, every episode
+#:   act_ramp     an open-loop schedule from nominal to that point
+#:   act_gate     the probe-gated curriculum expanding toward that point
+#:
+#: act_point versus act_range is the decisive contrast and it is a one-line
+#: configuration difference, which is what makes the claim cheap to falsify.
+#: act_ramp and act_gate say whether staging reaches a point that direct training
+#: cannot, and whether feedback adds anything over the schedule.
+#:
+#: The channel and the target value are launch arguments, not constants, because
+#: which channel is worth training on is decided by the frozen-policy screen.
+ACTUATOR_ARMS = ("act_off", "act_range", "act_point", "act_ramp", "act_gate")
+ARMS.update({
+    "act_off": ("fixed", 0.0, None),
+    "act_range": ("fixed", 0.0, None),
+    "act_point": ("fixed", 0.0, None),
+    "act_ramp": ("ramp", 0.0, None),
+    "act_gate": ("gate", 0.0, None),
+})
+ARM_SPREAD_STRATA.update({"act_ramp": 8, "act_gate": 8})
+ARM_RETURN_GUARD.update({arm: "relative" for arm in ACTUATOR_ARMS})
+#: Every actuator arm needs the preset that declares the four actuator terms.
+ARM_EVENT_PRESET: dict[str, str] = {arm: "tracking/lucid_actuator" for arm in ACTUATOR_ARMS}
+#: The channel each arm varies, and the parameter that carries its range.
+ACTUATOR_RANGE_PARAM = {
+    "effort_limit": ("randomize_joint_effort_limit", "effort_limit_scale_range", 1.0),
+    "joint_friction": ("randomize_joint_friction", "joint_friction_range", 0.0),
+    "armature": ("randomize_joint_armature", "armature_scale_range", 1.0),
+    "velocity_limit": ("randomize_joint_velocity_limit", "velocity_limit_scale_range", 1.0),
+}
+
+
+def actuator_overrides(mode: str, channel: str, target: float) -> list[str]:
+    """Hydra overrides that give one actuator arm its target distribution.
+
+    Every actuator channel except the one under test is collapsed to a point at
+    its nominal, so a difference between arms is attributable to the one channel.
+    The channel under test gets a range for ``act_range`` and a point for the
+    rest; for the scheduled arms the point is where the schedule ENDS, and the
+    curriculum moves it there from the nominal.
+    """
+    if mode not in ACTUATOR_ARMS:
+        raise ValueError(f"{mode!r} is not an actuator-barrier arm")
+    if channel not in ACTUATOR_RANGE_PARAM:
+        raise ValueError(f"unknown actuator channel {channel!r}")
+    overrides = []
+    for name, (term, param, nominal) in ACTUATOR_RANGE_PARAM.items():
+        if name == channel and mode != "act_off":
+            low, high = (min(nominal, target), max(nominal, target)) if mode == "act_range" else (target, target)
+        else:
+            low, high = nominal, nominal  # collapsed to its nominal: inert
+        overrides.append(
+            f"++manager_env.events.{term}.params.{param}=[{low},{high}]")
+    return overrides
+
+
 #: Every arm whose applied lambda can exceed the lambda = 1 envelope, and the
 #: ceiling it can reach. The delay-buffer capacity check reads THIS, not the
 #: fixed-lambda table: an expansion arm launched at the default --max-delay
@@ -702,6 +776,21 @@ def parse_args(argv=None):
         "--checkpoint",
         default=None,
         help="branch origin; omit together with --from-scratch to train a fresh policy",
+    )
+    parser.add_argument(
+        "--actuator-channel",
+        choices=sorted(ACTUATOR_RANGE_PARAM),
+        default="effort_limit",
+        help="which actuator channel the act_* arms vary; chosen by the frozen-policy screen",
+    )
+    parser.add_argument(
+        "--actuator-target",
+        type=float,
+        default=0.5,
+        help=(
+            "where the act_* arms end: the point act_point trains at, the upper end of "
+            "act_range, and the endpoint act_ramp and act_gate schedule toward"
+        ),
     )
     parser.add_argument(
         "--from-scratch",
@@ -1050,6 +1139,13 @@ def build_command(
                 f"which needs a delay-buffer capacity of {needed} steps; the buffer "
                 f"silently clamps to --max-delay ({args.max_delay}). Pass --max-delay {needed}."
             )
+    actuator: list[str] = []
+    if mode in ACTUATOR_ARMS:
+        actuator = actuator_overrides(
+            mode,
+            getattr(args, "actuator_channel", "effort_limit"),
+            float(getattr(args, "actuator_target", 0.5)),
+        )
     spread = [f"++callbacks.lucid_curriculum.spread_strata={strata}"] if strata > 1 else []
     if strata > 1 and anchor_ratio == 0.0:
         # Strata need the cohort machinery, which the callback only installs
@@ -1147,7 +1243,7 @@ def build_command(
             else ["use_wandb=false"]
         ),
         f"seed={seed}",
-        "manager_env/events=tracking/lucid_curriculum",
+        f"manager_env/events={ARM_EVENT_PRESET.get(mode, 'tracking/lucid_curriculum')}",
         *(
             [f"manager_env/terminations={args.terminations}"]
             if getattr(args, "terminations", None)
@@ -1179,6 +1275,7 @@ def build_command(
         *caps,
         *margin,
         *spread,
+        *actuator,
         *relative_guard,
         *ratchet,
         *expansion,
