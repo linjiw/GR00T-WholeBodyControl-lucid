@@ -315,6 +315,28 @@ EXPECTED_DR_TERMS = {
     "randomize_action_delay",
     "randomize_rigid_body_mass",
 }
+#: The actuator preset declares four more schedulable terms. The mechanism gate
+#: asserts an EXACT term set, so without this an actuator cell would report ten
+#: live terms against an expected six, the equality would fail, and `verified`
+#: would empty for the WHOLE receipt including every unrelated cell in it.
+#:
+#: Keeping the gate exact rather than relaxing it is the point: on the actuator
+#: preset it now proves the four channels were actually present and schedulable
+#: in the run, so a preset that failed to load them reports six terms and fails
+#: the gate, which is precisely the evidence a new channel needs.
+ACTUATOR_DR_TERMS = {
+    "randomize_joint_effort_limit",
+    "randomize_joint_friction",
+    "randomize_joint_armature",
+    "randomize_joint_velocity_limit",
+}
+
+
+def expected_dr_terms(preset: str) -> set[str]:
+    """The exact set of schedulable terms a cell on this preset must report."""
+    if preset in PRESET_ACTUATOR:
+        return EXPECTED_DR_TERMS | ACTUATOR_DR_TERMS
+    return EXPECTED_DR_TERMS
 
 
 def parse_args(argv=None):
@@ -778,7 +800,7 @@ def main(argv=None) -> int:
         complete = len(runs) == len(specs) and all(run["complete"] for run in runs.values())
         mechanisms = complete and all(
             delay_matches(run["preset"], run["summary"])
-            and set(run["summary"].get("active_dr_terms", [])) == EXPECTED_DR_TERMS
+            and set(run["summary"].get("active_dr_terms", [])) == expected_dr_terms(run["preset"])
             for run in runs.values()
         )
         hashes_after = {path: file_sha256(Path(path)) for path in checkpoint_hashes_before}

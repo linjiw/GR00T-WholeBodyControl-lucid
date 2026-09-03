@@ -83,6 +83,11 @@ class ActuatorChannel:
     floor: float = 0.0
     #: Extra writers that take the same value (PhysX splits friction three ways).
     also_write: tuple[str, ...] = ()
+    #: Method on ``articulation.root_physx_view`` that reads the property BACK out of
+    #: the physics engine. The articulation writes its own mirror unconditionally
+    #: before calling the simulator, so comparing against ``asset.data`` proves only
+    #: that Python was updated. This is the read that proves the value landed.
+    physx_getter: str = ""
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -120,6 +125,7 @@ CHANNELS: dict[str, ActuatorChannel] = {
     "effort_limit": ActuatorChannel(
         "effort_limit", ("joint_effort_limits_sim", "joint_effort_limits"),
         "write_joint_effort_limit_to_sim", "scale", (-0.5, 0.0),
+        physx_getter="get_dof_max_forces",
         note="fraction of peak torque removed; nominal is the peak rating in g1.py"),
     # Currently zero in simulation. A few N.m of Coulomb friction is ordinary for
     # a reducer of this size, and it rises sharply when the robot is cold.
@@ -137,13 +143,14 @@ CHANNELS: dict[str, ActuatorChannel] = {
     # Reflected rotor inertia, set from motor specs and never varied.
     "armature": ActuatorChannel(
         "armature", ("default_joint_armature",), "write_joint_armature_to_sim",
-        "scale", (-0.3, 0.6)),
+        "scale", (-0.3, 0.6), physx_getter="get_dof_armatures"),
     # Back-EMF caps joint speed; a motor at its limit cannot track a fast reference.
     # joint_velocity_limits is deprecated in favour of joint_vel_limits and logs a
     # warning on every read; prefer the new name and fall back to the old one.
     "velocity_limit": ActuatorChannel(
         "velocity_limit", ("joint_vel_limits", "joint_velocity_limits"),
-        "write_joint_velocity_limit_to_sim", "scale", (-0.4, 0.0)),
+        "write_joint_velocity_limit_to_sim", "scale", (-0.4, 0.0),
+        physx_getter="get_dof_max_velocities"),
 }
 
 # The dict key and the channel's own name must agree, or a lookup by key would
@@ -252,6 +259,8 @@ def draw_and_write(
             continue  # an older Isaac Sim splits friction fewer ways; report it
         writer(drawn, joint_ids=columns, env_ids=env_ids)
         written += 1
+
+    readback = physx_readback(asset, channel, drawn, env_ids, columns)
     return {
         "channel": channel_name,
         "combine": channel.combine,
@@ -271,7 +280,33 @@ def draw_and_write(
         "written_max": float(drawn.max()),
         "note": channel.note,
         "nominal_source": nominal_source(asset, channel_name),
+        **readback,
     }
+
+
+def physx_readback(asset, channel, drawn, env_ids, columns) -> dict[str, Any]:
+    """Read the property back out of the physics engine and compare.
+
+    Returns ``{"physx_readback": "unavailable"}`` where the view or the getter is
+    not exposed, which is the honest answer on a fake or an older build. Where it
+    IS available, a mismatch means the simulator did not take the value, and that
+    is the only evidence that distinguishes a live channel from one that merely
+    updated Python.
+    """
+    view = getattr(asset, "root_physx_view", None)
+    getter = getattr(view, channel.physx_getter, None) if (view and channel.physx_getter) else None
+    if getter is None:
+        return {"physx_readback": "unavailable",
+                "physx_reason": ("no getter for this channel" if not channel.physx_getter
+                                 else "articulation exposes no root_physx_view")}
+    try:
+        live = torch.as_tensor(getter()).to(torch.float32)
+        seen = live[env_ids.to(live.device)][:, columns].to(drawn.device)
+        gap = float((seen - drawn).abs().max())
+    except Exception as error:  # a shape or device surprise must not kill the run
+        return {"physx_readback": "error", "physx_reason": repr(error)[:200]}
+    return {"physx_readback": "matched" if gap <= 1e-3 else "MISMATCH",
+            "physx_max_abs_gap": gap}
 
 
 def apply(

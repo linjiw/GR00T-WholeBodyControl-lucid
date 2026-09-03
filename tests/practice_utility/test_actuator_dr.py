@@ -226,6 +226,70 @@ def test_every_channel_key_matches_its_own_name():
         assert key == channel.name
 
 
+# ---------------------------------------- proving the write reached the engine
+
+class PhysxView:
+    """The few getters actuator_dr reads back through, over a settable store."""
+
+    def __init__(self, store, honest=True):
+        self.store, self.honest = store, honest
+
+    def get_dof_max_forces(self):
+        return self.store if self.honest else torch.zeros_like(self.store)
+
+    def get_dof_armatures(self):
+        return self.store
+
+    def get_dof_max_velocities(self):
+        return self.store
+
+
+def test_without_a_physx_view_the_readback_says_so_rather_than_claiming_success():
+    """On a fake, or an older build, 'unavailable' is the honest answer."""
+    art = FakeArticulation()
+    report = A.apply(art, "effort_limit", lam=1.0, generator=gen())
+    assert report["physx_readback"] == "unavailable"
+    assert "root_physx_view" in report["physx_reason"]
+
+
+def test_a_matching_readback_is_reported_as_matched():
+    art = FakeArticulation()
+    store = torch.tensor([PEAK] * NUM_ENVS)
+    art.root_physx_view = PhysxView(store)
+    original = A.CHANNELS["effort_limit"].writer
+
+    def capture(values, joint_ids=None, env_ids=None):
+        store[env_ids.reshape(-1)[:, None], torch.tensor(joint_ids)] = values
+    setattr(art, "_captured", capture)
+    art.writes.setdefault(original, [])
+    # route the writer into the store so the engine and the write agree
+    object.__setattr__(art, original, capture)
+    report = A.apply(art, "effort_limit", lam=1.0, generator=gen())
+    assert report["physx_readback"] == "matched"
+    assert report["physx_max_abs_gap"] < 1e-3
+
+
+def test_an_engine_that_ignored_the_write_is_reported_as_a_mismatch():
+    """The articulation updates its own mirror unconditionally; only this catches it."""
+    art = FakeArticulation()
+    art.root_physx_view = PhysxView(torch.tensor([PEAK] * NUM_ENVS), honest=False)
+    report = A.apply(art, "effort_limit", lam=1.0, generator=gen())
+    assert report["physx_readback"] == "MISMATCH"
+    assert report["physx_max_abs_gap"] > 1.0
+
+
+def test_a_readback_that_raises_does_not_kill_the_run():
+    class Exploding:
+        def get_dof_max_forces(self):
+            raise RuntimeError("view detached")
+
+    art = FakeArticulation()
+    art.root_physx_view = Exploding()
+    report = A.apply(art, "effort_limit", lam=1.0, generator=gen())
+    assert report["physx_readback"] == "error"
+    assert "view detached" in report["physx_reason"]
+
+
 def test_a_negative_intensity_is_refused():
     with pytest.raises(ValueError, match="lam"):
         A.apply(FakeArticulation(), "effort_limit", lam=-0.5)
