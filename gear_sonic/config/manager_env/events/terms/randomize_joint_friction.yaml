@@ -1,0 +1,23 @@
+# Coulomb friction per joint, in newton-metres, ADDED.
+#
+# The G1's URDF contains no <dynamics> tags at all, so the simulated gearboxes
+# are frictionless and undamped; the only damping in the model is the PD
+# controller's gain, which is a control term rather than a property of the
+# mechanism. A real harmonic or planetary reducer has Coulomb friction that
+# varies with temperature, load and wear, and a cold robot is measurably stiffer
+# than a warm one.
+#
+# Added rather than scaled because the nominal is zero and scaling zero is zero.
+# 6 N.m is about 4 per cent of the knee's peak rating. Static friction has a sign
+# discontinuity at zero velocity, so unlike every other channel here this one is
+# nonsmooth: it produces stiction and a deadband rather than a shifted optimum.
+randomize_joint_friction:
+  _target_: isaaclab.managers.EventTermCfg
+  func: gear_sonic.research.practice_utility.events_actuator:randomize_joint_friction
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    joint_friction_range: [0.0, 6.0]

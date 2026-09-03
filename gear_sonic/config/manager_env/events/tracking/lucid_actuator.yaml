@@ -1,0 +1,70 @@
+# The LUCID curriculum channels PLUS the actuator-side ones.
+#
+# WHY A SEPARATE PRESET
+# ---------------------
+# Every channel in lucid_curriculum.yaml is a property of the robot's load or of
+# the world: mass, torso centre of mass, ground material, a joint default-position
+# offset, pushes and latency. None is a property of the actuator, and the actuator
+# is where a deployed humanoid differs most from its simulator.
+#
+# The four terms added here are actuator properties that Isaac Lab already lets us
+# write per environment and per joint, and that this robot currently holds fixed:
+# peak torque, joint friction (which the URDF does not declare at all), reflected
+# inertia, and the joint speed ceiling.
+#
+# This is a NEW file rather than an edit to lucid_curriculum.yaml on purpose. Every
+# landed result in this project was produced under that preset, and a baseline arm
+# that quietly acquired four extra channels would not be a baseline. Runs that do
+# not ask for this preset are unchanged.
+#
+# WHAT TO EXPECT
+# --------------
+# Two of these remove capability outright and one adds a nonsmooth term, which is a
+# different shape from the six smooth perturbations that produced no learnability
+# barrier. Whether any of them actually produces one is a measurement, and the
+# frozen-policy screen answers it before anything is trained.
+
+defaults:
+  - terms/physics_material@_here_
+  - terms/add_joint_default_pos@_here_
+  - terms/base_com@_here_
+  - terms/push_robot@_here_
+  - terms/randomize_rigid_body_mass@_here_
+  - terms/randomize_action_delay@_here_
+  - terms/randomize_joint_effort_limit@_here_
+  - terms/randomize_joint_friction@_here_
+  - terms/randomize_joint_armature@_here_
+  - terms/randomize_joint_velocity_limit@_here_
+
+_target_: gear_sonic.research.practice_utility.events_reset_safe.LucidEventCfg
+
+# The six inherited channels keep exactly the settings lucid_curriculum.yaml gives
+# them, so a comparison against a run under that preset differs only by the
+# actuator terms.
+randomize_rigid_body_mass:
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      body_names: ".*wrist_yaw.*|torso_link"
+    mass_distribution_params: [0.8, 1.5]
+    operation: "scale"
+
+base_com:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_rigid_body_com
+  mode: "reset"
+
+add_joint_default_pos:
+  func: gear_sonic.research.practice_utility.events_reset_safe:randomize_joint_default_pos
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    pos_distribution_params: [-0.01, 0.01]
+    operation: "add"
+
+physics_material:
+  mode: "reset"

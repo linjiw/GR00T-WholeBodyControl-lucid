@@ -1,0 +1,23 @@
+# Peak torque per joint, scaled.
+#
+# robots/g1.py sets effort_limit_sim to the PEAK rating taken straight from the
+# URDF (139 N.m knee and hip roll/pitch, 88 hip yaw and waist yaw, 50 feet and
+# waist) and applies it forever. A deployed motor delivers less: the battery sags
+# under load, the winding heats, and units vary. Unitree documents a derating
+# strategy on the G1 that limits current when a joint passes its safe
+# temperature.
+#
+# Multiplicative, nominal 1.0, so lambda = 0 collapses the range to [1, 1] and
+# the term writes back the rating that was already there. The lower bound of 0.5
+# is the continuous-to-peak ratio ordinary for a brushless servo of this class;
+# it is an assumption and is recorded as one.
+randomize_joint_effort_limit:
+  _target_: isaaclab.managers.EventTermCfg
+  func: gear_sonic.research.practice_utility.events_actuator:randomize_joint_effort_limit
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    effort_limit_scale_range: [0.5, 1.0]

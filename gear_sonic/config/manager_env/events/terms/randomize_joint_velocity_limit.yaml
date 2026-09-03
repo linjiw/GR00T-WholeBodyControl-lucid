@@ -1,0 +1,21 @@
+# Joint speed ceiling, scaled.
+#
+# Back-EMF caps joint speed and a motor at its limit cannot track a fast
+# reference. robots/g1.py sets velocity_limit_sim from the URDF (20 rad/s knee
+# and hip, 32 hip yaw, 37 feet) and never varies it.
+#
+# CAUTION, and it is the reason this channel is ranked last. On a motion-TRACKING
+# task a ceiling below what the clip demands makes the reference physically
+# untrackable rather than merely hard. A difficulty that nothing can reach is an
+# unlearnable task, not a learnability barrier, and the two must never be
+# reported as the same finding.
+randomize_joint_velocity_limit:
+  _target_: isaaclab.managers.EventTermCfg
+  func: gear_sonic.research.practice_utility.events_actuator:randomize_joint_velocity_limit
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    velocity_limit_scale_range: [0.6, 1.0]

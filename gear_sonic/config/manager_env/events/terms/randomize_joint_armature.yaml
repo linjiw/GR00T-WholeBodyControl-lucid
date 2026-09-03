@@ -1,0 +1,17 @@
+# Reflected rotor inertia, scaled.
+#
+# robots/g1.py sets armature per joint group from motor specifications and never
+# varies it. It is a routinely mis-identified quantity on real hardware, but it
+# is a smooth parameter: expect it to behave like the six channels already
+# measured, which produced no learnability barrier. It is included so that
+# expectation is tested rather than assumed.
+randomize_joint_armature:
+  _target_: isaaclab.managers.EventTermCfg
+  func: gear_sonic.research.practice_utility.events_actuator:randomize_joint_armature
+  mode: "reset"
+  params:
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "robot"
+      joint_names: [".*"]
+    armature_scale_range: [0.7, 1.6]
