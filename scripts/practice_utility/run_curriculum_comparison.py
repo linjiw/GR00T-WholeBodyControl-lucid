@@ -311,7 +311,15 @@ ASYM_CAPS: dict[str, float] = {name: cap for name, cap in ASYM_CEILINGS.items() 
 #: clearing its threshold 67% of the time. Without the guard, the survival
 #: probe alone decides where to stop, which is the claim the method actually
 #: rests on.
-WIDE_ARMS = ("gate_300", "fixed_300", "box_fast_300", "gate_300_ng")
+#: ``box_fast_300_ng`` is the per-channel companion to gate_300_ng. At a fast
+#: cadence and a 3.0 ceiling the guarded box still converged to a nearly
+#: uniform frontier (1.5 on four channels, 1.375 on two) because the guard
+#: froze every channel at once and no channel's probe ever fell below its
+#: threshold: at lambda <= 1.5 all six channels look equally survivable, so
+#: the box has nothing to discriminate on. Per-channel asymmetry can only
+#: appear where the channels actually differ, which the attribution sweep
+#: places near 2.5-3.0 and which the guard prevented any arm from reaching.
+WIDE_ARMS = ("gate_300", "fixed_300", "box_fast_300", "gate_300_ng", "box_fast_300_ng")
 WIDE_MAX = 3.0
 WIDE_CAPS: dict[str, float] = {"randomize_action_delay": 1.5}
 WIDE_BOX_CEILINGS: dict[str, float] = {
@@ -328,15 +336,18 @@ ARMS.update(
         "fixed_300": ("fixed", 0.0, None),
         "box_fast_300": ("box", 0.0, None),
         "gate_300_ng": ("gate", 0.0, None),
+        "box_fast_300_ng": ("box", 0.0, None),
     }
 )
-EXPANSION_ARMS = (*EXPANSION_ARMS, "gate_300", "box_fast_300", "gate_300_ng")
-ARM_SPREAD_STRATA.update({"gate_300": 8, "box_fast_300": 8, "gate_300_ng": 8})
+EXPANSION_ARMS = (*EXPANSION_ARMS, "gate_300", "box_fast_300", "gate_300_ng", "box_fast_300_ng")
+ARM_SPREAD_STRATA.update({"gate_300": 8, "box_fast_300": 8, "gate_300_ng": 8, "box_fast_300_ng": 8})
 #: Per-arm relative-return-guard tolerance, overriding --return-relative-drop.
 #: 0.99 means "only a 99% collapse counts as harm", i.e. the guard is inert.
-ARM_RETURN_DROP: dict[str, float] = {"gate_300_ng": 0.99}
+ARM_RETURN_DROP: dict[str, float] = {"gate_300_ng": 0.99, "box_fast_300_ng": 0.99}
 ARM_RETURN_GUARD.update({arm: "relative" for arm in WIDE_ARMS})
-ARM_FRONTIER_MAX.update({"gate_300": WIDE_MAX, "box_fast_300": WIDE_MAX, "gate_300_ng": WIDE_MAX})
+ARM_FRONTIER_MAX.update(
+    {"gate_300": WIDE_MAX, "box_fast_300": WIDE_MAX, "gate_300_ng": WIDE_MAX, "box_fast_300_ng": WIDE_MAX}
+)
 ARM_FIXED_LAMBDA.update({"fixed_300": WIDE_MAX})
 #: Per-arm channel caps (scalar frontier/fixed lambda clamped per term) and
 #: per-arm box ceilings (vector frontier bounded per term).
@@ -350,9 +361,10 @@ ARM_TERM_CAPS: dict[str, dict[str, float]] = {
 ARM_BOX_CEILINGS: dict[str, dict[str, float]] = {
     "box_asym": ASYM_CEILINGS,
     "box_fast_300": WIDE_BOX_CEILINGS,
+    "box_fast_300_ng": WIDE_BOX_CEILINGS,
 }
-GATE_ARMS = ("gate_150", "box_150", "box_asym", "gate_300", "box_fast_300", "gate_300_ng")
-BOX_ARMS = ("box_150", "box_asym", "box_fast_300")
+GATE_ARMS = ("gate_150", "box_150", "box_asym", "gate_300", "box_fast_300", "gate_300_ng", "box_fast_300_ng")
+BOX_ARMS = ("box_150", "box_asym", "box_fast_300", "box_fast_300_ng")
 
 #: ---------------------------------------------------------------------------
 #: Practice-allocation arms (screen, 2026-09-02). These answer a question that

@@ -267,3 +267,15 @@ def test_guard_free_gate_disables_the_relative_return_guard_only():
                          and "output_dir" not in c and "capsule_dir" not in c]
     assert strip(ng) == strip(base)
     assert "gate_300_ng" in R.MODES
+
+
+def test_guard_free_box_matches_the_guarded_box_apart_from_the_guard():
+    a = _asym_args()
+    ng = R.build_command(a, "box_fast_300_ng", 8600, "b", Path("/tmp/artifact"))
+    base = R.build_command(a, "box_fast_300", 8600, "b", Path("/tmp/artifact"))
+    assert "++callbacks.lucid_curriculum.return_relative_drop=0.99" in ng
+    assert "++callbacks.lucid_curriculum.box_lambda_max.push_robot=3.0" in ng
+    assert "++callbacks.lucid_curriculum.box_lambda_max.randomize_action_delay=1.5" in ng
+    strip = lambda cmd: [c for c in cmd if "return_relative_drop" not in c and "branch_id" not in c
+                         and "output_dir" not in c and "capsule_dir" not in c]
+    assert strip(ng) == strip(base)

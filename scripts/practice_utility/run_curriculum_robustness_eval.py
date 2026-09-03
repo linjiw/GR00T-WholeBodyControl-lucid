@@ -63,6 +63,7 @@ MODES = (
     "fixed_300",
     "box_fast_300",
     "gate_300_ng",
+    "box_fast_300_ng",
     # Practice-allocation arms: the lambda = 1 envelope with a fixed 25% share
     # of the same environments reallocated to one practised condition. They ask
     # where extra training is productive, before any scheduler exists.
