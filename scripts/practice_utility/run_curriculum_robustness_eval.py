@@ -70,6 +70,7 @@ MODES = (
     "prac_null",
     "prac_easy",
     "prac_push",
+    "prac_fric",
     "prac_pushfric",
 )
 #: Deployment-latency ladder: nominal physics on every other channel, with
@@ -154,6 +155,8 @@ PRESET_CHANNEL: dict[str, dict[str, float]] = {
 PRESET_PAIR: dict[str, dict[str, float]] = {
     "ch_push_fric_200_150": {"push_robot": 2.0, "physics_material": 1.5},
     "ch_push_fric_300_150": {"push_robot": 3.0, "physics_material": 1.5},
+    # Above the corner the combination arm practises, so it stays held out for it too.
+    "ch_push_fric_350_150": {"push_robot": 3.5, "physics_material": 1.5},
 }
 #: Every cell that scales named channels, marginal or pairwise.
 PRESET_SCALED: dict[str, dict[str, float]] = {**PRESET_CHANNEL, **PRESET_PAIR}

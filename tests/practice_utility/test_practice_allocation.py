@@ -113,7 +113,24 @@ def test_practice_levels_match_the_measured_sweep():
         "base_com": 3.0,
         "add_joint_default_pos": 3.0,
     }
-    assert R.PRACTICE_CHANNELS["prac_pushfric"] == {"push_robot": 2.0, "physics_material": 1.5}
+    assert R.PRACTICE_CHANNELS["prac_fric"] == {"physics_material": 1.5}
+    assert R.PRACTICE_CHANNELS["prac_pushfric"] == {"push_robot": 3.0, "physics_material": 1.5}
+
+
+def test_the_four_practice_arms_form_a_two_by_two():
+    """Amendment A1: the interaction must be estimable, not confounded with dose.
+
+    prac_pushfric practises push at exactly the level prac_push does and friction at
+    exactly the level prac_fric does, so the only thing that varies between the four
+    arms is which factors are present.
+    """
+    null = R.PRACTICE_CHANNELS["prac_null"]
+    push = R.PRACTICE_CHANNELS["prac_push"]
+    fric = R.PRACTICE_CHANNELS["prac_fric"]
+    both = R.PRACTICE_CHANNELS["prac_pushfric"]
+    assert null == {}
+    assert both == {**push, **fric}
+    assert set(push) & set(fric) == set()
 
 
 def test_unknown_arm_is_refused():
@@ -196,9 +213,10 @@ def test_the_pair_cells_name_two_terms_and_bracket_the_practised_corner():
         assert preset in E.PRESETS
         assert set(scales) <= R.EXPECTED_SCALABLE_TERMS
     practised = R.PRACTICE_CHANNELS["prac_pushfric"]
-    assert E.PRESET_PAIR["ch_push_fric_200_150"] == practised
-    above = E.PRESET_PAIR["ch_push_fric_300_150"]
+    assert E.PRESET_PAIR["ch_push_fric_300_150"] == practised
+    above = E.PRESET_PAIR["ch_push_fric_350_150"]
     assert above["push_robot"] > practised["push_robot"]
+    assert above["physics_material"] == practised["physics_material"]
 
 
 def test_every_scaled_cell_stays_inside_the_extrapolation_cap():

@@ -384,14 +384,22 @@ BOX_ARMS = ("box_150", "box_asym", "box_fast_300", "box_fast_300_ng")
 #:                  3x, where the origin already scores 0.949/0.988/0.990)
 #:   prac_push      the bottleneck: the share practises push at 3x, where the
 #:                  origin scores 0.746 -- difficult, and far from the floor
-#:   prac_pushfric  the interaction: push 2x together with friction 1.5x, each
-#:                  cheap alone (0.912 and 0.973) and untested in combination
+#:   prac_fric      friction at 1.5x alone, the second factor on its own
+#:   prac_pushfric  both factors together, at the SAME levels the single-factor
+#:                  arms use, so the four arms form a 2x2 on {push practice,
+#:                  friction practice} and the interaction is estimable rather
+#:                  than confounded with a change of dose
 #:
 #: The levels are read off the measured single-channel sweep rather than chosen,
 #: so "difficult" means a measured success level, not an intuition. The plain
 #: ``fixed`` arm at one stratum is the second control and answers how much comes
 #: from simply continuing to train.
-PRACTICE_ARMS = ("prac_null", "prac_easy", "prac_push", "prac_pushfric")
+#: Amended 2026-09-03 (A1): prac_pushfric practised push at 2.0 while prac_push practised it
+#: at 3.0, so their difference mixed "add friction" with "lower the push dose" and answered a
+#: question about recipes. Both now practise push at 3.0, prac_fric supplies friction alone,
+#: and the four arms {null, push, fric, pushfric} form a 2x2 whose interaction term is
+#: estimable. Amendment made before any arm was trained.
+PRACTICE_ARMS = ("prac_null", "prac_easy", "prac_push", "prac_fric", "prac_pushfric")
 #: Share of the focus cohort reallocated to the practice stratum. Identical for
 #: every arm, so the arms differ only in what that share practises.
 PRACTICE_FRACTION = 0.25
@@ -403,7 +411,8 @@ PRACTICE_CHANNELS: dict[str, dict[str, float]] = {
         "add_joint_default_pos": 3.0,
     },
     "prac_push": {"push_robot": 3.0},
-    "prac_pushfric": {"push_robot": 2.0, "physics_material": 1.5},
+    "prac_fric": {"physics_material": 1.5},
+    "prac_pushfric": {"push_robot": 3.0, "physics_material": 1.5},
 }
 ARMS.update({arm: ("fixed", 0.0, None) for arm in PRACTICE_ARMS})
 ARM_SPREAD_STRATA.update({arm: 2 for arm in PRACTICE_ARMS})
