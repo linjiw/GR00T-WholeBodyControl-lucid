@@ -126,9 +126,14 @@ CHANNELS: dict[str, ActuatorChannel] = {
     "joint_friction": ActuatorChannel(
         "joint_friction", ("default_joint_friction_coeff", "default_joint_friction"),
         "write_joint_friction_coefficient_to_sim", "add", (0.0, 6.0),
-        also_write=("write_joint_dynamic_friction_coefficient_to_sim",
-                    "write_joint_viscous_friction_coefficient_to_sim"),
-        note="N.m of gearbox friction; the simulated G1 currently has none"),
+        # Static and dynamic Coulomb friction share the same units (N.m) and the
+        # same physical magnitude, so one draw is right for both. VISCOUS friction
+        # is deliberately NOT written here: it is a velocity-proportional damping
+        # coefficient in N.m.s/rad, and feeding it a Coulomb magnitude would add a
+        # large damping term while the docstring claimed to be modelling stiction.
+        # A viscous channel needs its own units and its own range.
+        also_write=("write_joint_dynamic_friction_coefficient_to_sim",),
+        note="N.m of Coulomb (static and dynamic) gearbox friction; the asset declares none"),
     # Reflected rotor inertia, set from motor specs and never varied.
     "armature": ActuatorChannel(
         "armature", ("default_joint_armature",), "write_joint_armature_to_sim",
@@ -225,10 +230,17 @@ def draw_and_write(
     base = nominal[env_ids][:, columns].clone().to(torch.float32)
     if high < low:
         raise ValueError(f"{channel_name}: range ({low}, {high}) is inverted")
+    # The draw must land on the same device as the nominal. A CUDA nominal with a
+    # CPU deviation raises on the first reset, which is the good failure, but a
+    # generator is device-bound so the draw is made where the generator lives and
+    # moved afterwards.
     if low == high:
-        step = torch.full(base.shape, float(low), dtype=torch.float32)
+        step = torch.full(base.shape, float(low), dtype=torch.float32, device=base.device)
     else:
-        step = torch.rand(base.shape, generator=generator, dtype=torch.float32) * (high - low) + low
+        draw_device = getattr(generator, "device", None) if generator is not None else base.device
+        step = torch.rand(base.shape, generator=generator, dtype=torch.float32,
+                          device=draw_device) * (high - low) + low
+        step = step.to(base.device)
     drawn = base * step if channel.combine == "scale" else base + step
     drawn = drawn.clamp(min=channel.floor)
 
@@ -246,6 +258,11 @@ def draw_and_write(
         "applied_range": [float(low), float(high)],
         "envs": int(env_ids.numel()),
         "joints": len(columns),
+        # How many writer methods this Isaac Sim exposed and accepted the call.
+        # It is NOT proof the value reached PhysX: the articulation writes its own
+        # mirror unconditionally before the sim call, and older Isaac Sim builds
+        # log a warning and return from the dynamic-friction writer. A run that
+        # depends on this channel should read the physx view back.
         "writers_called": written,
         "writers_available": len(writers),
         "nominal_mean": float(base.mean()),

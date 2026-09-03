@@ -112,21 +112,35 @@ def test_friction_is_added_because_the_simulated_robot_has_none():
     assert report["written_max"] <= 6.0 + 1e-6
 
 
-def test_friction_reaches_all_three_physx_coefficients():
+def test_friction_writes_both_coulomb_coefficients_and_the_same_value_to_each():
+    """Static and dynamic Coulomb friction share units and magnitude; one draw is right."""
     art = FakeArticulation()
     report = A.apply(art, "joint_friction", lam=1.0, generator=gen())
-    assert report["writers_called"] == 3
+    assert report["writers_called"] == 2
     static = art.writes["write_joint_friction_coefficient_to_sim"][0]
     dynamic = art.writes["write_joint_dynamic_friction_coefficient_to_sim"][0]
-    viscous = art.writes["write_joint_viscous_friction_coefficient_to_sim"][0]
-    assert torch.equal(static, dynamic) and torch.equal(static, viscous)
+    assert torch.equal(static, dynamic)
+
+
+def test_friction_never_touches_the_viscous_coefficient():
+    """Viscous friction is a DIFFERENT physical quantity, in N.m.s/rad.
+
+    Writing a Coulomb magnitude into it would add a large velocity-proportional
+    damping term while the channel claimed to be modelling stiction, so a run
+    would be measuring something other than what its own docstring said.
+    """
+    art = FakeArticulation()
+    A.apply(art, "joint_friction", lam=1.0, generator=gen())
+    assert "write_joint_viscous_friction_coefficient_to_sim" not in art.writes
+    channel = A.CHANNELS["joint_friction"]
+    assert not any("viscous" in w for w in channel.also_write)
 
 
 def test_an_older_isaac_sim_with_fewer_writers_is_reported_not_assumed():
     art = FakeArticulation(friction_writers=1)
     report = A.apply(art, "joint_friction", lam=1.0, generator=gen())
     assert report["writers_called"] == 1
-    assert report["writers_available"] == 3
+    assert report["writers_available"] == 2
 
 
 def test_higher_intensity_widens_the_draw():
@@ -186,6 +200,14 @@ def test_an_unknown_nominal_is_an_error_not_a_silent_zero():
     del art.data.joint_vel_limits
     with pytest.raises(KeyError, match="no nominal source"):
         A.apply(art, "velocity_limit", lam=1.0, generator=gen())
+
+
+def test_the_draw_lands_on_the_same_device_as_the_nominal():
+    """A CPU draw against a CUDA nominal raises on the first reset in Isaac."""
+    art = FakeArticulation()
+    A.apply(art, "effort_limit", lam=1.0, generator=gen())
+    written = art.writes["write_joint_effort_limit_to_sim"][0]
+    assert written.device == art.data.joint_effort_limits.device
 
 
 def test_a_swapped_argument_is_refused_at_definition_time():

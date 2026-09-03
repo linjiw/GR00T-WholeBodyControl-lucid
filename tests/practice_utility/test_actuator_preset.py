@@ -111,3 +111,64 @@ def test_the_config_class_has_a_slot_for_every_actuator_term():
               / "gear_sonic/research/practice_utility/events_reset_safe.py").read_text()
     for name in ACTUATOR_TERMS:
         assert f"{name} = None" in source, f"LucidEventCfg has no slot for {name}"
+
+
+# ------------------------------------------------------- the evaluation cells
+
+def _eval_module():
+    from scripts.practice_utility import run_curriculum_robustness_eval as R
+    return R
+
+
+def test_every_actuator_cell_selects_the_preset_that_has_those_terms():
+    """A cell naming a term absent from its preset makes the evaluator fail closed."""
+    R = _eval_module()
+    for cell in R.PRESET_ACTUATOR:
+        assert R.PRESETS[cell] == "tracking/lucid_actuator", cell
+
+
+def test_the_physics_cells_did_not_move_to_the_new_preset():
+    """Every landed physics result must stay comparable to itself."""
+    R = _eval_module()
+    for cell in list(R.PRESET_CHANNEL) + list(R.PRESET_PAIR) + list(R.PRESET_PHYSICS_ONLY):
+        assert R.PRESETS[cell] == "tracking/lucid_curriculum", cell
+
+
+def test_the_off_cell_collapses_every_actuator_channel_to_its_nominal():
+    R = _eval_module()
+    assert set(R.PRESET_ACTUATOR["act_off"]) == set(R.ACTUATOR_TERMS)
+    assert set(R.PRESET_ACTUATOR["act_off"].values()) == {0.0}
+
+
+def test_every_other_actuator_cell_varies_exactly_one_channel():
+    """A severity ladder that moved two channels at once could not attribute a drop."""
+    R = _eval_module()
+    for cell, scales in R.PRESET_ACTUATOR.items():
+        if cell == "act_off":
+            continue
+        assert set(scales) == set(R.ACTUATOR_TERMS), cell
+        active = [n for n, v in scales.items() if v != 0.0]
+        assert len(active) == 1, f"{cell} varies {active}"
+
+
+def test_each_actuator_channel_has_a_ladder_not_a_single_point():
+    R = _eval_module()
+    per_channel = {}
+    for cell, scales in R.PRESET_ACTUATOR.items():
+        for name, value in scales.items():
+            if value != 0.0:
+                per_channel.setdefault(name, []).append(value)
+    assert set(per_channel) == set(R.ACTUATOR_TERMS)
+    for name, rungs in per_channel.items():
+        assert len(rungs) >= 2, f"{name} has no ladder"
+        assert len(set(rungs)) == len(rungs), f"{name} has duplicate rungs"
+
+
+def test_the_actuator_cells_reach_the_evaluator_as_channel_overrides():
+    R = _eval_module()
+    metadata = R.requested_preset_metadata(["act_effort_150"])
+    row = metadata["act_effort_150"]
+    assert row["event_preset"] == "tracking/lucid_actuator"
+    assert row["channel_dr_scales"]["randomize_joint_effort_limit"] == 1.5
+    override = R.channel_override("act_effort_150")
+    assert "randomize_joint_effort_limit:1.5" in override

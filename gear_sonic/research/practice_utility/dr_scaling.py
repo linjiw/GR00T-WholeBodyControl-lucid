@@ -249,6 +249,13 @@ PHYSICAL_LIMITS: dict[str, tuple[float, float]] = {
     "dynamic_friction_range": (0.05, 4.0),
     "restitution_range": (0.0, 1.0),
     "mass_distribution_params": (0.1, 10.0),
+    # Actuator channels. Extrapolation past lambda = 1 drives a scale channel
+    # toward zero, and a joint with no torque or no speed is not a hard robot but
+    # a broken one: the affine tail would hand PhysX a zero or negative limit.
+    "effort_limit_scale_range": (0.25, 1.5),
+    "velocity_limit_scale_range": (0.30, 1.5),
+    "armature_scale_range": (0.10, 5.0),
+    "joint_friction_range": (0.0, 40.0),
 }
 
 
