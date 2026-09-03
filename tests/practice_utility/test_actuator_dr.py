@@ -22,10 +22,17 @@ NUM_ENVS = 6
 
 
 class FakeData:
-    def __init__(self):
+    """Uses the CURRENT Isaac Lab field names. joint_velocity_limits and
+    default_joint_friction are deprecated aliases that log a warning on read."""
+
+    def __init__(self, legacy=False):
         self.joint_pos = torch.zeros((NUM_ENVS, 4))
         self.joint_effort_limits = torch.tensor([PEAK] * NUM_ENVS)
-        self.joint_velocity_limits = torch.tensor([[20.0, 20.0, 32.0, 37.0]] * NUM_ENVS)
+        vel = torch.tensor([[20.0, 20.0, 32.0, 37.0]] * NUM_ENVS)
+        if legacy:
+            self.joint_velocity_limits = vel
+        else:
+            self.joint_vel_limits = vel
         self.default_joint_armature = torch.full((NUM_ENVS, 4), 0.01)
         self.default_joint_friction_coeff = torch.zeros((NUM_ENVS, 4))
 
@@ -33,8 +40,8 @@ class FakeData:
 class FakeArticulation:
     """Only the writers actuator_dr calls, recording every write."""
 
-    def __init__(self, friction_writers=3):
-        self.data = FakeData()
+    def __init__(self, friction_writers=3, legacy=False):
+        self.data = FakeData(legacy=legacy)
         self.writes: dict[str, list[torch.Tensor]] = {}
         self._friction_writers = friction_writers
 
@@ -151,6 +158,50 @@ def test_only_the_named_joints_are_written():
     report = A.apply(art, "joint_friction", lam=1.0, joint_ids=[0, 1], generator=gen())
     assert report["joints"] == 2
     assert art.writes["write_joint_friction_coefficient_to_sim"][0].shape[1] == 2
+
+
+def test_the_nominal_survives_an_isaac_lab_rename():
+    """joint_velocity_limits is deprecated in favour of joint_vel_limits; both work."""
+    modern = FakeArticulation()
+    legacy = FakeArticulation(legacy=True)
+    a = A.apply(modern, "velocity_limit", lam=0.0, generator=gen())
+    b = A.apply(legacy, "velocity_limit", lam=0.0, generator=gen())
+    assert a["nominal_mean"] == pytest.approx(b["nominal_mean"])
+    assert a["nominal_source"] == "joint_vel_limits"
+    assert b["nominal_source"] == "joint_velocity_limits"
+
+
+def test_friction_with_no_field_at_all_falls_back_to_zero():
+    """A robot whose USD declares no joint friction still gets the channel."""
+    art = FakeArticulation()
+    del art.data.default_joint_friction_coeff
+    report = A.apply(art, "joint_friction", lam=1.0, generator=gen())
+    assert report["nominal_mean"] == pytest.approx(0.0)
+    assert report["nominal_source"] == "assumed zero"
+    assert report["written_mean"] > 0.0
+
+
+def test_an_unknown_nominal_is_an_error_not_a_silent_zero():
+    art = FakeArticulation()
+    del art.data.joint_vel_limits
+    with pytest.raises(KeyError, match="no nominal source"):
+        A.apply(art, "velocity_limit", lam=1.0, generator=gen())
+
+
+def test_a_swapped_argument_is_refused_at_definition_time():
+    """This mistake was made twice while writing the module and was silent both times."""
+    with pytest.raises(TypeError, match="tuple of attribute names"):
+        A.ActuatorChannel("armature", "default_joint_armature",
+                          "write_joint_armature_to_sim", "scale", (-0.3, 0.6))
+    with pytest.raises(ValueError, match="not an articulation joint writer"):
+        A.ActuatorChannel("x", ("a",), "default_joint_armature", "scale", (0.0, 1.0))
+    with pytest.raises(ValueError, match="inverted"):
+        A.ActuatorChannel("x", ("a",), "write_joint_armature_to_sim", "scale", (1.0, 0.0))
+
+
+def test_every_channel_key_matches_its_own_name():
+    for key, channel in A.CHANNELS.items():
+        assert key == channel.name
 
 
 def test_a_negative_intensity_is_refused():

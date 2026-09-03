@@ -68,8 +68,11 @@ class ActuatorChannel:
     """One randomizable actuator property."""
 
     name: str
-    #: Attribute on ``articulation.data`` holding the nominal, if there is one.
-    nominal_attr: str | None
+    #: Attributes on ``articulation.data`` that may hold the nominal, in preference
+    #: order. Isaac Lab renames these across releases and keeps the old name as a
+    #: deprecated property that logs a warning, so reading the first one that exists
+    #: is what keeps this working on both sides of a rename.
+    nominal_attrs: tuple[str, ...]
     #: Method on the articulation that writes it.
     writer: str
     combine: Combine
@@ -82,6 +85,32 @@ class ActuatorChannel:
     also_write: tuple[str, ...] = ()
     note: str = ""
 
+    def __post_init__(self) -> None:
+        """Refuse a positional mix-up at import time rather than at first use.
+
+        ``name`` and ``nominal_attrs`` are both about naming a property, and the
+        two got swapped twice while this file was being written. The failure was
+        silent until a draw was attempted, where a string ``nominal_attrs``
+        iterated over its own characters. These checks turn that into an
+        immediate, readable error.
+        """
+        if not isinstance(self.nominal_attrs, tuple):
+            raise TypeError(
+                f"{self.name!r}: nominal_attrs must be a tuple of attribute names, "
+                f"got {type(self.nominal_attrs).__name__}. A bare string iterates "
+                "over its characters and silently finds nothing.")
+        if not all(isinstance(a, str) and a for a in self.nominal_attrs):
+            raise TypeError(f"{self.name!r}: nominal_attrs must all be non-empty strings")
+        if not self.writer.startswith("write_joint_"):
+            raise ValueError(
+                f"{self.name!r}: writer {self.writer!r} is not an articulation joint writer; "
+                "the arguments are probably in the wrong order")
+        if self.combine not in ("scale", "add"):
+            raise ValueError(f"{self.name!r}: unknown combine {self.combine!r}")
+        lo, hi = self.deviation
+        if hi < lo:
+            raise ValueError(f"{self.name!r}: deviation {self.deviation} is inverted")
+
 
 #: The four actuator-side channels, with ranges set from what the hardware
 #: plausibly varies by rather than from what produces an outcome.
@@ -89,24 +118,34 @@ CHANNELS: dict[str, ActuatorChannel] = {
     # A deployed motor delivers less than its peak rating: the battery sags under
     # load, the winding heats, and units vary. Down to half of peak at lam = 1.
     "effort_limit": ActuatorChannel(
-        "effort_limit", None, "write_joint_effort_limit_to_sim", "scale", (-0.5, 0.0),
+        "effort_limit", ("joint_effort_limits_sim", "joint_effort_limits"),
+        "write_joint_effort_limit_to_sim", "scale", (-0.5, 0.0),
         note="fraction of peak torque removed; nominal is the peak rating in g1.py"),
     # Currently zero in simulation. A few N.m of Coulomb friction is ordinary for
     # a reducer of this size, and it rises sharply when the robot is cold.
     "joint_friction": ActuatorChannel(
-        "joint_friction", "default_joint_friction_coeff",
+        "joint_friction", ("default_joint_friction_coeff", "default_joint_friction"),
         "write_joint_friction_coefficient_to_sim", "add", (0.0, 6.0),
         also_write=("write_joint_dynamic_friction_coefficient_to_sim",
                     "write_joint_viscous_friction_coefficient_to_sim"),
         note="N.m of gearbox friction; the simulated G1 currently has none"),
     # Reflected rotor inertia, set from motor specs and never varied.
     "armature": ActuatorChannel(
-        "default_joint_armature", "default_joint_armature", "write_joint_armature_to_sim",
+        "armature", ("default_joint_armature",), "write_joint_armature_to_sim",
         "scale", (-0.3, 0.6)),
     # Back-EMF caps joint speed; a motor at its limit cannot track a fast reference.
+    # joint_velocity_limits is deprecated in favour of joint_vel_limits and logs a
+    # warning on every read; prefer the new name and fall back to the old one.
     "velocity_limit": ActuatorChannel(
-        "velocity_limit", None, "write_joint_velocity_limit_to_sim", "scale", (-0.4, 0.0)),
+        "velocity_limit", ("joint_vel_limits", "joint_velocity_limits"),
+        "write_joint_velocity_limit_to_sim", "scale", (-0.4, 0.0)),
 }
+
+# The dict key and the channel's own name must agree, or a lookup by key would
+# report a different channel than the one it configured.
+for _key, _channel in CHANNELS.items():
+    if _key != _channel.name:
+        raise ValueError(f"channel key {_key!r} does not match its name {_channel.name!r}")
 
 _CACHE = "_lucid_actuator_nominal"
 
@@ -126,20 +165,30 @@ def _nominal(asset: Any, channel: ActuatorChannel) -> torch.Tensor:
     if channel.name in cache:
         return cache[channel.name]
     data = asset.data
-    if channel.nominal_attr is not None and getattr(data, channel.nominal_attr, None) is not None:
-        value = getattr(data, channel.nominal_attr)
-    elif channel.name == "effort_limit":
-        value = data.joint_effort_limits
-    elif channel.name == "velocity_limit":
-        value = data.joint_velocity_limits
-    elif channel.name == "joint_friction":
-        value = getattr(data, "default_joint_friction_coeff", None)
-        if value is None:
-            value = torch.zeros_like(data.joint_pos)
-    else:  # pragma: no cover - every channel above is covered
-        raise KeyError(f"no nominal source for {channel.name!r}")
+    value = None
+    source = None
+    for attr in channel.nominal_attrs:
+        candidate = getattr(data, attr, None)
+        if candidate is not None:
+            value, source = candidate, attr
+            break
+    if value is None:
+        if channel.name == "joint_friction":
+            # The simulated G1 has no gearbox friction, so there may be no field at
+            # all. Zero is the correct nominal and the reason this channel ADDS.
+            value, source = torch.zeros_like(data.joint_pos), "assumed zero"
+        else:
+            raise KeyError(
+                f"no nominal source for {channel.name!r}; tried {channel.nominal_attrs}")
     cache[channel.name] = torch.as_tensor(value).clone()
+    cache.setdefault("_sources", {})[channel.name] = source
     return cache[channel.name]
+
+
+def nominal_source(asset: Any, channel_name: str) -> str | None:
+    """Which data field the nominal was read from, for the run receipt."""
+    cache = getattr(asset, _CACHE, None) or {}
+    return (cache.get("_sources") or {}).get(channel_name)
 
 
 def apply(
@@ -200,4 +249,5 @@ def apply(
         "written_min": float(drawn.min()),
         "written_max": float(drawn.max()),
         "note": channel.note,
+        "nominal_source": nominal_source(asset, channel_name),
     }
