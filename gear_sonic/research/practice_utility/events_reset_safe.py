@@ -668,10 +668,20 @@ def _build_event_cfg():
 
     @configclass
     class LucidEventCfg(EventCfg):
-        """SONIC's events plus a curriculum-scalable actuation-latency term."""
+        """SONIC's events plus curriculum-scalable latency and actuator terms.
+
+        Every added slot defaults to ``None``, so a config that does not fill it
+        gets SONIC's events unchanged. That is what keeps a baseline arm run
+        through the stock preset genuinely unmodified.
+        """
 
         randomize_action_delay = None
         randomize_action_delay_interval = None
+        # Actuator-side channels. Off unless a preset fills them in.
+        randomize_joint_effort_limit = None
+        randomize_joint_friction = None
+        randomize_joint_armature = None
+        randomize_joint_velocity_limit = None
 
     return LucidEventCfg
 

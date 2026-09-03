@@ -56,6 +56,16 @@ RANGE_NOMINALS: dict[str, float] = {
     # Actuation latency, in physics steps. Nominal 0 means lambda=0 collapses to
     # [0, 0] -- zero delay, bit-identical to a run with no latency channel.
     "delay_range": 0.0,
+    # --- actuator-side channels (events_actuator) ------------------------------
+    # These are direct articulation writes rather than event-manager parameters,
+    # but they are declared here so the curriculum, the strata dispatchers, the
+    # box gate and the evaluator all see them as ordinary channels. A scale
+    # channel's nominal multiplier is 1 and an additive one's is 0, so lambda = 0
+    # collapses each range to a point at the nominal and the write is a no-op.
+    "effort_limit_scale_range": 1.0,   # multiplicative on the peak torque rating
+    "armature_scale_range": 1.0,       # multiplicative on reflected rotor inertia
+    "velocity_limit_scale_range": 1.0,  # multiplicative on the joint speed ceiling
+    "joint_friction_range": 0.0,       # ADDITIVE, in N.m; the URDF declares none
 }
 
 

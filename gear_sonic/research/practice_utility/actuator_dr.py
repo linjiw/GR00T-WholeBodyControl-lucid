@@ -191,6 +191,72 @@ def nominal_source(asset: Any, channel_name: str) -> str | None:
     return (cache.get("_sources") or {}).get(channel_name)
 
 
+def draw_and_write(
+    asset: Any,
+    channel_name: str,
+    low: float,
+    high: float,
+    env_ids: torch.Tensor | None = None,
+    *,
+    generator: torch.Generator | None = None,
+    joint_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Draw uniformly in an ALREADY-SCALED range and write it.
+
+    This is the entry point an event term uses. The curriculum scales a term's
+    range parameter before the term runs, exactly as it does for every other
+    channel, so the term itself needs no knowledge of lambda: it applies the
+    range it was handed. Keeping it that way is what lets the strata machinery,
+    the box gate and the evaluator treat an actuator channel as just another
+    channel.
+    """
+    channel = CHANNELS[channel_name]
+    nominal = _nominal(asset, channel)
+    if nominal.ndim == 1:
+        nominal = nominal.unsqueeze(0).expand(asset.data.joint_pos.shape[0], -1)
+    num_envs, num_joints = nominal.shape
+    if env_ids is None:
+        env_ids = torch.arange(num_envs)
+    env_ids = torch.as_tensor(env_ids).reshape(-1)
+    columns = list(range(num_joints)) if joint_ids is None else list(joint_ids)
+
+    # Always re-derived from the cached nominal, so calling this every reset does
+    # not stack draws on the previous episode's values.
+    base = nominal[env_ids][:, columns].clone().to(torch.float32)
+    if high < low:
+        raise ValueError(f"{channel_name}: range ({low}, {high}) is inverted")
+    if low == high:
+        step = torch.full(base.shape, float(low), dtype=torch.float32)
+    else:
+        step = torch.rand(base.shape, generator=generator, dtype=torch.float32) * (high - low) + low
+    drawn = base * step if channel.combine == "scale" else base + step
+    drawn = drawn.clamp(min=channel.floor)
+
+    writers = (channel.writer, *channel.also_write)
+    written = 0
+    for name in writers:
+        writer = getattr(asset, name, None)
+        if writer is None:
+            continue  # an older Isaac Sim splits friction fewer ways; report it
+        writer(drawn, joint_ids=columns, env_ids=env_ids)
+        written += 1
+    return {
+        "channel": channel_name,
+        "combine": channel.combine,
+        "applied_range": [float(low), float(high)],
+        "envs": int(env_ids.numel()),
+        "joints": len(columns),
+        "writers_called": written,
+        "writers_available": len(writers),
+        "nominal_mean": float(base.mean()),
+        "written_mean": float(drawn.mean()),
+        "written_min": float(drawn.min()),
+        "written_max": float(drawn.max()),
+        "note": channel.note,
+        "nominal_source": nominal_source(asset, channel_name),
+    }
+
+
 def apply(
     asset: Any,
     channel_name: str,
@@ -208,46 +274,13 @@ def apply(
     if lam < 0.0:
         raise ValueError(f"lam must be >= 0, got {lam}")
     channel = CHANNELS[channel_name]
-    nominal = _nominal(asset, channel)
-    if nominal.ndim == 1:
-        nominal = nominal.unsqueeze(0).expand(asset.data.joint_pos.shape[0], -1)
-    num_envs, num_joints = nominal.shape
-    if env_ids is None:
-        env_ids = torch.arange(num_envs)
-    env_ids = torch.as_tensor(env_ids).reshape(-1)
-    columns = list(range(num_joints)) if joint_ids is None else list(joint_ids)
-
-    base = nominal[env_ids][:, columns].clone().to(torch.float32)
     lo, hi = channel.deviation
-    if lam == 0.0:
-        drawn = base
-    else:
-        u = torch.rand(base.shape, generator=generator, dtype=torch.float32) * (hi - lo) + lo
-        step = lam * u
-        drawn = base * (1.0 + step) if channel.combine == "scale" else base + step
-    drawn = drawn.clamp(min=channel.floor)
-
-    writers = (channel.writer, *channel.also_write)
-    written = 0
-    for name in writers:
-        writer = getattr(asset, name, None)
-        if writer is None:
-            continue  # an older Isaac Sim splits friction fewer ways; report it
-        writer(drawn, joint_ids=columns, env_ids=env_ids)
-        written += 1
-    return {
-        "channel": channel_name,
-        "lam": lam,
-        "combine": channel.combine,
-        "deviation_at_lam_1": list(channel.deviation),
-        "envs": int(env_ids.numel()),
-        "joints": len(columns),
-        "writers_called": written,
-        "writers_available": len(writers),
-        "nominal_mean": float(base.mean()),
-        "written_mean": float(drawn.mean()),
-        "written_min": float(drawn.min()),
-        "written_max": float(drawn.max()),
-        "note": channel.note,
-        "nominal_source": nominal_source(asset, channel_name),
-    }
+    # The curriculum's own convention: nominal +/- lam * deviation, so lam = 0
+    # reproduces the nominal exactly. For a scale channel the nominal multiplier
+    # is 1, for an additive one it is 0.
+    centre = 1.0 if channel.combine == "scale" else 0.0
+    report = draw_and_write(asset, channel_name, centre + lam * lo, centre + lam * hi,
+                            env_ids, generator=generator, joint_ids=joint_ids)
+    report["lam"] = lam
+    report["deviation_at_lam_1"] = list(channel.deviation)
+    return report
