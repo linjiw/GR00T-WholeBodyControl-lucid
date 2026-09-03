@@ -302,7 +302,16 @@ ASYM_CAPS: dict[str, float] = {name: cap for name, cap in ASYM_CEILINGS.items() 
 #: gate_300 must stop where its probe fails; box_fast_300 may stop push and
 #: keep widening the channels that are still free. Latency is held at 1.5 on
 #: all three so the 60 ms delay buffer (--max-delay 12) stays exact.
-WIDE_ARMS = ("gate_300", "fixed_300", "box_fast_300")
+#: ``gate_300_ng`` is gate_300 with the relative-return guard effectively
+#: disabled (a 99% drop tolerance). It exists because gate_300 stopped at 1.5
+#: for the WRONG reason: from a warm start the guard's reference is the return
+#: earned at low difficulty, so once difficulty rises the trailing mean can
+#: never recover to 75% of that best and the guard latches permanently -- it
+#: froze expansion on 1,509 of 1,990 iterations while the probe was still
+#: clearing its threshold 67% of the time. Without the guard, the survival
+#: probe alone decides where to stop, which is the claim the method actually
+#: rests on.
+WIDE_ARMS = ("gate_300", "fixed_300", "box_fast_300", "gate_300_ng")
 WIDE_MAX = 3.0
 WIDE_CAPS: dict[str, float] = {"randomize_action_delay": 1.5}
 WIDE_BOX_CEILINGS: dict[str, float] = {
@@ -314,12 +323,20 @@ WIDE_BOX_CEILINGS: dict[str, float] = {
     "randomize_action_delay": 1.5,
 }
 ARMS.update(
-    {"gate_300": ("gate", 0.0, None), "fixed_300": ("fixed", 0.0, None), "box_fast_300": ("box", 0.0, None)}
+    {
+        "gate_300": ("gate", 0.0, None),
+        "fixed_300": ("fixed", 0.0, None),
+        "box_fast_300": ("box", 0.0, None),
+        "gate_300_ng": ("gate", 0.0, None),
+    }
 )
-EXPANSION_ARMS = (*EXPANSION_ARMS, "gate_300", "box_fast_300")
-ARM_SPREAD_STRATA.update({"gate_300": 8, "box_fast_300": 8})
+EXPANSION_ARMS = (*EXPANSION_ARMS, "gate_300", "box_fast_300", "gate_300_ng")
+ARM_SPREAD_STRATA.update({"gate_300": 8, "box_fast_300": 8, "gate_300_ng": 8})
+#: Per-arm relative-return-guard tolerance, overriding --return-relative-drop.
+#: 0.99 means "only a 99% collapse counts as harm", i.e. the guard is inert.
+ARM_RETURN_DROP: dict[str, float] = {"gate_300_ng": 0.99}
 ARM_RETURN_GUARD.update({arm: "relative" for arm in WIDE_ARMS})
-ARM_FRONTIER_MAX.update({"gate_300": WIDE_MAX, "box_fast_300": WIDE_MAX})
+ARM_FRONTIER_MAX.update({"gate_300": WIDE_MAX, "box_fast_300": WIDE_MAX, "gate_300_ng": WIDE_MAX})
 ARM_FIXED_LAMBDA.update({"fixed_300": WIDE_MAX})
 #: Per-arm channel caps (scalar frontier/fixed lambda clamped per term) and
 #: per-arm box ceilings (vector frontier bounded per term).
@@ -328,12 +345,13 @@ ARM_TERM_CAPS: dict[str, dict[str, float]] = {
     "fixed_asym": ASYM_CAPS,
     "gate_300": WIDE_CAPS,
     "fixed_300": WIDE_CAPS,
+    "gate_300_ng": WIDE_CAPS,
 }
 ARM_BOX_CEILINGS: dict[str, dict[str, float]] = {
     "box_asym": ASYM_CEILINGS,
     "box_fast_300": WIDE_BOX_CEILINGS,
 }
-GATE_ARMS = ("gate_150", "box_150", "box_asym", "gate_300", "box_fast_300")
+GATE_ARMS = ("gate_150", "box_150", "box_asym", "gate_300", "box_fast_300", "gate_300_ng")
 BOX_ARMS = ("box_150", "box_asym", "box_fast_300")
 
 #: ---------------------------------------------------------------------------
@@ -1079,7 +1097,8 @@ def build_command(
     relative_guard = (
         [
             f"++callbacks.lucid_curriculum.return_guard={guard}",
-            f"++callbacks.lucid_curriculum.return_relative_drop={args.return_relative_drop}",
+            "++callbacks.lucid_curriculum.return_relative_drop="
+            f"{ARM_RETURN_DROP.get(mode, args.return_relative_drop)}",
             f"++callbacks.lucid_curriculum.return_window={args.return_window}",
         ]
         if guard != "absolute"
@@ -1438,6 +1457,9 @@ def main(argv=None) -> int:
                                     "dwell": args.gate_dwell,
                                     "min_episodes": args.gate_min_episodes,
                                     "guard_action": args.gate_guard_action,
+                                    "return_relative_drop": ARM_RETURN_DROP.get(
+                                        mode, args.return_relative_drop
+                                    ),
                                 }
                                 if mode in GATE_ARMS
                                 else None

@@ -254,3 +254,16 @@ def test_wide_arms_hold_latency_and_reach_three():
     with pytest.raises(SystemExit, match="max-delay 12"):
         R.build_command(a, "gate_300", 8600, "b", Path("/tmp/artifact"))
     assert R.ARM_DELAY_CEILING["gate_300"] == 1.5 and R.ARM_LAMBDA_CEILING["fixed_300"] == 3.0
+
+
+def test_guard_free_gate_disables_the_relative_return_guard_only():
+    a = _asym_args()
+    ng = R.build_command(a, "gate_300_ng", 8600, "b", Path("/tmp/artifact"))
+    base = R.build_command(a, "gate_300", 8600, "b", Path("/tmp/artifact"))
+    assert "++callbacks.lucid_curriculum.return_relative_drop=0.99" in ng
+    assert f"++callbacks.lucid_curriculum.return_relative_drop={a.return_relative_drop}" in base
+    # Everything else about the arm is identical to gate_300.
+    strip = lambda cmd: [c for c in cmd if "return_relative_drop" not in c and "branch_id" not in c
+                         and "output_dir" not in c and "capsule_dir" not in c]
+    assert strip(ng) == strip(base)
+    assert "gate_300_ng" in R.MODES
