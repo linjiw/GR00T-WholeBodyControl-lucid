@@ -25,8 +25,20 @@ PEAK = torch.tensor([139.0, 139.0, 88.0, 50.0], dtype=torch.float64)
 DT = 0.02  # the 50 Hz control step
 
 
-def state(lam=1.0, num_envs=3, **cfg):
-    return ThermalState(num_envs, PEAK, lam=lam, config=ThermalConfig(**cfg))
+def state(lam=1.0, num_envs=3, cold=False, seed=8600, **cfg):
+    """A thermal state with a SEEDED initial draw.
+
+    Without a seed these tests are flaky by construction: at lam = 1 the initial
+    temperature is drawn up to 0.5 and the onset is 0.35, so a test that means
+    "a cold joint" passes or fails on the draw. ``cold=True`` starts at zero for
+    the tests whose statement depends on it.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    st = ThermalState(num_envs, PEAK, lam=lam, config=ThermalConfig(**cfg),
+                      generator=generator)
+    if cold:
+        st.temperature.zero_()
+    return st
 
 
 def run(st, duty, seconds):
@@ -61,40 +73,40 @@ def test_at_zero_intensity_a_reset_draws_exactly_cold():
 # ------------------------------------------------- it behaves like a budget
 
 def test_available_torque_never_exceeds_peak_and_never_falls_below_continuous():
-    st = state(lam=3.0)
+    st = state(lam=3.0, cold=True)
     fraction = run(st, duty=1.0, seconds=30.0)
     assert float(fraction.max()) <= 1.0 + 1e-12
     assert float(fraction.min()) >= st.config.continuous_over_peak - 1e-12
 
 
 def test_a_cold_joint_below_the_onset_is_not_derated():
-    st = state(lam=1.0)
+    st = state(lam=1.0, cold=True)
     fraction = run(st, duty=0.1, seconds=2.0)
     assert float(fraction.min()) == pytest.approx(1.0)
 
 
 def test_harder_work_derates_sooner():
     """Monotone in duty: the whole point of an endogenous channel."""
-    lazy = float(run(state(lam=2.0), duty=0.3, seconds=4.0).min())
-    busy = float(run(state(lam=2.0), duty=0.9, seconds=4.0).min())
+    lazy = float(run(state(lam=2.0, cold=True), duty=0.3, seconds=4.0).min())
+    busy = float(run(state(lam=2.0, cold=True), duty=0.9, seconds=4.0).min())
     assert busy < lazy
 
 
 def test_higher_intensity_derates_sooner_at_the_same_effort():
-    mild = float(run(state(lam=1.0), duty=0.6, seconds=4.0).min())
-    harsh = float(run(state(lam=3.0), duty=0.6, seconds=4.0).min())
+    mild = float(run(state(lam=1.0, cold=True), duty=0.6, seconds=4.0).min())
+    harsh = float(run(state(lam=3.0, cold=True), duty=0.6, seconds=4.0).min())
     assert harsh < mild
 
 
 def test_a_joint_recovers_when_the_effort_stops():
-    st = state(lam=3.0)
+    st = state(lam=3.0, cold=True)
     hot = float(run(st, duty=1.0, seconds=10.0).min())
     cooled = float(run(st, duty=0.0, seconds=60.0).min())
     assert cooled > hot
 
 
 def test_clamping_preserves_sign_and_respects_the_budget():
-    st = state(lam=3.0)
+    st = state(lam=3.0, cold=True)
     run(st, duty=1.0, seconds=20.0)
     commanded = torch.tensor([[139.0, -139.0, 88.0, -50.0]] * 3, dtype=torch.float64)
     limited = st.clamp(commanded)
@@ -105,7 +117,7 @@ def test_clamping_preserves_sign_and_respects_the_budget():
 
 def test_heating_uses_the_delivered_torque_not_the_command():
     """A joint that could not produce the torque must not heat as though it had."""
-    st = state(lam=3.0)
+    st = state(lam=3.0, cold=True)
     run(st, duty=1.0, seconds=10.0)
     limit = st.available_torque()
     before = st.temperature.clone()
@@ -161,7 +173,7 @@ def test_a_reset_draw_is_bounded_by_the_intensity():
 
 
 def test_the_report_states_the_severity_rather_than_assuming_it():
-    st = state(lam=2.0)
+    st = state(lam=2.0, cold=True)
     run(st, duty=1.0, seconds=10.0)
     report = st.report()
     assert report["lam"] == 2.0
