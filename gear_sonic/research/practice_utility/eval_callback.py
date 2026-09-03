@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from gear_sonic.research.practice_utility import dr_scaling as DS
+from gear_sonic.research.practice_utility import events_actuator as EAC
 from gear_sonic.research.practice_utility import events_reset_safe as ERS
 from gear_sonic.research.practice_utility.quality_telemetry import (
     QualityTelemetryCollector,
@@ -142,6 +143,13 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         robot = _scene_entity(self.env, "robot")
         if robot is not None:
             ERS.reset_action_delay_process(robot)
+            # Clear the previous cell's actuator reports so the receipt describes
+            # this one. What the terms then record includes a PhysX read-back, which
+            # is the only evidence that distinguishes a channel that did nothing
+            # physically from one whose write never reached the engine: the
+            # articulation updates its own mirror unconditionally, so every
+            # event-manager read passes either way.
+            EAC.clear_actuator_telemetry(robot)
         super()._pre_evaluate_policy(reset_env=reset_env)
 
     def env_step(self, actor_state: dict[str, Any]) -> dict[str, Any]:
@@ -158,6 +166,9 @@ class PracticeRobustnessEvalCallback(ImEvalCallback):
         metrics["eval/protocol/channel_dr_scales"] = self.channel_dr_scales
         metrics["eval/protocol/fixed_latency_steps"] = self.fixed_latency_steps
         metrics["eval/protocol/fixed_latency_report"] = self._latency_report
+        robot = _scene_entity(self.env, "robot")
+        metrics["eval/protocol/actuator_telemetry"] = (
+            EAC.actuator_telemetry(robot) if robot is not None else None)
         event_manager = _event_manager(self.env)
         metrics["eval/protocol/active_dr_terms"] = DS.scalable_terms(event_manager)
         metrics["eval/protocol/dr_ranges"] = DS.capture_baseline(event_manager)
