@@ -50,16 +50,44 @@ def _joint_ids(asset_cfg: Any, asset: Any) -> list[int] | None:
 
 
 def _record(asset: Any, channel: str, report: dict[str, Any]) -> None:
+    """Accumulate every sub-call, because a term runs once PER COHORT.
+
+    The strata dispatchers split env_ids and call the underlying sampler once per
+    cohort, so a single reset produces several reports for one channel. Keeping
+    only the last would make every receipt describe whichever cohort happened to
+    run last -- and the cohorts sit at deliberately different intensities, so that
+    is precisely the number that must not be reported as the arm's exposure.
+    """
     store = getattr(asset, TELEMETRY, None)
     if store is None:
         store = {}
         setattr(asset, TELEMETRY, store)
-    store[channel] = report
+    store.setdefault(channel, []).append(report)
 
 
 def actuator_telemetry(asset: Any) -> dict[str, Any]:
-    """What each actuator channel actually applied, for the run receipt."""
-    return dict(getattr(asset, TELEMETRY, {}) or {})
+    """What each actuator channel applied this reset, aggregated over its cohorts."""
+    store = getattr(asset, TELEMETRY, {}) or {}
+    out: dict[str, Any] = {}
+    for channel, reports in store.items():
+        if not reports:
+            continue
+        last = reports[-1]
+        out[channel] = {
+            **last,
+            "cohorts": len(reports),
+            "envs": sum(int(r.get("envs", 0)) for r in reports),
+            "written_min": min(float(r["written_min"]) for r in reports),
+            "written_max": max(float(r["written_max"]) for r in reports),
+            "applied_ranges": [r.get("applied_range") for r in reports],
+            "physx_readbacks": sorted({str(r.get("physx_readback")) for r in reports}),
+        }
+    return out
+
+
+def clear_actuator_telemetry(asset: Any) -> None:
+    """Drop the previous reset's reports so a receipt describes one reset."""
+    setattr(asset, TELEMETRY, {})
 
 
 def _term(channel: str, env: Any, env_ids: Any, asset_cfg: Any,

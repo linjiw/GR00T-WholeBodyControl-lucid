@@ -109,7 +109,28 @@ def test_friction_is_added_because_the_simulated_robot_has_none():
     report = A.apply(art, "joint_friction", lam=1.0, generator=gen())
     assert report["combine"] == "add"
     assert report["written_mean"] > 0.0
-    assert report["written_max"] <= 6.0 + 1e-6
+    ceiling = A.CHANNELS["joint_friction"].deviation[1]
+    assert report["written_max"] <= ceiling * max(PEAK) + 1e-6
+
+
+def test_friction_is_a_fraction_of_each_joints_own_torque_rating():
+    """A flat N.m figure locks a 5 N.m wrist while barely touching a 139 N.m knee.
+
+    Expressing the channel relative to each joint's rating makes one range mean
+    the same physical thing everywhere, which is what a gearbox friction actually
+    does: it scales with the size of the reducer.
+    """
+    art = FakeArticulation()
+    assert A.CHANNELS["joint_friction"].relative_to == "effort_limit"
+    A.apply(art, "joint_friction", lam=1.0, generator=gen())
+    written = art.writes["write_joint_friction_coefficient_to_sim"][0]
+    ceiling = A.CHANNELS["joint_friction"].deviation[1]
+    peak = torch.tensor(PEAK)
+    # Every joint stays inside its own fraction, and none is driven past its rating.
+    assert bool((written <= ceiling * peak.unsqueeze(0) + 1e-6).all())
+    assert bool((written < peak.unsqueeze(0)).all())
+    # The strong joints receive proportionally more friction than the weak ones.
+    assert float(written[:, 0].mean()) > float(written[:, 3].mean())
 
 
 def test_friction_writes_both_coulomb_coefficients_and_the_same_value_to_each():

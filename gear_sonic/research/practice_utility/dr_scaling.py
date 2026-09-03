@@ -65,7 +65,7 @@ RANGE_NOMINALS: dict[str, float] = {
     "effort_limit_scale_range": 1.0,   # multiplicative on the peak torque rating
     "armature_scale_range": 1.0,       # multiplicative on reflected rotor inertia
     "velocity_limit_scale_range": 1.0,  # multiplicative on the joint speed ceiling
-    "joint_friction_range": 0.0,       # ADDITIVE, in N.m; the URDF declares none
+    "joint_friction_range": 0.0,       # ADDITIVE, as a fraction of each joint rating
 }
 
 
@@ -255,7 +255,7 @@ PHYSICAL_LIMITS: dict[str, tuple[float, float]] = {
     "effort_limit_scale_range": (0.25, 1.5),
     "velocity_limit_scale_range": (0.30, 1.5),
     "armature_scale_range": (0.10, 5.0),
-    "joint_friction_range": (0.0, 40.0),
+    "joint_friction_range": (0.0, 0.5),
 }
 
 

@@ -83,6 +83,13 @@ class ActuatorChannel:
     floor: float = 0.0
     #: Extra writers that take the same value (PhysX splits friction three ways).
     also_write: tuple[str, ...] = ()
+    #: For an additive channel, the channel whose per-joint nominal the drawn value
+    #: is a FRACTION of. Gearbox friction scales with the reducer's torque capacity,
+    #: so a flat 6 N.m is four per cent of the knee's rating and more than the wrist
+    #: pitch joint can produce at all: the small joints would lock solid while the
+    #: large ones barely noticed, and the channel would be measuring breakage rather
+    #: than friction.
+    relative_to: str = ""
     #: Method on ``articulation.root_physx_view`` that reads the property BACK out of
     #: the physics engine. The articulation writes its own mirror unconditionally
     #: before calling the simulator, so comparing against ``asset.data`` proves only
@@ -131,7 +138,9 @@ CHANNELS: dict[str, ActuatorChannel] = {
     # a reducer of this size, and it rises sharply when the robot is cold.
     "joint_friction": ActuatorChannel(
         "joint_friction", ("default_joint_friction_coeff", "default_joint_friction"),
-        "write_joint_friction_coefficient_to_sim", "add", (0.0, 6.0),
+        # A FRACTION of each joint's own torque rating, not an absolute N.m.
+        "write_joint_friction_coefficient_to_sim", "add", (0.0, 0.05),
+        relative_to="effort_limit",
         # Static and dynamic Coulomb friction share the same units (N.m) and the
         # same physical magnitude, so one draw is right for both. VISCOUS friction
         # is deliberately NOT written here: it is a velocity-proportional damping
@@ -139,7 +148,7 @@ CHANNELS: dict[str, ActuatorChannel] = {
         # large damping term while the docstring claimed to be modelling stiction.
         # A viscous channel needs its own units and its own range.
         also_write=("write_joint_dynamic_friction_coefficient_to_sim",),
-        note="N.m of Coulomb (static and dynamic) gearbox friction; the asset declares none"),
+        note="Coulomb friction as a fraction of each joint's torque rating; the asset declares none"),
     # Reflected rotor inertia, set from motor specs and never varied.
     "armature": ActuatorChannel(
         "armature", ("default_joint_armature",), "write_joint_armature_to_sim",
@@ -248,7 +257,18 @@ def draw_and_write(
         step = torch.rand(base.shape, generator=generator, dtype=torch.float32,
                           device=draw_device) * (high - low) + low
         step = step.to(base.device)
-    drawn = base * step if channel.combine == "scale" else base + step
+    if channel.combine == "scale":
+        drawn = base * step
+    else:
+        # An additive channel may be expressed relative to another channel's
+        # per-joint nominal, so one range means the same physical thing on a
+        # 139 N.m knee and a 5 N.m wrist.
+        if channel.relative_to:
+            reference = _nominal(asset, CHANNELS[channel.relative_to])
+            if reference.ndim == 1:
+                reference = reference.unsqueeze(0).expand(asset.data.joint_pos.shape[0], -1)
+            step = step * reference[env_ids][:, columns].to(step.device, torch.float32)
+        drawn = base + step
     drawn = drawn.clamp(min=channel.floor)
 
     writers = (channel.writer, *channel.also_write)
@@ -264,6 +284,7 @@ def draw_and_write(
     return {
         "channel": channel_name,
         "combine": channel.combine,
+        "relative_to": channel.relative_to or None,
         "applied_range": [float(low), float(high)],
         "envs": int(env_ids.numel()),
         "joints": len(columns),

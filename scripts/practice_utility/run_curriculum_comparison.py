@@ -150,6 +150,12 @@ EXPAND_EXPECTED_CLAMPS: dict[str, list[str]] = {
     "fixed_u": [],
     "fixed_u150": ["physics_material"],
 }
+#: The six channels the standard preset declares. The actuator preset declares
+#: four more, and the mechanism gate below compares the LIVE term set for exact
+#: equality, so an actuator arm reporting ten against an expected six would fail
+#: verification for the entire comparison. Kept exact rather than relaxed: on the
+#: actuator preset the gate then proves the four channels were present and
+#: schedulable in the run, which is the evidence a new channel needs.
 EXPECTED_SCALABLE_TERMS = {
     "add_joint_default_pos",
     "base_com",
@@ -484,6 +490,17 @@ ACTUATOR_RANGE_PARAM = {
     "armature": ("randomize_joint_armature", "armature_scale_range", 1.0),
     "velocity_limit": ("randomize_joint_velocity_limit", "velocity_limit_scale_range", 1.0),
 }
+
+
+#: The four terms the actuator preset adds on top of the six.
+ACTUATOR_SCALABLE_TERMS = {term for term, _param, _nominal in ACTUATOR_RANGE_PARAM.values()}
+
+
+def expected_scalable_terms(mode: str) -> set[str]:
+    """The exact live term set an arm on this mode must report."""
+    if mode in ACTUATOR_ARMS:
+        return EXPECTED_SCALABLE_TERMS | ACTUATOR_SCALABLE_TERMS
+    return EXPECTED_SCALABLE_TERMS
 
 
 def actuator_overrides(mode: str, channel: str, target: float) -> list[str]:
@@ -1661,7 +1678,7 @@ def main(argv=None) -> int:
         and arm["complete"]
         and arm["actuator_groups_swapped"] == 5
         and arm["checkpoint_exported"]
-        and set(arm["scalable_terms"]) == EXPECTED_SCALABLE_TERMS
+        and set(arm["scalable_terms"]) == expected_scalable_terms(arm["mode"])
         and (
             arm["mode"] not in EXPAND_ARMS or bool((arm.get("expand_contract") or {}).get("passed"))
         )

@@ -191,9 +191,14 @@ PRESET_ACTUATOR: dict[str, dict[str, float]] = {
        for s in (1.0, 2.0)},
     # Speed ceiling. Read with care: below what the clip demands this makes the
     # reference untrackable rather than hard, which is not a barrier.
+    # The reference clip never exceeds about 37 per cent of any velocity limit, so
+    # rungs whose lowest draw stays above that are inert BY MEASUREMENT and a null
+    # there would say nothing. 2.0 puts the lowest draw at 0.2 of the limit, below
+    # the clip's demand, so the channel is at least demonstrably live before it is
+    # reported as having no usable window between inert and untrackable.
     **{f"act_velocity_{int(s * 100):03d}": {**{n: 0.0 for n in ACTUATOR_TERMS},
                                             "randomize_joint_velocity_limit": s}
-       for s in (0.5, 1.0, 1.5)},
+       for s in (0.5, 1.0, 1.5, 2.0)},
 }
 
 #: Every cell that scales named channels, marginal, pairwise or actuator.
