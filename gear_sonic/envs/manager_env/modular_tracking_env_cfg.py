@@ -748,19 +748,14 @@ class MySceneCfg(InteractiveSceneCfg):
                     track_air_time=False,
                 )
 
-                # Table-to-robot contact sensor: detect when right hand/wrist touches table
-                # Used for termination logic (terminate if table contact before object contact).
-                # Kept inside the `add_object` branch: it filters on `right_hand_wrist_links`,
-                # which is only defined here, and it compares table contact against OBJECT
-                # contact, so it has no meaning without an object.  Previously it sat one level
-                # out, so `add_table=true` without `add_object=true` -- a table used as a plain
-                # scene obstacle -- raised UnboundLocalError before the sim could start.
-                self.table_to_robot_contact_sensor = ContactSensorCfg(
-                    prim_path="{ENV_REGEX_NS}/Table",
-                    filter_prim_paths_expr=right_hand_wrist_links,
-                    history_length=2,
-                    track_air_time=False,
-                )
+            # Table-to-robot contact sensor: detect when right hand/wrist touches table
+            # Used for termination logic (terminate if table contact before object contact)
+            self.table_to_robot_contact_sensor = ContactSensorCfg(
+                prim_path="{ENV_REGEX_NS}/Table",
+                filter_prim_paths_expr=right_hand_wrist_links,
+                history_length=2,
+                track_air_time=False,
+            )
 
         # # TODO: Do this better.  # noqa: TD002, TD003
         # self.ego_camera = TiledCameraCfg(
