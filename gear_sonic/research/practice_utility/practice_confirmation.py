@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 from pathlib import Path
 import statistics
 from typing import Any, Iterable
@@ -74,6 +75,19 @@ def load_evaluations(inputs: Iterable[Path]) -> dict[tuple[int, str, str], dict[
             key = (int(run["checkpoint_seed"]), str(run["mode"]), str(run["preset"]))
             if key in cells:
                 raise ValueError(f"duplicate evaluation cell {key} in {path}")
+            metrics_path = Path(run["metrics_path"]) if run.get("metrics_path") else None
+            if metrics_path is not None and not metrics_path.is_absolute():
+                metrics_path = path.parent / metrics_path
+            reported_scalars: dict[str, float] = {}
+            if metrics_path is not None and metrics_path.is_file():
+                metrics_payload = json.loads(metrics_path.read_text())
+                reported_scalars = {
+                    str(name): float(value)
+                    for name, value in metrics_payload.items()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                }
             cells[key] = {
                 "checkpoint_seed": key[0],
                 "evaluation_seed": int(run["evaluation_seed"]),
@@ -82,6 +96,8 @@ def load_evaluations(inputs: Iterable[Path]) -> dict[tuple[int, str, str], dict[
                 "metrics": {name: summary.get(name) for name in SCALAR_METRICS},
                 "quality_missing_signals": summary.get("quality_missing_signals", []),
                 "receipt": str(path.resolve()),
+                "metrics_path": str(metrics_path.resolve()) if metrics_path is not None else None,
+                "reported_scalars": reported_scalars,
             }
     return cells
 
@@ -221,6 +237,8 @@ def analyze(
                     "quality_missing_signals": cell["quality_missing_signals"],
                     "in_training_support": in_support(preset, exposures.get((seed, mode))),
                     "evaluation_seed": cell["evaluation_seed"],
+                    "metrics_path": cell["metrics_path"],
+                    "reported_scalars": cell["reported_scalars"],
                 }
             table[preset][str(seed)] = seed_row
 
@@ -279,6 +297,16 @@ def analyze(
         )
         for preset in ("ch_push_350", "ch_push_fric_350_150")
     }
+    expected_cells = [
+        cells[(seed, mode, preset)]
+        for seed in all_seeds
+        for mode in MODES
+        for preset in presets
+        if (seed, mode, preset) in cells
+    ]
+    reported_key_sets = [set(cell["reported_scalars"]) for cell in expected_cells]
+    reported_union = set().union(*reported_key_sets) if reported_key_sets else set()
+    reported_intersection = set.intersection(*reported_key_sets) if reported_key_sets else set()
 
     return {
         "kind": "lucid_practice_allocation_confirmation_analysis",
@@ -294,6 +322,16 @@ def analyze(
             "missing_cells": missing_cells,
             "wrong_evaluation_seeds": wrong_eval_seeds,
             "complete": not missing_cells and not wrong_eval_seeds,
+        },
+        "reported_scalar_audit": {
+            "cells_with_metrics_files": sum(
+                bool(cell["reported_scalars"]) for cell in expected_cells
+            ),
+            "expected_cells": len(all_seeds) * len(MODES) * len(presets),
+            "key_union": sorted(reported_union),
+            "key_intersection": sorted(reported_intersection),
+            "all_expected_cells_have_reported_scalars": bool(expected_cells)
+            and all(reported_key_sets),
         },
         "realized_practice_vectors": {
             str(seed): {mode: exposures.get((seed, mode)) for mode in MODES} for seed in all_seeds

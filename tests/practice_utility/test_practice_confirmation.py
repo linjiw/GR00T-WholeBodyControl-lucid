@@ -104,6 +104,30 @@ def test_duplicate_cell_is_rejected_instead_of_overwritten(tmp_path):
         PC.load_evaluations([first, second])
 
 
+def test_loader_preserves_every_finite_top_level_reported_scalar(tmp_path):
+    metrics = write(
+        tmp_path / "metrics.json",
+        {
+            "eval/all/mpjpe_g": 123.0,
+            "eval/success/mpjpe_g": 99.0,
+            "eval/quality/energy_proxy": 42.0,
+            "nested": {"not": "a scalar"},
+            "flag": True,
+        },
+    )
+    receipt = eval_receipt(8601, "prac_push", {})
+    for run in receipt["runs"].values():
+        run["metrics_path"] = str(metrics)
+    cells = PC.load_evaluations([write(tmp_path / "eval.json", receipt)])
+    cell = cells[(8601, "prac_push", "ch_push_300")]
+    assert cell["metrics_path"] == str(metrics.resolve())
+    assert cell["reported_scalars"] == {
+        "eval/all/mpjpe_g": 123.0,
+        "eval/success/mpjpe_g": 99.0,
+        "eval/quality/energy_proxy": 42.0,
+    }
+
+
 def test_exposure_support_is_seed_and_arm_specific(tmp_path):
     exposure = PC.load_exposures([write(tmp_path / "training.json", training_receipt(8601))])
     assert PC.in_support("ch_push_300", exposure[(8601, "prac_push")]) is True
